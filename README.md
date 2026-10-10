@@ -143,6 +143,11 @@ strixite runs on **Linux with an AMD Strix Halo (gfx1151) and 128 GB of memory**
 and tested by one person on one machine, so that's the only setup I can promise works; Windows and macOS aren't
 supported, and I don't plan to add them. I can't take on ports to other platforms here, but forks are very welcome.
 
+## Roadmap
+
+What I'm working on, what's next, and what isn't planned: [Roadmap](docs/roadmap.md). Priorities, in order:
+stability, quality, performance. Feature requests are welcome as issues.
+
 ## Contributing
 
 Pull requests and issues are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how they land.
