@@ -74,7 +74,7 @@ constexpr int kExitGpuFatal = 3;
 constexpr int kExitLowMemory = 4;
 
 int run(int argc, char **argv) {
-    ServerSettings settings(strix_server_options(models_dir(), NgramTableRows::kDefaultCacheRows));
+    ServerSettings settings(strix_server_options(models_dir()));
     settings.load(std::vector<std::string>(argv + 1, argv + argc));
     if (settings.help()) {
         std::fputs(settings.usage("strix_server").c_str(), stdout);

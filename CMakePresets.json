@@ -71,6 +71,11 @@
       },
       "execution": {
         "jobs": 8
+      },
+      "filter": {
+        "exclude": {
+          "label": "other"
+        }
       }
     },
     {
@@ -78,6 +83,11 @@
       "configurePreset": "xtx-dev",
       "output": {
         "outputOnFailure": true
+      },
+      "filter": {
+        "exclude": {
+          "label": "other"
+        }
       }
     },
     {
@@ -85,7 +95,7 @@
       "inherits": "strix",
       "filter": {
         "exclude": {
-          "label": "slow"
+          "label": "slow|other"
         }
       }
     },
@@ -94,7 +104,22 @@
       "inherits": "xtx-dev",
       "filter": {
         "exclude": {
-          "label": "slow"
+          "label": "slow|other"
+        }
+      }
+    },
+    {
+      "name": "other-configs",
+      "configurePreset": "strix",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 8
+      },
+      "filter": {
+        "include": {
+          "label": "other"
         }
       }
     }

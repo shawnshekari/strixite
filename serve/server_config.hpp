@@ -77,8 +77,13 @@ private:
     bool help_ = false;
 };
 
+// The served n-gram row cache (8 M rows, ~3 GiB; deploy/strix-server.conf has the reason) - the server's default. The
+// library's own default (NgramTableRows::kDefaultCacheRows, 2^18) stays for tools and benches.
+constexpr int64_t kServedNgramCacheRows = 8388608;
+
 // strix_server's option table. models_dir: $STRIX_MODELS_DIR (else ~/models/strix-infer), under which the default
-// paths live; ngram_cache_rows_default: NgramTableRows::kDefaultCacheRows (runtime/, which strix_serve doesn't link).
-std::vector<ConfigOption> strix_server_options(const std::string &models_dir, int64_t ngram_cache_rows_default);
+// paths live. Every default is the served value (2026-10-10: the defaults are what a dedicated headless
+// Strix Halo serving a coding agent uses); tests/test_server_config.cpp checks deploy/strix-server.conf against them.
+std::vector<ConfigOption> strix_server_options(const std::string &models_dir);
 
 }  // namespace strix

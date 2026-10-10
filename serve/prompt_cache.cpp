@@ -146,6 +146,10 @@ PromptCache::PromptCache(std::string dir, uint64_t max_bytes, std::string finger
                 fingerprint_.size(), " chars, expected 1..", kFpBytes - 1);
     STRIX_CHECK(std::isfinite(opt_.idle_seconds) && opt_.idle_seconds > 0, "PromptCache: idle_seconds ",
                 opt_.idle_seconds, ", expected > 0");
+    STRIX_CHECK(std::isfinite(opt_.ram_watch_seconds) && opt_.ram_watch_seconds > 0 && opt_.ram_watch_seconds <= 60,
+                "PromptCache: ram_watch_seconds ", opt_.ram_watch_seconds, ", expected 0 < s <= 60");
+    STRIX_CHECK(opt_.ram_watch_headroom < (1ull << 40), "PromptCache: ram_watch_headroom ", opt_.ram_watch_headroom,
+                " bytes, expected < 1 TiB");
     STRIX_CHECK(std::isfinite(opt_.write_gib_per_hour) && opt_.write_gib_per_hour >= 0,
                 "PromptCache: write_gib_per_hour ", opt_.write_gib_per_hour, ", expected >= 0 (0 = no limit)");
     STRIX_CHECK(std::isfinite(opt_.shutdown_seconds) && opt_.shutdown_seconds >= 0, "PromptCache: shutdown_seconds ",
@@ -881,12 +885,16 @@ PromptCacheStats PromptCache::stats() const {
 
 void PromptCache::writer() {
     set_idle_io_priority();
-    // The idle rule's scan: a quarter of idle_seconds, between 0.05 and 30 s.
+    // The idle rule's scan: a quarter of idle_seconds, between 0.05 and 30 s. The margin watch runs more often.
     const double scan_s = std::clamp(opt_.idle_seconds / 4, 0.05, 30.0);
+    const double wake_s = std::min(scan_s, opt_.ram_watch_seconds);
+    double scan_at = now_s() + scan_s, watch_at = now_s() + opt_.ram_watch_seconds;
     for (;;) {
         Job job;
         {
             std::unique_lock<std::mutex> lock(mu_);
+            // Between writes too: a queue of multi-GB writes takes seconds each.
+            if (now_s() >= watch_at) watch_margin(lock), watch_at = now_s() + opt_.ram_watch_seconds;
             while (!stop_ && queue_.empty()) {
                 if (const uint64_t want = prefault_want_locked()) {  // populate a spare off the request path
                     lock.unlock();
@@ -910,9 +918,17 @@ void PromptCache::writer() {
                     lock.lock();
                     continue;
                 }
-                if (cv_.wait_for(lock, std::chrono::duration<double>(scan_s)) == std::cv_status::timeout) {
-                    write_idle_locked(now_s());
-                    summary_locked(now_s());
+                if (cv_.wait_for(lock, std::chrono::duration<double>(wake_s)) == std::cv_status::timeout) {
+                    const double now = now_s();
+                    if (now >= watch_at) {
+                        watch_margin(lock), watch_at = now_s() + opt_.ram_watch_seconds;
+                        if (stop_ || !queue_.empty()) break;
+                    }
+                    if (now >= scan_at) {
+                        write_idle_locked(now);
+                        summary_locked(now);
+                        scan_at = now + scan_s;
+                    }
                 }
             }
             if (queue_.empty()) return;  // stop_ with nothing left
@@ -942,6 +958,32 @@ void PromptCache::writer() {
         }
         idle_cv_.notify_all();
     }
+}
+
+void PromptCache::watch_margin(std::unique_lock<std::mutex> &lock) {
+    STRIX_CHECK(lock.owns_lock(), "PromptCache::watch_margin: called without the cache's lock");
+    // Off: no RAM tier keeps nothing to evict; shutting down, the shutdown rule writes RAM entries itself.
+    if (!opt_.ram_tier || shutting_down_ || stop_) return;
+    const uint64_t avail = mem_available();
+    if (avail >= opt_.ram_margin) return;
+    const int64_t before = stats_.ram_evicted;
+    const uint64_t ram_before = ram_bytes_ + spare_bytes_;
+    make_room_locked(opt_.ram_watch_headroom);
+    const int64_t n = stats_.ram_evicted - before;
+    stats_.ram_evicted_watch += n;
+    // A line only when something left: a machine sitting below the margin with nothing left to evict stays quiet.
+    const uint64_t freed = ram_before - std::min(ram_before, ram_bytes_ + spare_bytes_);
+    const double gib = (double)(1ull << 30);
+    if (n > 0 || freed > 0)
+        slog(LogLevel::Info, "prompt cache: MemAvailable %s GiB, below the %s GiB margin between saves (another "
+             "process grew): %s entries leave RAM, %s GB freed now (queued writes free theirs once written)",
+             fmt_rate(avail / gib, 1).c_str(), fmt_rate(opt_.ram_margin / gib, 0).c_str(), fmt_n((long long)n).c_str(),
+             fmt_rate(freed / 1e9, 1).c_str());
+    std::vector<HostBuffer> trash;
+    trash.swap(trash_);
+    lock.unlock();
+    trash.clear();  // unmapped outside the lock
+    lock.lock();
 }
 
 void PromptCache::write_entry(Job &job) {

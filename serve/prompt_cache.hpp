@@ -92,6 +92,7 @@ struct PromptCacheStats {
     int64_t writes = 0, write_failures = 0, bytes_written = 0;
     int64_t writes_evict = 0, writes_idle = 0, writes_shutdown = 0;  // writes by rule
     int64_t ram_evicted = 0;  // entries that left RAM for lack of memory (written, already on disk, or dropped)
+    int64_t ram_evicted_watch = 0;  // of those, by the writer's margin watch (another process grew between saves)
     int64_t ram_only_dropped = 0;  // RAM-only entries that left RAM (never written, by design)
     int64_t rejected_space = 0, rejected_budget = 0, rejected_queue = 0;  // eviction writes refused, by reason
     int64_t room_refused = 0;  // make_room_for found no room: a save skipped or a disk load refused
@@ -111,12 +112,19 @@ public:
     enum class Kind : uint32_t { System = 1, Turn = 2, Checkpoint = 3 };
 
     struct Options {
-        // Keep MemAvailable above this (RAM entries leave first; make_room_for holds it at every allocation). 24 GiB:
-        // at 16 the switch test hit direct compaction at 23-27 GB available (MemAvailable is mostly page cache, and
-        // large allocations compact it) - exports 4-5 s, a RAM resume 9.6 s; at 24, none. A single-purpose machine
-        // measured fine at 4; the right default for one that also runs a desktop is still being measured.
-        uint64_t ram_margin = 24ull << 30;
-        double idle_seconds = 600;          // an entry idle in RAM this long is written (and kept in RAM)
+        // Keep MemAvailable above this (RAM entries leave first; make_room_for holds it at every allocation). 4 GiB
+        // (2026-10-08; was 24, set against direct compaction from MADV_HUGEPAGE buffers and buffered writes, both gone
+        // since e35f0c8): the switch test at 512k capacity / chunk 16384, two 264k conversations, n-gram table warm,
+        // bottomed at 5.5 GiB with 0 compaction stalls, RAM resumes 1.2-1.4 s.
+        uint64_t ram_margin = 4ull << 30;
+        double idle_seconds = 3600;  // an entry idle in RAM this long is written (and kept in RAM); served since 2026-10-02
+        // The margin watch: the writer applies the RAM rule this often, so memory another process takes between saves
+        // (a build or test an agent runs, a sidecar) is answered within seconds, not at the next save (2026-10-10:
+        // the margin was held only at allocations). One /proc/meminfo read a check. Below the margin it frees down to
+        // margin + ram_watch_headroom: freeing only the shortfall let a hog growing 0.5 GiB/s outrun a 2 s watch to
+        // 2.8 GiB (hog test 77ab6df, ~/bench-out/day/2026-10-10/memwatch2).
+        double ram_watch_seconds = 1;
+        uint64_t ram_watch_headroom = 1ull << 30;
         // Budget for eviction and idle writes; 0 = no limit. 32 GiB/h: the served value since 2026-10-03 (reasons in
         // deploy/strix-server.conf); the old 64 predates delta entries.
         double write_gib_per_hour = 32;
@@ -260,6 +268,8 @@ private:
     void unlink_locked(Entry &e);                      // its file
     void keep_spare_locked(HostBuffer b);
     void make_room_locked(uint64_t extra = 0);         // the RAM rule: MemAvailable >= ram_margin + extra
+    // The writer's margin watch (Options::ram_watch_seconds): the RAM rule, its buffers unmapped outside the lock.
+    void watch_margin(std::unique_lock<std::mutex> &lock);
     void evict_disk_locked(uint64_t need);
     // Makes room for `need` bytes on disk by evicting entries used less recently than `last_used`; false if it can't.
     bool disk_room_locked(uint64_t need, uint64_t last_used);
