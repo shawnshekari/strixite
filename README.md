@@ -54,6 +54,11 @@ source.
 You need an AMD Strix Halo machine with 128 GB of memory running Linux, and a fast NVMe drive with ~120 GB free for
 the weights, plus room for the prompt cache (capped at 128 GiB, and it never leaves less than 32 GiB free).
 
+> [!NOTE]
+> **Not a dedicated, headless Strix Halo and want to try strixite anyway?** The defaults assume the machine runs
+> nothing else - that's where it's fastest. Sharing it with a desktop or another model works with a couple of
+> settings changed: [Memory](docs/memory.md) has the recipes.
+
 **1. Let the GPU use the memory.** Strix Halo's GPU allocates from system memory (GTT). The default limit is far
 below what the model needs, so raise it with kernel parameters - these are mine, with the BIOS's dedicated VRAM set
 to its minimum (512 MB):
@@ -101,8 +106,10 @@ follows it - including the prompt cache's directory.
 build/strix/strix_server --config deploy/strix-server.conf
 ```
 
-`--config` matters: without it the server uses its built-in defaults (a 256k context instead of 512k, among others).
-Change a setting in the file, or override it on the command line: `--capacity 262144` sets the context in tokens.
+The built-in defaults are the values in `deploy/strix-server.conf` - the file adds the reason behind each one, and is
+the place to change them; a flag overrides a single setting: `--capacity 262144` sets the context in tokens. The
+defaults assume the machine is dedicated to strixite. If it's also your desktop or runs another model, see
+[Memory](docs/memory.md): the server checks at startup that it has room, and tells you what to change if it doesn't.
 
 **6. Try it:**
 
