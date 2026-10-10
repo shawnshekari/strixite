@@ -23,6 +23,13 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// A GPU error after which the device context is gone (an illegal address, a kernel fault): every later call fails
+// too, so the request fails and the process exits for its supervisor to restart (common/hip_check.hpp classifies).
+class GpuFatalError : public Error {
+public:
+    using Error::Error;
+};
+
 template <typename... Args>
 std::string cat(Args &&...args) {
     std::ostringstream os;

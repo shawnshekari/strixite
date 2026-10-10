@@ -81,7 +81,9 @@ FROM registry.fedoraproject.org/fedora-minimal:${FEDORA}
 COPY --from=build /opt/strixite /opt/strixite
 ENV LD_LIBRARY_PATH=/opt/strixite/lib \
     PATH=/opt/strixite/bin:/usr/bin:/bin \
-    STRIX_MODELS_DIR=/models
+    STRIX_MODELS_DIR=/models \
+    HSA_DISABLE_COREDUMP_ON_EXCEPTION=1
+# (no GPU memory dump into the working directory on a GPU fault - deploy/strix-server.service says why)
 VOLUME /models
 EXPOSE 5300
 # /models: the downloaded weights (hf download ... --local-dir), and the prompt cache's directory (prompt-cache/,

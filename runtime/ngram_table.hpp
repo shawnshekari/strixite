@@ -48,7 +48,13 @@ public:
     int64_t row_dim() const override { return file_.info().row_dim; }
     void gather(const int64_t *rows, int64_t n, uint16_t *out) const override;
     void prefetch(const int64_t *rows, int64_t n) const override;
-    int64_t cache_rows() const { return cap_; }
+    int64_t cache_rows() const;
+    // RAM per cache row: the row's BF16 values + its slot's LRU links and index entry (an unordered_map node and
+    // bucket, ~40 B - estimated, not measured).
+    uint64_t cache_bytes_per_row() const { return (uint64_t)row_dim() * 2 + 24 + 40; }
+    // Empties the cache and reallocates it at `rows` (0..2^26), freeing the old arrays - the startup memory plan's
+    // shrink (serve/memory_plan.hpp). Thread-safe; gathers meanwhile wait.
+    void resize_cache(int64_t rows) const;
     const NgramTableFile &file() const { return file_; }
     // Gathers: rows requested, distinct rows per gather (summed), of those served from the cache / read from the
     // file. Prefetches: rows read from the file into the cache (a later gather counts them as hits).
@@ -64,7 +70,7 @@ public:
 
 private:
     NgramTableFile file_;
-    int64_t cap_;
+    mutable int64_t cap_;  // under mu_ (resize_cache)
     // LRU over cap_ slots: slot -> row id, doubly linked most- to least-recent.
     mutable std::mutex mu_;
     mutable std::unordered_map<int64_t, int32_t> where_;

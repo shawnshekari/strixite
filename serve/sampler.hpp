@@ -55,6 +55,11 @@ struct LogitMasks {
 // Full rows: every logit whose id the row's mask disallows becomes -inf (candidate rows: refused - their backend
 // applies the mask before reducing).
 void apply_masks(LogitRows &rows, const LogitMasks &masks);
+// Takes ids out of row r after the forward (the think-block guard, Engine::Options::think_end_guard): full rows get
+// -inf there; candidate rows drop them and end in padding (-inf, INT32_MAX) - top-k then draws from one fewer
+// candidate per removed id (the row's 21st-best is not there to move up; after top-p 0.95 its share is nearly always
+// cut anyway). Returns whether one of ids was the row's top token (it would most likely have been sampled).
+bool ban_tokens(LogitRows &rows, int64_t r, const std::vector<int32_t> &ids);
 
 class Sampler {
 public:

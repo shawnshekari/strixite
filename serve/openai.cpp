@@ -397,6 +397,7 @@ json::Value strix_ext(const GenerationResult &r, bool clamped, const std::string
     if (r.malformed_tool_calls > 0) s.set("malformed_tool_calls", json::Value::integer(r.malformed_tool_calls));
     s.set("thinking_budget_hit", json::Value::boolean(r.thinking_budget_hit));
     if (r.think_nudges > 0) s.set("think_nudges", json::Value::integer(r.think_nudges));
+    if (r.think_end_blocked > 0) s.set("think_end_blocked", json::Value::integer(r.think_end_blocked));
     if (!thinking.empty()) s.set("thinking", json::Value::string(thinking));
     if (thinking == "skipped")
         s.set("thinking_skipped_reason",

@@ -17,6 +17,7 @@ public:
     int64_t max_chunk() const override { return session_.max_tokens(); }
     int64_t logits_row() const override { return model_.dims().vocab; }
     int64_t pos() const override { return session_.pos(); }
+    uint64_t state_bytes_at(int64_t n) const { return session_.state_bytes(n); }  // a whole saved state at n tokens
     void reset() override { session_.reset(); }
     std::vector<float> forward(const std::vector<int32_t> &ids, bool want_logits) override {
         return session_.forward(ids, want_logits ? 1 : 0);
@@ -60,6 +61,7 @@ public:
     bool can_restore_snapshot(int slot) const override { return session_.can_restore(snap(slot)); }
     void restore_snapshot(int slot) override { session_.restore(snap(slot)); }
     void export_snapshot(int slot, HostBuffer &out, int64_t from = 0) override;
+    uint64_t snapshot_bytes(int slot, int64_t from = 0) const override;
     void import_state(const HostBuffer &state, int64_t n, int64_t from = 0) override;
     std::string state_fingerprint() const override;
     std::string describe() const override;

@@ -207,9 +207,10 @@ size_t NgramTableRows::fill(const std::vector<int64_t> &uniq, uint16_t *buf) con
         }
         ngram_decode_row(info, raw.data(), buf + u * D);  // the cache and the forward see BF16
     });
-    if (cap_ > 0 && !miss.empty()) {
+    if (!miss.empty()) {
         std::lock_guard<std::mutex> lock(mu_);
-        for (size_t u : miss) {
+        for (size_t u = 0, k = 0; cap_ > 0 && k < miss.size(); ++k) {  // (cap_ under the lock: resize_cache)
+            u = miss[k];
             auto it = where_.find(uniq[u]);  // another gather / prefetch may have read it meanwhile
             if (it != where_.end()) touch(it->second);
             else std::memcpy(data_.data() + (size_t)take_slot(uniq[u]) * D, buf + u * D, vb);
@@ -247,6 +248,25 @@ void NgramTableRows::prefetch(const int64_t *rows, int64_t n) const {
 void NgramTableRows::clear_cache() const {
     std::lock_guard<std::mutex> lock(mu_);
     where_.clear();
+    head_ = tail_ = -1, used_ = 0;
+}
+
+int64_t NgramTableRows::cache_rows() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return cap_;
+}
+
+void NgramTableRows::resize_cache(int64_t rows) const {
+    STRIX_CHECK(rows >= 0 && rows <= (1ll << 26), "NgramTableRows::resize_cache: rows = ", rows, ", expected 0..2^26");
+    std::lock_guard<std::mutex> lock(mu_);
+    // Swapped with fresh containers so the old memory is returned now (clear() / resize() keep the capacity).
+    std::unordered_map<int64_t, int32_t>().swap(where_);
+    std::vector<int64_t>((size_t)rows).swap(slot_row_);
+    std::vector<int32_t>((size_t)rows).swap(prev_);
+    std::vector<int32_t>((size_t)rows).swap(next_);
+    std::vector<uint16_t>((size_t)(rows * file_.info().row_dim)).swap(data_);
+    where_.reserve((size_t)rows);
+    cap_ = rows;
     head_ = tail_ = -1, used_ = 0;
 }
 

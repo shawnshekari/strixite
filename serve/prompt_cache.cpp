@@ -104,12 +104,24 @@ Header read_header(int fd, const std::string &path, const std::string &fingerpri
     STRIX_CHECK(r.fingerprint == fingerprint, path, ": saved for '", r.fingerprint, "', this server is '", fingerprint, "'");
     STRIX_CHECK(r.kind >= 1 && r.kind <= 3, path, ": kind ", r.kind, ", expected 1 (system), 2 (turn) or 3 (checkpoint)");
     STRIX_CHECK(r.tokens >= 1 && r.tokens < (1ull << 24), path, ": ", r.tokens, " tokens");
-    STRIX_CHECK(r.base_n < r.tokens && (r.base_n == 0 || r.kind == 2), path, ": base of ", r.base_n, " tokens for a kind ",
-                r.kind, " entry of ", r.tokens, " (a delta is a turn, on a shorter base)");
+    STRIX_CHECK(r.base_n < r.tokens && (r.base_n == 0 || r.kind != 1), path, ": base of ", r.base_n, " tokens for a kind ",
+                r.kind, " entry of ", r.tokens, " (a delta is a turn or a checkpoint, on a shorter base)");
     STRIX_CHECK(r.state_at == align4k(kHeaderBytes + r.tokens * 4) && r.state_at + r.state_bytes == file_bytes, path,
                 ": layout says ", r.state_at, " + ", r.state_bytes, " bytes, the file has ", file_bytes);
     return r;
 }
+
+
+// The writer thread's I/O at idle priority (ioprio_set, IOPRIO_CLASS_IDLE on this thread): the n-gram table's reads
+// on the same SSD go first. Only effective under an I/O scheduler that honours priorities (bfq); logged either way.
+void set_idle_io_priority() {
+    constexpr int kWhoProcess = 1, kClassIdle = 3, kClassShift = 13;
+    const long r = ::syscall(SYS_ioprio_set, kWhoProcess, 0, kClassIdle << kClassShift);
+    if (r != 0)
+        slog(LogLevel::Warning, "prompt cache: the writer's idle I/O priority wasn't set: %s", std::strerror(errno));
+}
+
+}  // namespace
 
 // /proc/meminfo's MemAvailable in bytes; throws if it can't be read.
 uint64_t proc_mem_available() {
@@ -122,17 +134,6 @@ uint64_t proc_mem_available() {
         if (key == "MemAvailable:") return kib << 10;
     STRIX_FAIL("PromptCache: /proc/meminfo has no MemAvailable line");
 }
-
-// The writer thread's I/O at idle priority (ioprio_set, IOPRIO_CLASS_IDLE on this thread): the n-gram table's reads
-// on the same SSD go first. Only effective under an I/O scheduler that honours priorities (bfq); logged either way.
-void set_idle_io_priority() {
-    constexpr int kWhoProcess = 1, kClassIdle = 3, kClassShift = 13;
-    const long r = ::syscall(SYS_ioprio_set, kWhoProcess, 0, kClassIdle << kClassShift);
-    if (r != 0)
-        slog(LogLevel::Warning, "prompt cache: the writer's idle I/O priority wasn't set: %s", std::strerror(errno));
-}
-
-}  // namespace
 
 PromptCache::PromptCache(std::string dir, uint64_t max_bytes, std::string fingerprint)
     : PromptCache(std::move(dir), max_bytes, std::move(fingerprint), Options{}) {}
@@ -151,6 +152,8 @@ PromptCache::PromptCache(std::string dir, uint64_t max_bytes, std::string finger
                 opt_.shutdown_seconds, ", expected >= 0");
     STRIX_CHECK(opt_.checkpoints_per_chain >= 1, "PromptCache: checkpoints_per_chain ", opt_.checkpoints_per_chain,
                 ", expected >= 1");
+    STRIX_CHECK(opt_.max_spares >= 0 && opt_.max_spares <= kMaxSpares, "PromptCache: max_spares ", opt_.max_spares,
+                ", expected 0..", kMaxSpares);
     fs::create_directories(dir_);
     // Probe both once, so a broken probe fails here and not on the request path.
     (void)mem_available();
@@ -350,6 +353,7 @@ bool PromptCache::with_state(const std::vector<int32_t> &prompt, int64_t n,
         EntryPtr e;
         std::string path;  // empty: RAM
         HostBuffer loaded;
+        uint64_t file_bytes = 0;  // the file's size (a disk part): what the load needs in RAM, about
     };
     std::vector<Part> parts;
     {
@@ -364,7 +368,7 @@ bool PromptCache::with_state(const std::vector<int32_t> &prompt, int64_t n,
             STRIX_CHECK(!p.e->ram.empty() || !p.e->path.empty(), "PromptCache::with_state: the entry of ",
                         p.e->tokens.size(), " tokens is neither in RAM nor on disk");
             if (!p.e->ram.empty()) ++p.e->readers;
-            else p.path = p.e->path;
+            else p.path = p.e->path, p.file_bytes = p.e->file_bytes;
         }
     }
     // Every RAM part's reader count goes back down however this ends; loaded buffers are promoted or kept as spares.
@@ -397,6 +401,15 @@ bool PromptCache::with_state(const std::vector<int32_t> &prompt, int64_t n,
         if (p.path.empty()) continue;
         any_disk = true;
         p.loaded = take_buffer();
+        // Room first, the margin counted at the allocation (make_room_for): refused, the prompt prefills instead.
+        if (p.file_bytes > p.loaded.capacity() && !make_room_for(p.file_bytes - p.loaded.capacity())) {
+            slog(LogLevel::Warning, "prompt cache: not loading the %s-token entry from disk: no room in RAM (needs %s GB "
+                 "more; MemAvailable %s GiB, margin %s GiB)", fmt_n((long long)p.e->tokens.size()).c_str(),
+                 fmt_rate((p.file_bytes - p.loaded.capacity()) / 1e9, 1).c_str(),
+                 fmt_rate(mem_available() / (double)(1ull << 30), 1).c_str(),
+                 fmt_rate(opt_.ram_margin / (double)(1ull << 30), 0).c_str());
+            return false;
+        }
         try {
             load_file(p.path, prompt, (int64_t)p.e->tokens.size(), p.loaded);
         } catch (const std::exception &ex) {
@@ -488,7 +501,7 @@ void PromptCache::keep_spare_locked(HostBuffer b) {
     if (b.capacity() == 0) return;
     spare_bytes_ += b.capacity();
     spares_.push_back(std::move(b));
-    while ((int)spares_.size() > kMaxSpares) {  // the smallest goes
+    while ((int)spares_.size() > opt_.max_spares) {  // the smallest goes
         size_t small = 0;
         for (size_t i = 1; i < spares_.size(); ++i)
             if (spares_[i].capacity() < spares_[small].capacity()) small = i;
@@ -537,12 +550,14 @@ void PromptCache::remove_locked(size_t i) {
 
 int64_t PromptCache::delta_base(const int32_t *tokens, int64_t n, Kind kind) const {
     STRIX_CHECK(tokens != nullptr && n >= 1, "PromptCache::delta_base: ", n, " tokens at ", (const void *)tokens);
-    if (kind != Kind::Turn || opt_.delta_max_tokens <= 0) return 0;
+    if (kind == Kind::System || opt_.delta_max_tokens <= 0) return 0;
     std::lock_guard<std::mutex> lock(mu_);
     int64_t best = 0;
     for (const EntryPtr &e : entries_) {
         const int64_t b = (int64_t)e->tokens.size();
         if (e->base || e->dead || b <= best || b >= n) continue;  // whole entries only; deltas don't chain
+        // A Checkpoint's base is never a Turn: the next turn replaces a Turn, and the checkpoint would go with it.
+        if (kind == Kind::Checkpoint && e->kind == Kind::Turn) continue;
         if (std::memcmp(e->tokens.data(), tokens, (size_t)b * 4) == 0) best = b;
     }
     // Worth it while the delta stays small against the base (a quarter) and in absolute terms; else save whole.
@@ -556,9 +571,9 @@ bool PromptCache::put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, 
     STRIX_CHECK(!tokens.empty() && !state.empty(), "PromptCache::put: ", tokens.size(), " tokens, ", state.size(), " state bytes");
     STRIX_CHECK(kind == Kind::System || kind == Kind::Turn || kind == Kind::Checkpoint, "PromptCache::put: kind ",
                 (uint32_t)kind, ", expected 1..3");
-    STRIX_CHECK(base_n >= 0 && base_n < (int64_t)tokens.size() && (base_n == 0 || kind == Kind::Turn),
+    STRIX_CHECK(base_n >= 0 && base_n < (int64_t)tokens.size() && (base_n == 0 || kind != Kind::System),
                 "PromptCache::put: base of ", base_n, " tokens for a kind ", (uint32_t)kind, " entry of ", tokens.size(),
-                " (a delta is a Turn on a shorter base)");
+                " (a delta is a Turn or a Checkpoint on a shorter base)");
     std::vector<HostBuffer> trash;
     std::lock_guard<std::mutex> lock(mu_);
     EntryPtr base;
@@ -612,9 +627,13 @@ bool PromptCache::put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, 
                 std::memcmp(e->tokens.data(), tokens.data(), e->tokens.size() * 4) == 0)
                 chain.emplace_back(e->tokens.size(), e.get());
         std::sort(chain.begin(), chain.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+        // Longest first, so a delta goes before its base. A base stays while a delta needs it - this put's own base
+        // and the base of a checkpoint delta kept above (Checkpoint deltas, 2026-10-08); it goes on a later trim.
         for (size_t k = (size_t)opt_.checkpoints_per_chain - 1; k < chain.size(); ++k) {
-            if (chain[k].second == base.get()) continue;  // (never: a delta's base for a Checkpoint put - deltas are Turns)
-            remove_locked((size_t)find_locked(chain[k].second));
+            if (chain[k].second == base.get() || chain[k].second->dependents > 0) continue;
+            const int i = find_locked(chain[k].second);
+            if (i < 0) continue;  // (not expected: only a base takes others with it, and bases are skipped)
+            remove_locked((size_t)i);
             ++stats_.checkpoints_dropped;
         }
     }
@@ -693,10 +712,27 @@ void PromptCache::enqueue_locked(const EntryPtr &e, Why why) {
     cv_.notify_one();
 }
 
-void PromptCache::make_room_locked() {
+bool PromptCache::make_room_for(uint64_t bytes) {
+    STRIX_CHECK(bytes < (1ull << 40), "PromptCache::make_room_for: ", bytes, " bytes, expected < 1 TiB");
+    if (bytes == 0) return true;
+    {
+        std::vector<HostBuffer> trash;
+        std::lock_guard<std::mutex> lock(mu_);
+        make_room_locked(bytes);
+        trash.swap(trash_);
+    }  // the evicted buffers are unmapped here, before MemAvailable is read again
     const uint64_t avail = mem_available();
-    if (avail >= opt_.ram_margin) return;
-    uint64_t need = opt_.ram_margin - avail;
+    if (avail >= opt_.ram_margin + bytes) return true;
+    std::lock_guard<std::mutex> lock(mu_);
+    ++stats_.room_refused;
+    return false;
+}
+
+void PromptCache::make_room_locked(uint64_t extra) {
+    const uint64_t avail = mem_available(), target = opt_.ram_margin + extra;
+    if (avail >= target && opt_.ram_tier) return;
+    // No RAM tier: every entry that can leave does (need never reaches 0 below).
+    uint64_t need = opt_.ram_tier ? target - avail : UINT64_MAX;
     // Spares go first: nothing is lost.
     while (need > 0 && !spares_.empty()) {
         need -= std::min(need, (uint64_t)spares_.back().capacity());
@@ -714,7 +750,7 @@ void PromptCache::make_room_locked() {
             if (!e->ram.empty() && !e->drop_ram && (e->readers == 0 || e->queued) && (!lru || e->last_used < lru->last_used))
                 lru = e.get();
         if (!lru) break;  // the rest is in use or on its way out; the next put tries again
-        need -= std::min(need, (uint64_t)lru->ram.capacity());
+        if (opt_.ram_tier) need -= std::min(need, (uint64_t)lru->ram.capacity());
         ++stats_.ram_evicted;
         if (lru->queued) {  // written soon: out of RAM after that
             lru->drop_ram = true;
@@ -755,8 +791,11 @@ void PromptCache::make_room_locked() {
         slog(level, "prompt cache: dropped a %s entry of %s tokens%s, %s GB (%slast used %s ago)", kind_name(lru->kind),
              fmt_n((long long)lru->tokens.size()).c_str(), deltas.c_str(), fmt_rate(lru->ram.size() / 1e9, 1).c_str(),
              by.c_str(), ago(idle).c_str());
-        slog(level, "%sit had to leave RAM (MemAvailable %s GiB, below the %s GiB margin) and can't go to disk:", kCont,
-             fmt_rate(avail / (double)(1ull << 30), 1).c_str(), fmt_rate(opt_.ram_margin / (double)(1ull << 30), 0).c_str());
+        if (opt_.ram_tier)
+            slog(level, "%sit had to leave RAM (MemAvailable %s GiB, below the %s GiB margin) and can't go to disk:", kCont,
+                 fmt_rate(avail / (double)(1ull << 30), 1).c_str(), fmt_rate(opt_.ram_margin / (double)(1ull << 30), 0).c_str());
+        else
+            slog(level, "%sit had to leave RAM (the RAM tier is off: low-memory adapt) and can't go to disk:", kCont);
         if (no[0] == 'q')
             slog(level, "%sthe write queue is full (%s of %s GB queued)", kCont, fmt_rate(pending_bytes_ / 1e9, 1).c_str(),
                  fmt_rate(queue_cap / 1e9, 1).c_str());
@@ -780,9 +819,10 @@ void PromptCache::summary_locked(double now) {
     int64_t ram_n = 0, disk_n = 0;
     for (const EntryPtr &e : entries_) ram_n += !e->ram.empty(), disk_n += !e->path.empty();
     const double gib = (double)(1ull << 30);
-    slog(LogLevel::Info, "prompt cache: RAM %s entries, %s GB (+ %s GB spare buffers); MemAvailable %s GiB (margin %s)",
+    slog(LogLevel::Info, "prompt cache: RAM %s entries, %s GB (+ %s GB spare buffers); MemAvailable %s GiB (margin %s)%s%s",
          fmt_n(ram_n).c_str(), fmt_rate(ram_bytes_ / 1e9, 1).c_str(), fmt_rate(spare_bytes_ / 1e9, 1).c_str(),
-         fmt_rate(mem_available() / gib, 1).c_str(), fmt_rate(opt_.ram_margin / gib, 0).c_str());
+         fmt_rate(mem_available() / gib, 1).c_str(), fmt_rate(opt_.ram_margin / gib, 0).c_str(),
+         opt_.status_note.empty() ? "" : "; ", opt_.status_note.c_str());
     char budget[64] = "no write budget";
     if (opt_.write_gib_per_hour > 0)
         std::snprintf(budget, sizeof budget, "write budget %s of %s GiB left this hour",
@@ -813,7 +853,7 @@ uint64_t PromptCache::prefault_want_locked() const {
     if (!opt_.prefault || prefault_bytes_ == 0 || shutting_down_ || stop_) return 0;
     int ready = 0;
     for (const HostBuffer &b : spares_) ready += b.capacity() >= prefault_bytes_;
-    if (ready >= kMaxSpares) return 0;
+    if (ready >= opt_.max_spares) return 0;
     if (mem_available() < opt_.ram_margin + prefault_bytes_) return 0;  // never into memory pressure
     return prefault_bytes_;
 }

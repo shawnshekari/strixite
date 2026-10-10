@@ -41,7 +41,7 @@
 // Checkpoints per conversation: a new Checkpoint keeps at most checkpoints_per_chain - 1 of the older Checkpoints it
 // extends (the newest), so a long session doesn't fill RAM and disk with its early user messages.
 //
-// Delta entries: a Turn may be saved as a delta on
+// Delta entries: a Turn or a Checkpoint may be saved as a delta on
 // a full entry it extends - its base - holding only what changed since the base's position (the K / V rows past it and
 // the per-step state; LmBackend::export_snapshot with from > 0). A deep conversation then saves ~0.2 GB a turn instead
 // of its whole state (11.5 GB at 410k). delta_base() picks the base: the longest full entry the Turn extends, if the
@@ -51,7 +51,11 @@
 // - a new Turn replaces the Turns it extends except its own base, and a base's buffer is never handed out for reuse;
 // - a delta reaches the disk only with its base: writing one writes the base first if it isn't there (the budget
 //   counts both); at startup a delta file whose base file is missing is dropped (counted invalid);
-// - using or saving a delta refreshes its base's place in the LRU, so the two leave RAM together.
+// - using or saving a delta refreshes its base's place in the LRU, so the two leave RAM together;
+// - a Checkpoint's base is a Checkpoint or a System entry, never a Turn (the next turn would replace it, and the
+//   checkpoint would go with it); the checkpoints_per_chain trim skips a base while a delta needs it (2026-10-08:
+//   terminal-bench sends every terminal output as a user message - a whole ~1.2 GB checkpoint a request - and the
+//   margin test's 264k conversations a whole 7.4 GB one).
 // On disk a delta is a version-2 file whose header names its base by length (the base's tokens are the delta's own
 // first base_n tokens).
 //
@@ -76,6 +80,9 @@
 
 namespace strix {
 
+// /proc/meminfo's MemAvailable in bytes; throws if it can't be read (the RAM tier's probe and the startup memory plan).
+uint64_t proc_mem_available();
+
 struct PromptCacheStats {
     int64_t entries = 0;                           // RAM or disk or both
     int64_t ram_entries = 0, ram_bytes = 0;        // RAM: entries' buffers (capacity)
@@ -87,6 +94,7 @@ struct PromptCacheStats {
     int64_t ram_evicted = 0;  // entries that left RAM for lack of memory (written, already on disk, or dropped)
     int64_t ram_only_dropped = 0;  // RAM-only entries that left RAM (never written, by design)
     int64_t rejected_space = 0, rejected_budget = 0, rejected_queue = 0;  // eviction writes refused, by reason
+    int64_t room_refused = 0;  // make_room_for found no room: a save skipped or a disk load refused
     int64_t evicted = 0, replaced = 0, invalid = 0;  // disk LRU / replaced turns / damaged or foreign
     int64_t checkpoints_dropped = 0;                 // older Checkpoints over checkpoints_per_chain
     int64_t prefaulted = 0;                          // spares the writer populated ahead of an export
@@ -103,20 +111,28 @@ public:
     enum class Kind : uint32_t { System = 1, Turn = 2, Checkpoint = 3 };
 
     struct Options {
-        // Keep MemAvailable above this (RAM entries leave first). 24 GiB: at 16 the switch test (dd56908) hit direct
-        // compaction at 23-27 GB available (MemAvailable is mostly page cache; MADV_HUGEPAGE allocations compact) -
-        // exports 4-5 s, a RAM resume 9.6 s; at 24, none.
+        // Keep MemAvailable above this (RAM entries leave first; make_room_for holds it at every allocation). 24 GiB:
+        // at 16 the switch test hit direct compaction at 23-27 GB available (MemAvailable is mostly page cache, and
+        // large allocations compact it) - exports 4-5 s, a RAM resume 9.6 s; at 24, none. A single-purpose machine
+        // measured fine at 4; the right default for one that also runs a desktop is still being measured.
         uint64_t ram_margin = 24ull << 30;
         double idle_seconds = 600;          // an entry idle in RAM this long is written (and kept in RAM)
-        double write_gib_per_hour = 64;     // budget for eviction and idle writes; 0 = no limit
+        // Budget for eviction and idle writes; 0 = no limit. 32 GiB/h: the served value since 2026-10-03 (reasons in
+        // deploy/strix-server.conf); the old 64 predates delta entries.
+        double write_gib_per_hour = 32;
         uint64_t disk_free_margin = 32ull << 30;  // a write never leaves less free space on the cache's filesystem
         double shutdown_seconds = 40;       // the destructor's flush stops after this long
         int checkpoints_per_chain = 2;      // Checkpoints kept per conversation (>= 1)
         // Delta entries: a Turn is a delta on its base while it adds at most this many tokens (and at most a quarter of
-        // the base's); 0 = every entry whole. 32768: a delta of ~0.9 GB (27 KiB a token), a rebase every 32k tokens
-        // of a deep conversation.
-        int64_t delta_max_tokens = 32768;
+        // the base's); 0 = every entry whole. 65536 (was 32768, 2026-10-08): below a 262k base the quarter rule
+        // decides - a delta of <= ~1.4 GB (27 KiB a token + ~0.12 GB) instead of a whole rebase every 32k tokens.
+        int64_t delta_max_tokens = 65536;
         bool prefault = true;               // the writer keeps populated spares ready for the next export
+        int max_spares = 2;                 // spare buffers kept, 0..kMaxSpares (0: low-memory adapt, serve/memory_plan)
+        // false (low-memory adapt, serve/memory_plan.hpp): no RAM tier - every entry leaves RAM right after its put or
+        // load (written to disk under the usual rules, else dropped), so only the export or load in flight holds RAM.
+        bool ram_tier = true;
+        std::string status_note;            // appended to the periodic status line ("" = none): what adapt turned down
         uint64_t prefault_headroom = 256ull << 20;  // on top of the last saved state (a conversation grows)
         uint64_t max_pending_bytes = 0;  // the eviction write queue's cap; 0 = max(kMaxPendingBytes, 4 x last state)
         // Memory and disk probes: /proc/meminfo MemAvailable and statvfs(dir) by default; tests fake them.
@@ -183,6 +199,14 @@ public:
     // deltas nor the entry of tokens[0, keep_n) - the base the coming put will name (delta_base()), whose old delta
     // this call may just have taken.
     HostBuffer take_replaced_buffer(const int32_t *tokens, int64_t n, int64_t keep_n = 0);
+    // Before a buffer grows by `bytes` (an export into a taken buffer, a disk load): spares and least recently used
+    // entries leave RAM until MemAvailable >= ram_margin + bytes, measured after their memory is unmapped. False if it
+    // still isn't (an eviction write still queued holds its RAM until written): the caller then doesn't grow the
+    // buffer - the save is skipped, the load refused - so the margin holds at every allocation, not only after a put
+    // (2026-10-08: a whole 7.4 GB export a request, checked only afterwards, took the machine to 0.5 GB and hung it).
+    bool make_room_for(uint64_t bytes);
+    uint64_t mem_available_now() const { return mem_available(); }  // MemAvailable (or the test's probe), bytes
+    uint64_t disk_free_now() const { return disk_free(); }          // free bytes on the directory's filesystem
     void give_back(HostBuffer b);
     // Queues the idle rule's writes now (the writer also does this on its own every few seconds).
     void write_idle();
@@ -235,7 +259,7 @@ private:
     void release_locked(Entry &e);                     // a reader / the writer is done with e
     void unlink_locked(Entry &e);                      // its file
     void keep_spare_locked(HostBuffer b);
-    void make_room_locked();                           // the RAM rule
+    void make_room_locked(uint64_t extra = 0);         // the RAM rule: MemAvailable >= ram_margin + extra
     void evict_disk_locked(uint64_t need);
     // Makes room for `need` bytes on disk by evicting entries used less recently than `last_used`; false if it can't.
     bool disk_room_locked(uint64_t need, uint64_t last_used);

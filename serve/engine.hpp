@@ -27,6 +27,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -132,6 +133,8 @@ public:
     // since position `from` (the KV rows [from, n) and every per-step part; Qwen4ExpSession::state_bytes), imported
     // right after its base (import_state(base, from), then import_state(delta, n, from)).
     virtual void export_snapshot(int slot, HostBuffer &out, int64_t from = 0) = 0;  // resizes out to the state's size
+    // The bytes export_snapshot(slot, out, from) will size out to (the prompt cache makes room for them first).
+    virtual uint64_t snapshot_bytes(int slot, int64_t from = 0) const = 0;
     virtual void import_state(const HostBuffer &state, int64_t n, int64_t from = 0) = 0;
     // What a saved state fits: model, weights, layout, activation dtype (PromptCache refuses others).
     virtual std::string state_fingerprint() const = 0;
@@ -187,6 +190,7 @@ struct GenerationResult {
     BackendStats backend;  // this request's share (wait_max: the longest wait of the session so far)
     bool thinking_budget_hit = false;  // the engine closed the think block (kThinkingStop was fed)
     int64_t think_nudges = 0;          // thinking nudges fed (serve/think_nudge.hpp)
+    int64_t think_end_blocked = 0;     // rows where the guard took out an end of turn that was the top token
 };
 
 // The request's side of the loop, called on the engine thread.
@@ -206,6 +210,7 @@ struct EngineStats {
     int64_t mtp_drafted_tokens = 0, mtp_accepted_tokens = 0, mtp_rollbacks = 0;
     int64_t mtp_reject_at[kMtpMaxDraft] = {};
     int64_t think_nudges = 0;  // thinking nudges fed
+    int64_t think_end_blocked = 0;  // GenerationResult::think_end_blocked, summed
     int64_t cache_hits = 0, cache_misses = 0;
     double prefill_seconds = 0, decode_seconds = 0;
     double last_prefill_tps = 0, last_decode_tps = 0;
@@ -234,6 +239,20 @@ public:
         // comparisons with engines that don't have it.
         bool think_nudge = true;
         ThinkWatch::Policy think_nudge_policy;  // when it fires (config think-nudge-rate / -min-tokens)
+        std::string think_nudge_wording = "commit";  // nudge 1's text (config think-nudge-wording; think_nudge1_text)
+        // The think-block guard (config think-end-guard): <|im_end|> / <|endoftext|> are never sampled while the think
+        // block or a tool call is open (ban_tokens). Off only for like-for-like comparisons with engines that don't have it.
+        bool think_end_guard = true;
+        // OutputParser::Config::literal_tags (config literal-tags): a tag not right after a newline is text.
+        bool literal_tags = true;
+        // Called once, on the worker thread, after a request failed with GpuFatalError (the GPU context is lost, every
+        // later request would fail): that request and the queued ones have their error responses, new ones are
+        // refused. strix_server stops serving and exits non-zero, for its supervisor to restart it. Empty: the
+        // engine only refuses.
+        std::function<void(const std::string &)> on_fatal;
+        // Non-empty: what startup turned down (serve/memory_plan.hpp, low-memory adapt). Every request's log block
+        // carries it as a "performance degraded" WARNING row, and /health reports it.
+        std::string degraded;
     };
 
     Engine(LmBackend &backend, const Tokenizer &tok, const Options &options);
@@ -249,6 +268,9 @@ public:
     const LmBackend &backend() const { return be_; }
     const PromptCache *prompt_cache() const { return cache_; }
     float mtp_margin() const { return options_.mtp_margin; }
+    // The GpuFatalError that stopped the engine (empty: none); submit refuses every request after it.
+    std::string fatal_error() const;
+    const std::string &degraded() const { return options_.degraded; }
 
 private:
     struct Job {
@@ -285,6 +307,8 @@ private:
     std::condition_variable cv_;
     std::deque<Job> queue_;
     bool stop_ = false;
+    std::string fatal_;  // the GpuFatalError's text once one was thrown; under mu_
+    std::string fatal_pending_;  // set by run()'s handler, moved to fatal_ by the worker (worker thread only)
     EngineStats stats_;
     double idle_since_ = 0;  // when the last request finished (steady clock, s); under mu_
     int64_t running_id_ = 0;  // the id of the request the worker runs (while stats_.busy); under mu_

@@ -94,7 +94,9 @@ std::optional<json::Value> arguments_of(const json::Value &call, const std::stri
 
 }  // namespace
 
-std::string render_chat(const json::Value &messages, const json::Value *tools, const ChatTemplateOptions &opt) {
+std::string render_chat(const json::Value &messages, const json::Value *tools, const ChatTemplateOptions &opt,
+                        std::vector<std::pair<size_t, size_t>> *plain_spans) {
+    if (plain_spans) plain_spans->clear();
     const auto &msgs = messages.as_array("messages");
     STRIX_CHECK(!msgs.empty(), "chat template: No messages provided.");
     std::vector<std::string> roles;
@@ -110,22 +112,31 @@ std::string render_chat(const json::Value &messages, const json::Value *tools, c
     }
 
     std::string out;
+    // Appends request-supplied text, recording its span.
+    const auto plain = [&](const std::string &s) {
+        if (plain_spans && !s.empty()) plain_spans->emplace_back(out.size(), out.size() + s.size());
+        out += s;
+    };
     const bool have_tools = tools && tools->is_array() && !tools->as_array("tools").empty();
     if (have_tools) {
         out += "<|im_start|>system\n";
         if (!reasoning.empty()) out += reasoning + "\n\n";
         out += kToolsIntro;
-        for (const json::Value &tool : tools->as_array("tools")) out += "\n" + tool.dump_python();
+        for (const json::Value &tool : tools->as_array("tools")) out += "\n", plain(tool.dump_python());
         out += "\n</tools>";
         out += kToolsFormat;
         if (roles[0] == "system") {
             const std::string c = content_of(msgs[0], "messages[0].content", true);
-            if (!c.empty()) out += "\n\n" + c;
+            if (!c.empty()) out += "\n\n", plain(c);
         }
         out += "<|im_end|>\n";
     } else if (roles[0] == "system") {
         const std::string c = content_of(msgs[0], "messages[0].content", true);
-        if (!c.empty()) out += "<|im_start|>system\n" + (reasoning.empty() ? "" : reasoning + "\n\n") + c + "<|im_end|>\n";
+        if (!c.empty()) {
+            out += "<|im_start|>system\n" + (reasoning.empty() ? "" : reasoning + "\n\n");
+            plain(c);
+            out += "<|im_end|>\n";
+        }
         else if (!reasoning.empty()) out += "<|im_start|>system\n" + reasoning + "<|im_end|>\n";
     } else if (!reasoning.empty()) {
         out += "<|im_start|>system\n" + reasoning + "<|im_end|>\n";
@@ -151,7 +162,17 @@ std::string render_chat(const json::Value &messages, const json::Value *tools, c
         if (role == "system") {
             STRIX_CHECK(k == 0, "chat template: '", path, "': System message must be at the beginning.");
         } else if (role == "user") {
-            out += "<|im_start|>user\n" + content + "<|im_end|>\n";
+            out += "<|im_start|>user\n";
+            // Tool results a client wrapped in a user message (the template's own test above): the wrapper stays markup.
+            const std::string open = "<tool_response>", close = "</tool_response>";
+            if (content.size() >= open.size() + close.size() && starts_with(content, open.c_str()) && ends_with(content, close)) {
+                out += open;
+                plain(content.substr(open.size(), content.size() - open.size() - close.size()));
+                out += close;
+            } else {
+                plain(content);
+            }
+            out += "<|im_end|>\n";
         } else if (role == "assistant") {
             std::string reasoning_content;
             if (const json::Value *r = m.find("reasoning_content"); r && r->is_string())
@@ -177,9 +198,11 @@ std::string render_chat(const json::Value &messages, const json::Value *tools, c
                     else out += "\n";
                     out += "<tool_call>\n<function=" + nm + ">\n";
                     if (const auto args = arguments_of(call, fp))
-                        for (const auto &[an, av] : args->as_object(fp + ".arguments"))
-                            out += "<parameter=" + an + ">\n" + (av.is_string() ? av.as_string(an) : av.dump_python()) +
-                                   "\n</parameter>\n";
+                        for (const auto &[an, av] : args->as_object(fp + ".arguments")) {
+                            out += "<parameter=" + an + ">\n";
+                            plain(av.is_string() ? av.as_string(an) : av.dump_python());
+                            out += "\n</parameter>\n";
+                        }
                     out += "</function>\n</tool_call>";
                 }
             } else {
@@ -189,7 +212,9 @@ std::string render_chat(const json::Value &messages, const json::Value *tools, c
             out += "<|im_end|>\n";
         } else if (role == "tool") {
             if (k > 0 && roles[k - 1] != "tool") out += "<|im_start|>user";
-            out += "\n<tool_response>\n" + content + "\n</tool_response>";
+            out += "\n<tool_response>\n";
+            plain(content);
+            out += "\n</tool_response>";
             if (k + 1 == msgs.size() || roles[k + 1] != "tool") out += "<|im_end|>\n";
         } else {
             STRIX_FAIL("chat template: '", path, ".role' is '", role, "': Unexpected message role.");

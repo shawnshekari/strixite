@@ -6,6 +6,13 @@
 
 namespace strix {
 
+const char *think_nudge1_text(const std::string &wording) {
+    if (wording == "commit") return kThinkNudge1;
+    if (wording == "decide") return kThinkNudgeDecide;
+    STRIX_CHECK(false, "think_nudge1_text: think-nudge-wording '", wording, "' is not one of: commit, decide");
+    return nullptr;
+}
+
 ThinkWatch::ThinkWatch(Policy p) : p_(p) {
     STRIX_CHECK(p_.min_tokens >= 0 && p_.window >= 16 && p_.rate > 0 && p_.rate <= 1 &&
                     p_.min_gap >= 0 && p_.boundary_wait >= 0 && p_.ngram >= 2 && p_.ngram <= 32 && p_.max_nudges >= 0 &&

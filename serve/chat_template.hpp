@@ -17,6 +17,8 @@
 
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace strix {
 
@@ -28,6 +30,13 @@ struct ChatTemplateOptions {
 };
 
 // tools: nullptr or the request's `tools` array (rendered only when it's a non-empty array).
-std::string render_chat(const json::Value &messages, const json::Value *tools, const ChatTemplateOptions &opt);
+// plain_spans (optional): set to the byte ranges of the rendered text that came from the request rather than the
+// template - system / user / tool message content, tool-call argument values, the tool schemas - for
+// Tokenizer::encode(text, spans): a special token's text there is the user's or a file's text, not a control token
+// (an opencode tool result holding "<|im_end|>" otherwise ended up as a real end of turn in the prompt). Assistant
+// content and reasoning are left out: the model wrote those, and a special token it emitted there must re-encode
+// as that token (the session / prompt cache resume on the exact ids).
+std::string render_chat(const json::Value &messages, const json::Value *tools, const ChatTemplateOptions &opt,
+                        std::vector<std::pair<size_t, size_t>> *plain_spans = nullptr);
 
 }  // namespace strix

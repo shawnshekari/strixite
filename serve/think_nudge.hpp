@@ -27,9 +27,18 @@ namespace strix {
 constexpr const char *kThinkNudge1 =
     "I've been reasoning about this for a long time and I keep going over the same ground. I should commit to the "
     "most promising approach now and act on it.\n\n";
+// Nudge 1's alternative wording ("decide"): names the decision and the next action. In fork tests at the served
+// trigger it ended thinking more often than kThinkNudge1, and wrote the answer inside the think block more often too.
+constexpr const char *kThinkNudgeDecide =
+    "I have enough information to act. I'll state my decision and the exact next command, run it, and let the output "
+    "tell me if I was wrong.\n\n";
 constexpr const char *kThinkNudge2 =
     "I'm still going around in circles. The task may not need this level of detail - I'll take the simplest approach "
     "that meets the stated requirements, act on it, and check the result.\n\n";
+
+// Nudge 1's text for the config's think-nudge-wording: "commit" (kThinkNudge1) or "decide" (kThinkNudgeDecide).
+// Throws on any other name.
+const char *think_nudge1_text(const std::string &wording);
 
 class ThinkWatch {
 public:

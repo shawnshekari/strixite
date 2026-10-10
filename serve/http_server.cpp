@@ -170,12 +170,14 @@ void HttpServer::routes() {
                              " cached)";
             }
             std::string prompt;
+            std::vector<std::pair<size_t, size_t>> plain_spans;  // what the request wrote: never control tokens
             try {
-                prompt = render_chat(cr.messages, cr.tools.is_null() ? nullptr : &cr.tools, cr.template_options);
+                prompt = render_chat(cr.messages, cr.tools.is_null() ? nullptr : &cr.tools, cr.template_options,
+                                     &plain_spans);
             } catch (const Error &e) {
                 throw ApiError(400, e.what(), "messages");
             }
-            gen.prompt = tok_.encode(prompt);
+            gen.prompt = tok_.encode(prompt, plain_spans);
             // A user message last (not a tool result): the disk cache keeps this turn as a checkpoint.
             if (cr.messages.is_array() && !cr.messages.as_array("messages").empty()) {
                 const json::Value &last = cr.messages.as_array("messages").back();
@@ -193,11 +195,12 @@ void HttpServer::routes() {
                 cr.template_options.enable_thinking = false;
                 thinking_skipped = true;
                 try {
-                    prompt = render_chat(cr.messages, cr.tools.is_null() ? nullptr : &cr.tools, cr.template_options);
+                    prompt = render_chat(cr.messages, cr.tools.is_null() ? nullptr : &cr.tools, cr.template_options,
+                                         &plain_spans);
                 } catch (const Error &e) {
                     throw ApiError(400, e.what(), "messages");
                 }
-                gen.prompt = tok_.encode(prompt);
+                gen.prompt = tok_.encode(prompt, plain_spans);
                 gen.max_tokens = clamp_max_tokens(cr.max_tokens, (int64_t)gen.prompt.size(), engine_.capacity(), clamped);
             }
         } catch (const ApiError &e) {
@@ -473,8 +476,13 @@ void HttpServer::routes() {
 
     svr_->Get("/health", [this](const httplib::Request &, httplib::Response &res) {
         const EngineStats s = engine_.stats();
+        const std::string fatal = engine_.fatal_error();
         json::Value b = json::Value::object();
-        b.set("status", json::Value::string("ok"));
+        // After a GpuFatalError: 503 and the error, until the process exits (strix_server) or forever (no on_fatal).
+        if (!fatal.empty()) res.status = 503;
+        b.set("status", json::Value::string(fatal.empty() ? "ok" : "error"));
+        if (!fatal.empty()) b.set("error", json::Value::string(fatal));
+        if (!engine_.degraded().empty()) b.set("degraded", json::Value::string(engine_.degraded()));
         b.set("model", json::Value::string(cfg_.model_id));
         b.set("backend", json::Value::string(engine_.backend().describe()));
         b.set("context_length", json::Value::integer(engine_.capacity()));
@@ -506,6 +514,7 @@ void HttpServer::routes() {
             disk.set("ram_hits", json::Value::integer(d.ram_hits));
             disk.set("ram_evicted", json::Value::integer(d.ram_evicted));
             disk.set("ram_only_dropped", json::Value::integer(d.ram_only_dropped));
+            disk.set("room_refused", json::Value::integer(d.room_refused));
             disk.set("turn_buffers_reused", json::Value::integer(d.turn_buffers_reused));
             disk.set("disk_entries", json::Value::integer(d.disk_entries));
             disk.set("bytes", json::Value::integer(d.bytes));
@@ -552,6 +561,8 @@ void HttpServer::routes() {
         metric("strix_mtp_drafted_tokens_total", "counter", "MTP candidate tokens drafted.", (double)s.mtp_drafted_tokens);
         metric("strix_think_nudges_total", "counter", "Thinking nudges fed into a think block going in circles.",
                (double)s.think_nudges);
+        metric("strix_think_end_blocked_total", "counter",
+               "Ends of turn the guard took out inside the think block or a tool call while they were the top token.", (double)s.think_end_blocked);
         metric("strix_mtp_accepted_tokens_total", "counter", "MTP candidate tokens accepted.", (double)s.mtp_accepted_tokens);
         metric("strix_mtp_rollbacks_total", "counter", "MTP speculation rollbacks on rejection.", (double)s.mtp_rollbacks);
         metric("strix_mtp_rejections_total", "counter",
@@ -611,6 +622,8 @@ void HttpServer::routes() {
             metric("strix_prompt_cache_ram_evicted_total", "counter", "Entries that left RAM for lack of memory.", (double)d.ram_evicted);
             metric("strix_prompt_cache_ram_only_dropped_total", "counter",
                    "One-shot requests' entries that left RAM (never written to disk, by design).", (double)d.ram_only_dropped);
+            metric("strix_prompt_cache_room_refused_total", "counter",
+                   "Saves skipped or disk loads refused: no room in RAM above the margin.", (double)d.room_refused);
             metric("strix_prompt_cache_buffers_reused_total", "counter",
                    "Exports / loads given an on-disk entry's RAM buffer instead of a fresh mapping.", (double)d.buffers_reused);
             metric("strix_prompt_cache_prefaulted_total", "counter", "Spare buffers populated ahead of an export.", (double)d.prefaulted);

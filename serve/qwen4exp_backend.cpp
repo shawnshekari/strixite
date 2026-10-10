@@ -51,6 +51,12 @@ void Qwen4ExpBackend::export_snapshot(int slot, HostBuffer &out, int64_t from) {
     session_.export_state(s, out.data(), out.size(), from);
 }
 
+uint64_t Qwen4ExpBackend::snapshot_bytes(int slot, int64_t from) const {
+    const Qwen4ExpSnapshot &s = snap(slot);
+    STRIX_CHECK(s.pos() >= 1, "Qwen4ExpBackend::snapshot_bytes: slot ", slot, " was never saved");
+    return (uint64_t)session_.state_bytes(s.pos(), from);
+}
+
 void Qwen4ExpBackend::import_state(const HostBuffer &state, int64_t n, int64_t from) {
     session_.import_state(state.data(), state.size(), n, from);
 }

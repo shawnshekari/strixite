@@ -243,6 +243,10 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir, in
         {"prompt-cache-gib", K::Int, 0, 1 << 16, "128", "the disk prompt cache's cap in GiB; 0 = no prompt cache"},
         {"prompt-cache-ram-margin-gib", K::Int, 0, 1 << 12, std::to_string(cache.ram_margin >> 30),
          "RAM tier: keep MemAvailable above this many GiB"},
+        {"low-memory", K::Text, 0, 0, "fail",
+         "startup memory check (serve/memory_plan.hpp): fail = refuse to start when MemAvailable after loading is short "
+         "of the prompt cache's margin + one full-capacity state, naming the settings that fit; adapt = start with the "
+         "RAM caches turned down, each step logged"},
         {"prompt-cache-idle-s", K::Number, 1, 1e7, fmt_number(cache.idle_seconds),
          "RAM tier: an entry idle this many seconds is written to disk"},
         {"prompt-cache-write-gib-per-hour", K::Number, 0, 1e6, fmt_number(cache.write_gib_per_hour),
@@ -268,9 +272,16 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir, in
          "write each request's token ids and MTP steps here (serve/capture.hpp); off = no capture"},
         {"think-nudge", K::OnOff, 0, 0, "on",
          "the thinking nudge into a think block going in circles (serve/think_nudge.hpp); off for like-for-like comparisons"},
+        {"think-end-guard", K::OnOff, 0, 0, "on",
+         "no end of turn while the think block or a tool call is open (Engine::Options::think_end_guard); off for like-for-like comparisons"},
+        {"literal-tags", K::OnOff, 0, 0, "on",
+         "a </think> / <tool_call> / </tool_call> token not right after a newline is text (OutputParser::Config::literal_tags); off for like-for-like comparisons"},
         {"think-nudge-rate", K::Number, 0.01, 1, "0.25",
          "thinking nudge: due when this share of the last 1024 thinking tokens repeat earlier 8-grams"},
         {"think-nudge-min-tokens", K::Int, 1024, 1 << 24, "3072", "thinking nudge: no rate trigger before this many thinking tokens"},
+        {"think-nudge-wording", K::Text, 0, 0, "commit",
+         "thinking nudge 1's text: commit (\"... commit to the most promising approach now\") or decide (\"... state my "
+         "decision and the exact next command\")"},
         {"thinking", K::OnOff, 0, 0, "on",
          "thinking for requests that don't say (enable_thinking / thinking.type / reasoning_effort / a budget); off = "
          "rendered without the think block unless the request asks"},

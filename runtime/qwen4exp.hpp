@@ -131,6 +131,7 @@ public:
     const float *inv_freq() const { return inv_freq_.get(); }
     float rope_scale() const { return dims_.rope_scale; }  // cos/sin factor for every RoPE call (YaRN; else 1)
     const NgramRowSource &ngram_rows() const;
+    bool has_ngram_rows() const { return ngram_ != nullptr; }
     bool has_mtp() const { return has_mtp_; }
     const MtpHead &mtp() const { return mtp_; }
 

@@ -15,6 +15,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstdio>
 #include <random>
 #include <string>
 #include <vector>
@@ -23,7 +24,7 @@ using namespace strix;
 
 namespace {
 
-const char *kSpecials[] = {"<tool_call>", "</tool_call>", "</think>"};
+const char *kSpecials[] = {"<tool_call>", "</tool_call>", "</think>", "<|im_start|>"};
 
 // What a parser put out, in order: adjacent pieces of the same kind joined; a whole ToolCall as a start (id, name) and
 // its arguments, as a stream sends it.
@@ -122,12 +123,16 @@ Run run(const Tokenizer &tok, const std::vector<int32_t> &ids, const json::Value
         ev.clear();
     };
     std::vector<OutputEvent> ev;
+    bool after_nl = true;  // mirrors the parser's literal_tags gate (the prompt ends in a newline)
     try {
         for (size_t i = 0; i < ids.size(); ++i) {
-            const bool opens = !in_call && ids[i] == begin && !p.in_reasoning();
+            const std::string &bytes = tok.token_bytes(ids[i]);
+            const bool structure = after_nl;
+            after_nl = !bytes.empty() && bytes.back() == '\n';
+            const bool opens = !in_call && ids[i] == begin && structure && !p.in_reasoning();
             const bool stopped = p.feed(ids[i], ev);
             if (opens) in_call = true, r.regions.push_back({i, ids.size(), false, false, {}});
-            if (in_call && ids[i] == end && !opens) {
+            if (in_call && ids[i] == end && structure && !opens) {
                 in_call = false;
                 r.regions.back().end = i;
                 for (const OutputEvent &e : ev) r.regions.back().closed |= e.kind == OutputEvent::Kind::ToolCallArgs && e.text == "}";
@@ -196,7 +201,7 @@ void check(const Tokenizer &tok, const std::string &text, const json::Value *too
             }
             neutral.insert(neutral.end(), ids.begin() + (long)at, ids.begin() + (long)g.begin);
             neutral.push_back(tok.id_of("<tool_call>"));
-            for (int32_t t : tok.encode("<function=" + g.name + "></function>")) neutral.push_back(t);
+            for (int32_t t : tok.encode("<function=" + g.name + "></function>\n")) neutral.push_back(t);  // \n: literal_tags
             if (g.end < ids.size()) neutral.push_back(tok.id_of("</tool_call>"));
             at = g.end < ids.size() ? g.end + 1 : ids.size();
         }
@@ -326,7 +331,7 @@ int main(int argc, char **argv) {
                     if (v.find("</parameter>") != std::string::npos) continue;
                     text += pick(rng, {"\n", ""}) + "<parameter=" + p + ">" + pick(rng, {"\n", ""}) + v + pick(rng, {"\n", ""}) + "</parameter>";
                 }
-                text += pick(rng, {"\n", ""}) + "</function>" + pick(rng, {"\n", ""}) + "</tool_call>";
+                text += pick(rng, {"\n", ""}) + "</function>\n</tool_call>";  // \n: literal_tags wants the end structural
             }
             if (rng() % 4 == 0) text += pick(rng, {" done", "\n\nAnd more.", "  "});
             check(tok, text, rng() % 5 ? &tools : nullptr, false, true, rng);

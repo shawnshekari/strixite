@@ -23,12 +23,19 @@ Environment=STRIX_WEIGHTS=%h/models/strix-infer/converted/Qwen3.8-Flash-Next.U-g
 Environment=STRIX_EXTRA_ARGS=
 # STRIX_LOCAL_ARGS: this machine's standing additions (e.g. "--capture-dir ..."), set by a local drop-in; empty here.
 Environment=STRIX_LOCAL_ARGS=
+# A GPU memory fault (an aperture violation) aborts the process from the HIP runtime's queue callback (exit 134, then
+# Restart= below) and by default dumps the GPU's memory into the working directory - this checkout, 156 MB for a
+# one-buffer test process (tests/hazards/gpu_fault_sticky, 2026-10-10), far more for the server's ~95 GiB. Off.
+Environment=HSA_DISABLE_COREDUMP_ON_EXCEPTION=1
 ExecStart=%h/src/strix-infer/build/strix/strix_server --config %h/src/strix-infer/deploy/strix-server.conf --weights ${STRIX_WEIGHTS} $STRIX_LOCAL_ARGS $STRIX_EXTRA_ARGS
 # SIGTERM stops the HTTP server, then the prompt cache writes its RAM-only entries to disk (up to 40 s); the model's
 # ~30 s load is on start, not stop.
 TimeoutStopSec=90
 Restart=on-failure
 RestartSec=15
+# Exit 4: the startup memory check refused (low-memory = fail; the log says what to change) - restarting would load
+# the weights again only to refuse again. Exit 3 (a lost GPU context) and a crash do restart.
+RestartPreventExitStatus=4
 
 [Install]
 WantedBy=default.target

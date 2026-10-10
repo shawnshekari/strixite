@@ -289,11 +289,19 @@ void Tokenizer::encode_plain(std::string_view text, std::vector<int32_t> &out) c
     for (const auto &[b, e] : pretokenize(cps)) bpe(unicode::encode_utf8(cps, b, e), out);
 }
 
-std::vector<int32_t> Tokenizer::encode(std::string_view text) const {
+std::vector<int32_t> Tokenizer::encode(std::string_view text) const { return encode(text, {}); }
+
+std::vector<int32_t> Tokenizer::encode(std::string_view text, const std::vector<std::pair<size_t, size_t>> &plain_spans) const {
     STRIX_CHECK(json::valid_utf8(text), "Tokenizer::encode: text (", text.size(), " bytes) is not valid UTF-8");
+    for (size_t k = 0; k < plain_spans.size(); ++k) {
+        const auto [b, e] = plain_spans[k];
+        STRIX_CHECK(b <= e && e <= text.size() && (k == 0 || plain_spans[k - 1].second <= b), "Tokenizer::encode: plain span ",
+                    k, " [", b, ", ", e, ") of ", plain_spans.size(), " - expected sorted, non-overlapping spans inside the ",
+                    text.size(), "-byte text", k > 0 ? " (previous ends at " + std::to_string(plain_spans[k - 1].second) + ")" : "");
+    }
     std::vector<int32_t> out;
     out.reserve(text.size() / 3 + 4);
-    size_t plain = 0;
+    size_t plain = 0, span = 0;
     for (size_t i = 0; i < text.size();) {
         int32_t hit = -1;
         size_t len = 0;
@@ -301,8 +309,14 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text) const {
             ++i;
             continue;
         }
+        while (span < plain_spans.size() && plain_spans[span].second <= i) ++span;
+        if (span < plain_spans.size() && plain_spans[span].first <= i) {  // inside a plain span: skip to its end
+            i = plain_spans[span].second;
+            continue;
+        }
+        const size_t room = span < plain_spans.size() ? plain_spans[span].first - i : text.size() - i;
         for (const auto &[content, id] : added_)  // longest first: the first hit is the longest here
-            if (text.compare(i, content.size(), content) == 0) {
+            if (content.size() <= room && text.compare(i, content.size(), content) == 0) {
                 hit = id, len = content.size();
                 break;
             }

@@ -5,18 +5,20 @@
 // token, then content; a <tool_call> token opens a call that runs to </tool_call> and is parsed from the model's
 // XML form (<function=NAME> <parameter=P> value </parameter> ... </function>) into a name and JSON arguments,
 // typed from the tool's JSON schema. Markers count only as the single special tokens, never as text the model
-// spelled out, and only in their phase (a <tool_call> inside reasoning is reasoning text).
+// spelled out, only in their phase (a <tool_call> inside reasoning is reasoning text), and only right after a newline
+// (Config::literal_tags).
 //
 // Streamed calls (Config::stream_calls, for streamed chat responses): a call goes out as it is generated instead of
 // whole at </tool_call>. ToolCallStart (id, name) as soon as <function=NAME> is complete, then ToolCallArgs pieces
 // of the arguments' JSON text: "{", each parameter - a string-typed value piece by piece as its characters arrive,
-// any other value whole at its </parameter> (parsed and printed as the buffered path does) - and "}" at the
-// </tool_call> of a call the buffered path would parse. Joined, the pieces are its arguments.dump() byte for byte.
-// What differs: once the header went out, a call can't be taken back. Where the buffered path shows the call as text
-// (a stray tag, text after </function>), the streamed call stays a call whose arguments never get their "}" - they
-// don't parse - and malformed_calls() counts it; so too a call that names a parameter twice (the buffered path keeps
-// the last value; the stream already sent the first). A call cut off by the end of generation is left the same way
-// (dropped_partial_call(), as for a buffered one, and counted malformed).
+// any other value whole once the structure after it commits its </parameter> as the value's end (a value may hold
+// the call's tags as text, so that end waits, and a value after it waits too) - and "}" at the </tool_call> of a
+// call the buffered path parses to the same bytes. Joined, the pieces are its arguments.dump() byte for byte.
+// What differs: once the header went out, a call can't be taken back. Where the buffered path shows the call as
+// text (a stray tag, text after </function>), the streamed call stays a call whose arguments never get their "}" -
+// they don't parse - and malformed_calls() counts it; so too a call that names a parameter twice (the buffered
+// path keeps the last value; the stream already sent the first). A call cut off by the end of generation is left
+// the same way (dropped_partial_call(), as for a buffered one, and counted malformed).
 //
 // Text is released in whole UTF-8 characters (a token can end inside one). Like the chat template, which trims
 // reasoning and content when the turn is re-rendered, leading and trailing white space of each channel is
@@ -62,6 +64,11 @@ public:
         // Trim each channel's leading / trailing white space (chat, like the template's re-render). Off for raw
         // /v1/completions, where it's part of the text (code indentation, a continuation's leading space).
         bool trim_ws = true;
+        // Literal tags (2026-10-09): </think>, <tool_call> and </tool_call> are structure only right after a newline
+        // (where the model always writes them: 4,654 / 4,654 </think> and 6,039 / 6,051 call tags in the 2026-10-09 captures);
+        // anywhere else - `id_of("<tool_call>")` in code it writes, a tag named in a sentence - the model had no other
+        // way to spell the tag (it has no text tokens for it), and the token is text of the channel it is in.
+        bool literal_tags = true;
         // Stream tool calls as they are generated (ToolCallStart / ToolCallArgs) instead of one ToolCall each.
         bool stream_calls = false;
     };
@@ -76,6 +83,7 @@ public:
 
     int64_t reasoning_tokens() const { return reasoning_tokens_; }
     bool in_reasoning() const { return phase_ == Phase::Reasoning; }
+    bool in_call() const { return phase_ == Phase::Call; }  // between <tool_call> and its </tool_call>
     int64_t tool_calls() const { return tool_calls_; }
     bool dropped_partial_call() const { return dropped_call_; }
     int64_t malformed_calls() const { return malformed_calls_; }  // streamed calls that went out but weren't well-formed
@@ -92,6 +100,8 @@ private:
     void release(Channel &c, std::vector<OutputEvent> &out, bool drop_trailing_ws);
     // Streamed calls: the bytes of call_body_ from call_at_ on, as far as they can go out yet.
     void advance_call(std::vector<OutputEvent> &out);
+    // A streamed value's closing text (up to the </parameter> at v_end, JSON-closed): see advance_call.
+    bool close_value_text(std::string &into, size_t v_end);
     std::string new_call_id();
 
     const Tokenizer &tok_;
@@ -102,17 +112,20 @@ private:
     std::string call_body_;
     // A streamed call: where in call_body_ it is, what it waits for (Header: "<function="; FnName: the function's
     // name; Next: a parameter or "</function>"; Name: a parameter's name; Value: its value; Done: nothing but white
-    // space; Broken: not well-formed, the rest is dropped), and the parameter being read. NoHeader: not a call it can
-    // stream - the buffered path decides at </tool_call>. Header, FnName and NoHeader have sent nothing.
+    // space; Broken: not well-formed, the rest is dropped), and the parameter being read. NoHeader: not a call it
+    // can stream - the buffered path decides at </tool_call>. Header, FnName and NoHeader have sent nothing.
     enum class CallState { Header, FnName, NoHeader, Next, Name, Value, Done, Broken } call_state_ = CallState::Header;
     size_t call_at_ = 0, value_start_ = 0, value_sent_ = 0;
     size_t name_scan_ = 0, value_scan_ = 0;  // no '>' / newline, no "</parameter>" starts before
     bool value_started_ = false, value_string_ = false, first_param_ = true;
-    std::string call_name_, param_name_;
+    std::string call_name_, param_name_, streamed_args_;  // streamed_args_: the arguments' JSON text sent so far
+    bool pending_close_ = false;  // a shadow close: a value ended at a </parameter> before a </function> that may
+    size_t pending_v_end_ = 0;    // be the call's own - text after it means the value held the tags: look on
     std::unordered_set<std::string> params_seen_;
     int64_t malformed_calls_ = 0;
     int64_t reasoning_tokens_ = 0, tool_calls_ = 0;
     bool dropped_call_ = false, stopped_ = false;
+    bool after_newline_ = true;  // the last token fed ended in '\n' (the prompt ends in one)
     size_t max_stop_ = 0;
     std::mt19937_64 rng_;
 };

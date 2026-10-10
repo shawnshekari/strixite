@@ -17,6 +17,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace strix {
@@ -26,6 +27,10 @@ public:
     explicit Tokenizer(const std::string &tokenizer_json);
 
     std::vector<int32_t> encode(std::string_view text) const;  // text must be valid UTF-8 (throws otherwise)
+    // The same, but an added token counts only where it lies wholly outside plain_spans (byte ranges [begin, end),
+    // sorted, not overlapping, inside text): there its text is encoded as ordinary text. render_chat reports the
+    // spans of what users, tools and tool schemas wrote, so a file holding "<|im_end|>" stays text (2026-10-09).
+    std::vector<int32_t> encode(std::string_view text, const std::vector<std::pair<size_t, size_t>> &plain_spans) const;
     const std::string &token_bytes(int32_t id) const;          // raw bytes; throws on an unknown id
     std::string decode(const std::vector<int32_t> &ids) const;  // concatenated bytes (may be invalid UTF-8 at a cut)
     int32_t id_of(std::string_view token_text) const;          // an added token's id or a vocab token (byte-level

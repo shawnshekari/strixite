@@ -160,6 +160,34 @@ int32_t Sampler::sample(const float *logits, size_t size, float *out_margin) {
     return draw_from_candidates(k);
 }
 
+bool ban_tokens(LogitRows &l, int64_t r, const std::vector<int32_t> &ids) {
+    STRIX_CHECK(r >= 0 && r < l.rows, "ban_tokens: row ", r, " of ", l.rows);
+    STRIX_CHECK(!ids.empty(), "ban_tokens: no ids");
+    const auto banned = [&](int32_t id) { return std::find(ids.begin(), ids.end(), id) != ids.end(); };
+    if (l.cands == 0) {
+        STRIX_CHECK(l.full.size() == (size_t)(l.rows * l.row), "ban_tokens: ", l.full.size(), " floats for ", l.rows,
+                    " rows of ", l.row);
+        float *x = l.full.data() + r * l.row;
+        const int32_t top = (int32_t)(std::max_element(x, x + l.row) - x);  // NaN rows fail in the sampler
+        for (const int32_t id : ids) {
+            STRIX_CHECK(id >= 0 && id < l.row, "ban_tokens: id ", id, ", expected 0..", l.row - 1);
+            x[id] = -std::numeric_limits<float>::infinity();
+        }
+        return banned(top);
+    }
+    STRIX_CHECK(l.cand_v.size() == (size_t)(l.rows * l.cands) && l.cand_id.size() == l.cand_v.size(),
+                "ban_tokens: candidate arrays ", l.cand_v.size(), " / ", l.cand_id.size(), " for ", l.rows, " rows of ",
+                l.cands);
+    float *v = l.cand_v.data() + r * l.cands;
+    int32_t *id = l.cand_id.data() + r * l.cands;
+    const bool top = banned(id[0]);
+    int64_t w = 0;
+    for (int64_t i = 0; i < l.cands; ++i)
+        if (!banned(id[i])) v[w] = v[i], id[w] = id[i], ++w;
+    for (; w < l.cands; ++w) v[w] = -std::numeric_limits<float>::infinity(), id[w] = INT32_MAX;
+    return top;
+}
+
 bool Sampler::takes_candidates() const {
     if (n_valid_ < kCandidates) return false;
     return p_.temperature == 0 || (p_.top_k >= 1 && p_.top_k <= kCandidates);

@@ -289,6 +289,7 @@ add_library(strix_serve STATIC
     serve/server_config.cpp
     serve/openai.cpp
     serve/http_server.cpp
+    serve/memory_plan.cpp
     serve/prompt_cache.cpp
     serve/resume_loss.cpp
     serve/capture.cpp
@@ -330,6 +331,9 @@ add_executable(bench_replay tools/bench_replay.cpp)
 target_link_libraries(bench_replay PRIVATE strix_serve_model)
 add_executable(nudge_fork tools/nudge_fork.cpp)
 target_link_libraries(nudge_fork PRIVATE strix_serve_model)
+# P(end of turn) at every position of captured turns, per decode path (the 2026-10-09 mid-thought stops).
+add_executable(eot_probe tools/eot_probe.cpp)
+target_link_libraries(eot_probe PRIVATE strix_serve_model)
 endif()
 
 if(EXISTS "${CMAKE_SOURCE_DIR}/tests/CMakeLists.txt")

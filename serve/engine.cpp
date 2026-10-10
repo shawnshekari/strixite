@@ -31,7 +31,7 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
       think_end_(tok.id_of("</think>")),
       masker_(tok, backend.logits_row()),
       thinking_stop_(tok.encode(kThinkingStop)),
-      nudge_{tok.encode(kThinkNudge1), tok.encode(kThinkNudge2)} {
+      nudge_{tok.encode(think_nudge1_text(options.think_nudge_wording)), tok.encode(kThinkNudge2)} {
     STRIX_CHECK(backend.logits_row() >= tok.size(), "Engine: logits rows of ", backend.logits_row(),
                 " are shorter than the tokenizer's ", tok.size(), " tokens");
     STRIX_CHECK(backend.max_chunk() >= (int64_t)thinking_stop_.size() && backend.capacity() >= 2, "Engine: backend chunk ",
@@ -87,6 +87,8 @@ void Engine::submit(GenerationRequest req, std::shared_ptr<GenerationSink> sink)
     {
         std::lock_guard<std::mutex> lock(mu_);
         STRIX_CHECK(!stop_, "Engine::submit: shutting down");
+        STRIX_CHECK(fatal_.empty(), "Engine::submit: the GPU failed on an earlier request (", fatal_,
+                    "); nothing runs until the server restarts");
         // One line from the HTTP thread for a request that waits; its block prints when it starts.
         if (stats_.busy || !queue_.empty())
             slog(LogLevel::Info, "Request %lld queued: %s ahead of it (Request %lld running)", (long long)req.id,
@@ -117,12 +119,34 @@ void Engine::worker() {
             running_id_ = job.req.id;
         }
         run(job);
+        if (!fatal_pending_.empty()) {
+            std::deque<Job> failed;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                fatal_ = fatal_pending_;
+                failed.swap(queue_);
+                stats_.queued = 0, stats_.busy = 0, running_id_ = 0;
+            }
+            for (Job &j : failed) {
+                GenerationResult r;
+                r.finish_reason = "error", r.error = "the GPU failed on an earlier request (" + fatal_pending_ +
+                                                     "); the server is restarting";
+                j.sink->on_done(r);
+            }
+            if (options_.on_fatal) options_.on_fatal(fatal_pending_);
+            return;  // nothing runs on this context again
+        }
         std::lock_guard<std::mutex> lock(mu_);
         stats_.busy = 0, running_id_ = 0;
         idle_since_ = now_s();
         stats_.live_tokens = (int64_t)seq_.size();
         stats_.snapshot_pos = be_.snapshot_pos(LmBackend::kTurnSlot);
     }
+}
+
+std::string Engine::fatal_error() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return fatal_;
 }
 
 int64_t Engine::resume_point(const std::vector<int32_t> &prompt, int64_t id, bool &from_disk, bool &from_ram) {
@@ -307,6 +331,9 @@ void Engine::run(Job &job) {
     slog(LogLevel::Info, "%s", kLogRule);
     slog(LogLevel::Info, "Request %lld", (long long)req.id);
     for (const auto &[label, text] : req.log_header) slog_row(LogLevel::Info, label.c_str(), "%s", text.c_str());
+    if (!options_.degraded.empty())
+        slog_row(LogLevel::Warning, "degraded", "WARNING: performance degraded - %s (the startup WARNINGs say what each costs)",
+                 options_.degraded.c_str());
     struct BlockEnd {
         const GenerationResult &r;
         ~BlockEnd() {
@@ -336,6 +363,7 @@ void Engine::run(Job &job) {
             stats_.generated_tokens += res.completion_tokens;
             stats_.mtp_drafted_tokens += res.mtp_drafted_tokens;
             stats_.think_nudges += res.think_nudges;
+            stats_.think_end_blocked += res.think_end_blocked;
             stats_.mtp_accepted_tokens += res.mtp_accepted_tokens;
             stats_.mtp_rollbacks += res.mtp_rollbacks;
             for (int64_t i = 0; i < kMtpMaxDraft; ++i) stats_.mtp_reject_at[i] += res.mtp_reject_at[i];
@@ -446,8 +474,19 @@ void Engine::run(Job &job) {
         }
 
         Sampler sampler(req.sampling, tok_.size());
-        OutputParser parser(tok_, req.parser);
+        OutputParser::Config parser_cfg = req.parser;
+        // Literal tags (config literal-tags) - not under a response_format grammar, whose think-block end is the token.
+        parser_cfg.literal_tags = options_.literal_tags && !so;
+        OutputParser parser(tok_, parser_cfg);
         ThinkWatch watch{options_.think_nudge_policy};
+        // The think-block guard: no end of turn while the think block or a tool call is open - the model reaches for
+        // <|im_end|> when it means to name a tag in inline code (`</tool_call>`) or in code it writes into a call
+        // (`id_of("<|im_end|>")`), ending the turn mid thought or mid call.
+        const std::vector<int32_t> end_ids{im_end_, eot_};
+        const auto guard = [&](LogitRows &rows, int64_t r) {
+            if (options_.think_end_guard && (parser.in_reasoning() || parser.in_call()) && ban_tokens(rows, r, end_ids))
+                ++res.think_end_blocked;
+        };
         // A sampled token just fed to the parser: the nudge watch follows the reasoning ones.
         const auto watch_tok = [&](int32_t t) {
             if (options_.think_nudge && parser.in_reasoning()) watch.observe(t, tok_.decode({t}));
@@ -537,6 +576,7 @@ void Engine::run(Job &job) {
                 id = carry;
                 carry = -1;
             } else {
+                guard(logits, 0);
                 id = sampler.sample(logits, 0);
                 ++res.completion_tokens;
                 if (id == im_end_ || id == eot_) {
@@ -585,7 +625,7 @@ void Engine::run(Job &job) {
                 if (k > 0) {
                     res.mtp_drafted_tokens += k;
                     ++res.decode_forwards;
-                    const LogitRows ml = be_.forward_verify_rows(
+                    LogitRows ml = be_.forward_verify_rows(
                         ids, k + 1, cands, n_valid, masks_for(std::vector<int32_t>(ids.begin() + 1, ids.end())));
                     STRIX_CHECK(ml.rows == k + 1, "Engine: verify of ", k + 1, " tokens returned ", ml.rows,
                                 " logits rows");
@@ -594,6 +634,7 @@ void Engine::run(Job &job) {
                     int32_t v = -1;
                     bool ended = false;
                     for (; j < k; ++j) {
+                        guard(ml, j);
                         v = sampler.sample(ml, j);
                         if (v != ids[(size_t)j + 1]) break;
                         ++res.mtp_accepted_tokens, ++res.completion_tokens;
@@ -674,6 +715,9 @@ void Engine::run(Job &job) {
         slog_row(LogLevel::Info, "generate", "%s   %s tokens (think %s) in %s s", gen_rate,
                  fmt_n(res.completion_tokens).c_str(), fmt_n(res.reasoning_tokens).c_str(),
                  fmt_rate(res.decode_ms / 1e3, 2).c_str());
+        if (res.think_end_blocked > 0)
+            slog_row(LogLevel::Info, "guard", "end of turn blocked inside the think block or a tool call %s time%s (it was the top token)",
+                     fmt_n(res.think_end_blocked).c_str(), res.think_end_blocked == 1 ? "" : "s");
         finish(reason);
         if (!options_.capture_dir.empty() && reason != "cancelled") capture(req, steps, reason);
         // After the response: the new prefixes go to the prompt cache's RAM tier (the disk only later, if at all).
@@ -701,6 +745,17 @@ void Engine::run(Job &job) {
                 HostBuffer state = kind == PromptCache::Kind::System ? HostBuffer()
                                                                       : cache_->take_replaced_buffer(prompt.data(), n, base_n);
                 if (state.capacity() == 0) state = cache_->take_buffer();
+                // Room before the buffer grows (PromptCache::make_room_for): else no save - never past the margin.
+                const uint64_t want = be_.snapshot_bytes(slot, base_n);
+                if (want > state.capacity() && !cache_->make_room_for(want - state.capacity())) {
+                    slog_row(LogLevel::Warning, rows++ ? "" : "cache",
+                             "%s, %s tokens: not saved - no room in RAM (needs %s GB more; MemAvailable %s GiB, margin %s "
+                             "GiB)", what, fmt_n(n).c_str(), fmt_rate((want - state.capacity()) / 1e9, 1).c_str(),
+                             fmt_rate(cache_->mem_available_now() / (double)(1ull << 30), 1).c_str(),
+                             fmt_rate(cache_->options().ram_margin / (double)(1ull << 30), 0).c_str());
+                    cache_->give_back(std::move(state));
+                    return;
+                }
                 be_.export_snapshot(slot, state, base_n);
                 const double ms = (now_s() - t_e) * 1e3;  // > 0.5 s: the request path waited - worth seeing
                 const LogLevel level = ms > 500 ? LogLevel::Warning : LogLevel::Debug;
@@ -727,6 +782,16 @@ void Engine::run(Job &job) {
             std::lock_guard<std::mutex> lock(mu_);
             stats_.ram_saves += saved, stats_.export_seconds += now_s() - t0;
         }
+    } catch (const GpuFatalError &e) {
+        // The GPU context is gone (strixite issue #6: an aperture violation, then hipErrorIllegalAddress on every
+        // request until a restart): no reset - it would fail too. The worker fails the queue and calls on_fatal.
+        slog_row(LogLevel::Error, "error", "FATAL: %s", e.what());
+        slog_row(LogLevel::Error, "", "FATAL: no request can run on this GPU context: failing the queued ones, refusing "
+                 "new ones%s", options_.on_fatal ? ", the server exits for its supervisor to restart it" : "");
+        fatal_pending_ = e.what();
+        seq_.clear();
+        res.error = e.what();
+        finish("error");
     } catch (const std::exception &e) {
         // A failed forward leaves the session unusable until reset: start clean for the next request.
         slog_row(LogLevel::Error, "error", "ERROR: %s", e.what());
