@@ -200,9 +200,9 @@ reaches it, while a smaller cache costs a little on every switch.
 - **At startup:** the `startup: memory:` line above - what was measured, what's needed. `journalctl --user -u
   strix-server.service` for the systemd unit, `podman logs` for the container.
 - **While it runs:**
-  - `curl localhost:5300/health` - `"status": "ok"`, and a `degraded` field if adapt turned something down;
-  - `curl localhost:5300/cache` - the prompt cache: entries in RAM and on disk, bytes, hits;
-  - `curl localhost:5300/metrics` - counters, e.g. `strix_prompt_cache_ram_evicted_total` (conversations that left
+  - `curl 127.0.0.1:5300/health` - `"status": "ok"`, and a `degraded` field if adapt turned something down;
+  - `curl 127.0.0.1:5300/cache` - the prompt cache: entries in RAM and on disk, bytes, hits;
+  - `curl 127.0.0.1:5300/metrics` - counters, e.g. `strix_prompt_cache_ram_evicted_total` (conversations that left
     RAM for lack of memory) and `strix_prompt_cache_rejected_total` (ones that couldn't be written and were dropped);
   - the log every ten minutes while the cache is in use: `prompt cache: RAM N entries, X GB ...; MemAvailable Y GiB
     (margin 4)`.

@@ -89,9 +89,9 @@ The full list: `podman run --rm ghcr.io/shawnshekari/strixite:v0.2.3 --help`.
 ## 4. Check it
 
 ```sh
-curl -s localhost:5300/health          # {"status":"ok", ...} once loaded
+curl -s 127.0.0.1:5300/health          # {"status":"ok", ...} once loaded
 podman logs -f strixite                # the startup lines, then one block per request
-curl -s localhost:5300/v1/chat/completions -H 'Content-Type: application/json' \
+curl -s 127.0.0.1:5300/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
@@ -161,6 +161,7 @@ Prompt cache entries made by another version are checked at startup and dropped 
 | `can't open '/models/...'` although the file exists | SELinux: add `--security-opt label=disable`; or the `-v` path doesn't point at the download directory |
 | the server stops while loading, or `hipMalloc` / out-of-memory errors | the kernel parameters aren't active - check `mem_info_gtt_total` (step 1) |
 | the server exits with status 4 right after loading | not enough free memory for these settings - the log says what to change; [Memory](memory.md) explains the options |
+| `curl localhost:5300` resets the connection while `127.0.0.1` works | rootless podman forwards `localhost`'s IPv6 address (`::1`) into the container, and the server listens on IPv4 only - use `127.0.0.1` (or your machine's address) |
 | `Address already in use` | something else listens on 5300 (another server, or an old container: `podman ps -a`) - or one just stopped: its closed connections hold the port for up to a minute (`ss -tan "( sport = :5300 )"` shows them); wait, or publish another port |
 | a 400 naming a JSON schema keyword | structured output refuses what it can't enforce - [what the server accepts](server.md#structured-output) |
 
