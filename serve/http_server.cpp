@@ -36,17 +36,17 @@ class QueueSink : public GenerationSink {
 public:
     struct Item {
         enum class Kind { Start, Progress, Events, Done } kind;
-        int64_t done = 0, total = 0;
+        PrefillProgress progress;
         std::vector<OutputEvent> events;
         GenerationResult result;
     };
-    void on_start() override { push({Item::Kind::Start, 0, 0, {}, {}}); }
-    void on_progress(int64_t done, int64_t total) override { push({Item::Kind::Progress, done, total, {}, {}}); }
+    void on_start() override { push({Item::Kind::Start, {}, {}, {}}); }
+    void on_prefill(const PrefillProgress &p) override { push({Item::Kind::Progress, p, {}, {}}); }
     void on_events(std::vector<OutputEvent> &events) override {
-        push({Item::Kind::Events, 0, 0, std::move(events), {}});
+        push({Item::Kind::Events, {}, std::move(events), {}});
         events.clear();
     }
-    void on_done(const GenerationResult &r) override { push({Item::Kind::Done, 0, 0, {}, r}); }
+    void on_done(const GenerationResult &r) override { push({Item::Kind::Done, {}, {}, r}); }
     bool cancelled() override { return cancelled_.load(); }
     void cancel() { cancelled_ = true; }
 
@@ -267,7 +267,7 @@ void HttpServer::routes() {
         }
 
         res.set_header("Cache-Control", "no-cache");
-        res.set_chunked_content_provider("text/event-stream", [sink, meta, clamped, keepalive, tools](size_t, httplib::DataSink &out) {
+        res.set_chunked_content_provider("text/event-stream", [sink, meta, clamped, keepalive, tools, rp = cr.return_progress](size_t, httplib::DataSink &out) {
             const auto send = [&](const std::string &data) {
                 const std::string frame = "data: " + data + "\n\n";
                 if (!out.write(frame.data(), frame.size())) {
@@ -299,8 +299,12 @@ void HttpServer::routes() {
                 switch (it.kind) {
                 case QueueSink::Item::Kind::Start: progress = "started"; break;
                 case QueueSink::Item::Kind::Progress:
-                    progress = "prefill " + std::to_string(it.done) + "/" + std::to_string(it.total);
-                    if (!comment(progress)) return false;
+                    progress = "prefill " + std::to_string(it.progress.processed) + "/" + std::to_string(it.progress.total);
+                    if (rp) {
+                        if (!send(prompt_progress_chunk_body(meta, false, it.progress))) return false;
+                    } else if (!comment(progress)) {
+                        return false;
+                    }
                     break;
                 case QueueSink::Item::Kind::Events:
                     for (size_t k = 0; k < it.events.size(); ++k) {
@@ -413,7 +417,7 @@ void HttpServer::routes() {
         }
 
         res.set_header("Cache-Control", "no-cache");
-        res.set_chunked_content_provider("text/event-stream", [sink, meta, clamped, keepalive](size_t, httplib::DataSink &out) {
+        res.set_chunked_content_provider("text/event-stream", [sink, meta, clamped, keepalive, rp = cr.return_progress](size_t, httplib::DataSink &out) {
             const auto frame = [&](const std::string &f) {
                 if (!out.write(f.data(), f.size())) {
                     sink->cancel();
@@ -431,8 +435,9 @@ void HttpServer::routes() {
                 switch (it.kind) {
                 case QueueSink::Item::Kind::Start: progress = "started"; break;
                 case QueueSink::Item::Kind::Progress:
-                    progress = "prefill " + std::to_string(it.done) + "/" + std::to_string(it.total);
-                    if (!frame(": " + progress + "\n\n")) return false;
+                    progress = "prefill " + std::to_string(it.progress.processed) + "/" + std::to_string(it.progress.total);
+                    if (!frame(rp ? "data: " + prompt_progress_chunk_body(meta, true, it.progress) + "\n\n" : ": " + progress + "\n\n"))
+                        return false;
                     break;
                 case QueueSink::Item::Kind::Events:
                     for (const OutputEvent &e : it.events)

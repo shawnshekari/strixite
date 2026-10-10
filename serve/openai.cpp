@@ -102,10 +102,12 @@ json::Value merge_leading_system(const json::Value &messages) {
     return out;
 }
 
-// The fields /v1/chat/completions and /v1/completions share: stream, max_tokens, sampling, stop, and the known
-// fields that are refused rather than ignored. R has stream, max_tokens, sampling, seeded, stop.
+// The fields /v1/chat/completions and /v1/completions share: stream, return_progress, max_tokens, sampling, stop, and
+// the known fields that are refused rather than ignored. R has stream, return_progress, max_tokens, sampling, seeded,
+// stop.
 template <typename R> void parse_common(const json::Value &body, R &r, bool legacy_completions) {
     if (const json::Value *v = field(body, "stream")) r.stream = get_bool(*v, "stream");
+    if (const json::Value *v = field(body, "return_progress")) r.return_progress = get_bool(*v, "return_progress");
     const json::Value *mt = field(body, "max_completion_tokens");
     if (!mt) mt = field(body, "max_tokens");
     if (mt) {
@@ -516,6 +518,28 @@ std::string text_usage_chunk_body(const ResponseMeta &m, const GenerationResult 
     b.set("usage", usage_json(r));
     b.set("timings", timings_json(r));
     b.set("strix", strix_ext(r, clamped, m.thinking));
+    return b.dump();
+}
+
+std::string prompt_progress_chunk_body(const ResponseMeta &m, bool legacy_completions, const PrefillProgress &p) {
+    json::Value b = envelope(m, legacy_completions ? "text_completion" : "chat.completion.chunk");
+    json::Value choices = json::Value::array();
+    if (legacy_completions) {
+        choices.push(text_choice("", json::Value()));
+    } else {
+        json::Value choice = json::Value::object();
+        choice.set("index", json::Value::integer(0));
+        choice.set("delta", json::Value::object());
+        choice.set("finish_reason", json::Value());
+        choices.push(std::move(choice));
+    }
+    b.set("choices", std::move(choices));
+    json::Value pp = json::Value::object();
+    pp.set("total", json::Value::integer(p.total));
+    pp.set("cache", json::Value::integer(p.cached));
+    pp.set("processed", json::Value::integer(p.processed));
+    pp.set("time_ms", json::Value::integer((int64_t)p.ms));
+    b.set("prompt_progress", std::move(pp));
     return b.dump();
 }
 

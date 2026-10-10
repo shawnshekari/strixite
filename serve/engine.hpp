@@ -189,12 +189,22 @@ struct GenerationResult {
     int64_t think_nudges = 0;          // thinking nudges fed (serve/think_nudge.hpp)
 };
 
+// Where the prefill stands (GenerationSink::on_prefill): `processed` of the prompt's `total` tokens are in the KV
+// state, `cached` of them reused from the live session or the prompt cache rather than prefilled; `ms` since the
+// prefill started (once the resume point was found and any prompt cache state loaded).
+struct PrefillProgress {
+    int64_t total = 0, cached = 0, processed = 0;
+    double ms = 0;
+};
+
 // The request's side of the loop, called on the engine thread.
 class GenerationSink {
 public:
     virtual ~GenerationSink() = default;
     virtual void on_start() = 0;                               // left the queue
-    virtual void on_progress(int64_t done, int64_t total) = 0;  // after each prefill chunk
+    virtual void on_progress(int64_t done, int64_t total) { (void)done, (void)total; }  // after each prefill chunk
+    // The same with the cached tokens and the time, once more at the resume point: the engine calls this one.
+    virtual void on_prefill(const PrefillProgress &p) { on_progress(p.processed, p.total); }
     virtual void on_events(std::vector<OutputEvent> &events) = 0;
     virtual void on_done(const GenerationResult &r) = 0;
     virtual bool cancelled() = 0;  // polled between chunks and tokens

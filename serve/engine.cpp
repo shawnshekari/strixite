@@ -404,6 +404,9 @@ void Engine::run(Job &job) {
             if (save_sys && sys > pos && sys < end) end = sys;
             return end;
         };
+        const double t_prefill = now_s();
+        const auto progress = [&](int64_t pos) { sink.on_prefill({P, start, pos, (now_s() - t_prefill) * 1e3}); };
+        progress(start);
         if (start == ust)  // resumed exactly at the user turn: its start state is the live state right now
             be_.save_snapshot(LmBackend::kUserSlot);
         for (int64_t pos = start; pos < P;) {
@@ -417,7 +420,7 @@ void Engine::run(Job &job) {
             if (pos == cut) be_.save_snapshot(LmBackend::kTurnSlot);
             if (pos == ust) be_.save_snapshot(LmBackend::kUserSlot);
             if (save_sys && pos == sys) be_.save_snapshot(LmBackend::kSystemSlot);
-            sink.on_progress(pos, P);
+            progress(pos);
             if (pos < P && sink.cancelled()) {
                 res.prompt_ms = (now_s() - t_start) * 1e3;
                 return finish("cancelled");

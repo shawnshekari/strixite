@@ -1,8 +1,8 @@
 # What the server accepts
 
 strixite's server speaks the OpenAI API on port 5300. This page covers the parts where it does something you might
-not expect: how thinking is switched and limited, the thinking nudge, and exactly what structured output enforces -
-and what it refuses.
+not expect: how thinking is switched and limited, the thinking nudge, prefill progress in a stream, and exactly what
+structured output enforces - and what it refuses.
 
 | endpoint | what it is |
 |---|---|
@@ -51,6 +51,28 @@ approach. It never closes the think block itself; the model decides whether to w
   length alone - ignored, or it made the model write its answer inside the think block.
 - **Settings:** `think-nudge = on|off`, `think-nudge-rate` (0.25), `think-nudge-min-tokens` (3072). Turn it off for
   like-for-like comparisons with engines that don't have it. `strix.think_nudges` in a response counts the nudges.
+
+## Streaming
+
+A streamed response (`"stream": true`) sends server-sent events: one `data:` chunk per piece of reasoning, content
+or tool call, then a chunk with the `finish_reason`, a last chunk with `usage` and `strix`, and `data: [DONE]`.
+
+**Prefill progress.** A long prompt can take minutes to read before the first token. By default the stream says how
+far it got only in SSE comment lines (`: prefill 24576/65536`), which keep the connection alive but which clients
+don't show. A request that sends `"return_progress": true` gets it as `data:` chunks instead - one when the prefill
+begins, one after each prefill chunk - with a top-level `prompt_progress` object and an empty delta:
+
+```json
+{"id": "chatcmpl-...", "object": "chat.completion.chunk", "created": 1760000000, "model": "...",
+ "choices": [{"index": 0, "delta": {}, "finish_reason": null}],
+ "prompt_progress": {"total": 65536, "cache": 8192, "processed": 24576, "time_ms": 9120}}
+```
+
+`total` is the prompt's tokens, `cache` the ones reused from the prompt cache rather than read again, `processed`
+the ones in the model's state so far (cached ones included; it reaches `total` when the prefill is done), `time_ms`
+the time since the prefill began. llama.cpp's server streams the same field with the same keys for the same flag,
+so a harness that asks llama.cpp for it (llama.cpp's own web UI does, when it streams) can ask strixite too.
+`/v1/completions` takes the flag as well (its chunks carry empty `text`); without streaming it does nothing.
 
 ## Structured output
 

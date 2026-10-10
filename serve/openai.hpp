@@ -27,6 +27,7 @@ std::string error_body(const std::string &message, const std::string &type, cons
 struct ChatRequest {
     json::Value messages, tools;  // tools: null unless a non-empty array that will be rendered
     bool stream = false;
+    bool return_progress = false;  // streamed: prefill progress as data chunks (prompt_progress_chunk_body)
     std::string model;  // as asked (any name is served: logged, not refused)
     std::optional<int64_t> max_tokens;
     SamplingParams sampling;
@@ -49,6 +50,7 @@ struct ChatRequest {
 struct CompletionRequest {
     std::string prompt;
     bool stream = false;
+    bool return_progress = false;
     std::string model;
     std::optional<int64_t> max_tokens;
     SamplingParams sampling;
@@ -93,6 +95,10 @@ std::string usage_chunk_body(const ResponseMeta &m, const GenerationResult &r, b
 std::string completion_body(const ResponseMeta &m, const std::string &reasoning, const std::string &content,
                             const std::vector<ToolCallOut> &calls, const GenerationResult &r, bool clamped);
 json::Value tool_call_delta(const ToolCallOut &c, int index);
+// A streamed chunk that carries only where the prefill stands, for a request that set return_progress: a choice with
+// an empty delta (chat) or empty text (legacy completions), and a top-level "prompt_progress" {total, cache,
+// processed, time_ms} - the field llama.cpp's server streams for its return_progress, with the same keys.
+std::string prompt_progress_chunk_body(const ResponseMeta &m, bool legacy_completions, const PrefillProgress &p);
 // Legacy completions ("text_completion"): the whole response, a streamed text chunk (finish_reason null until the
 // last), and the final usage chunk (empty choices, as chat's).
 std::string text_completion_body(const ResponseMeta &m, const std::string &text, const GenerationResult &r, bool clamped);
