@@ -183,6 +183,7 @@ struct GenerationResult {
     int64_t decode_forwards = 0, fed_tokens = 0;
     int64_t tool_calls = 0;       // tool calls in the answer
     bool dropped_partial_call = false;
+    int64_t malformed_tool_calls = 0;  // streamed calls that went out but weren't well-formed (OutputParser)
     BackendStats backend;  // this request's share (wait_max: the longest wait of the session so far)
     bool thinking_budget_hit = false;  // the engine closed the think block (kThinkingStop was fed)
     int64_t think_nudges = 0;          // thinking nudges fed (serve/think_nudge.hpp)

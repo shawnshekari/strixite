@@ -63,7 +63,8 @@ const std::string &role_of(const json::Value &msg, const std::string &path) {
 }
 
 // A tool call's arguments as the object the template iterates: an object as is, a JSON string parsed (it must
-// hold an object). nullptr = render no parameters (absent, or the empty string).
+// hold an object). nullptr = render no parameters: absent, the empty string, or an object's JSON left open the way
+// a streamed call that was cut off or malformed leaves it ("}" or "\"}" would close it), sent back as received.
 std::optional<json::Value> arguments_of(const json::Value &call, const std::string &path) {
     const json::Value *a = call.find("arguments");
     if (!a) return std::nullopt;
@@ -74,6 +75,12 @@ std::optional<json::Value> arguments_of(const json::Value &call, const std::stri
         try {
             v = json::Value::parse(s);
         } catch (const Error &e) {
+            for (const char *close : {"}", "\"}"}) {
+                try {
+                    if (json::Value::parse(s + close).is_object()) return std::nullopt;
+                } catch (const Error &) {
+                }
+            }
             STRIX_FAIL("chat template: '", path, ".arguments' is a string but not JSON: ", e.what());
         }
         STRIX_CHECK(v.is_object(), "chat template: '", path, ".arguments' must hold a JSON object, got ",

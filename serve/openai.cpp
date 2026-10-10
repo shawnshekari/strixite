@@ -348,6 +348,27 @@ json::Value timings_json(const GenerationResult &r) {
     return t;
 }
 
+json::Value tool_call_start_delta(const ToolCallOut &c, int index) {
+    json::Value fn = json::Value::object();
+    fn.set("name", json::Value::string(c.name));
+    fn.set("arguments", json::Value::string(""));
+    json::Value tc = json::Value::object();
+    tc.set("index", json::Value::integer(index));
+    tc.set("id", json::Value::string(c.id));
+    tc.set("type", json::Value::string("function"));
+    tc.set("function", std::move(fn));
+    return tc;
+}
+
+json::Value tool_call_args_delta(const std::string &piece, int index) {
+    json::Value fn = json::Value::object();
+    fn.set("arguments", json::Value::string(piece));
+    json::Value tc = json::Value::object();
+    tc.set("index", json::Value::integer(index));
+    tc.set("function", std::move(fn));
+    return tc;
+}
+
 json::Value tool_call_delta(const ToolCallOut &c, int index) {
     json::Value fn = json::Value::object();
     fn.set("name", json::Value::string(c.name));
@@ -373,6 +394,7 @@ json::Value strix_ext(const GenerationResult &r, bool clamped, const std::string
     json::Value s = json::Value::object();
     s.set("max_tokens_clamped", json::Value::boolean(clamped));
     if (r.dropped_partial_call) s.set("dropped_partial_tool_call", json::Value::boolean(true));
+    if (r.malformed_tool_calls > 0) s.set("malformed_tool_calls", json::Value::integer(r.malformed_tool_calls));
     s.set("thinking_budget_hit", json::Value::boolean(r.thinking_budget_hit));
     if (r.think_nudges > 0) s.set("think_nudges", json::Value::integer(r.think_nudges));
     if (!thinking.empty()) s.set("thinking", json::Value::string(thinking));

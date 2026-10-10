@@ -68,12 +68,26 @@ bool is_string_typed(const json::Value *schema) {
     return str;
 }
 
+const std::string kFn = "<function=", kParam = "<parameter=", kParamEnd = "</parameter>", kFnEnd = "</function>";
+
+bool starts_with(const std::string &s, size_t at, const std::string &prefix) { return s.compare(at, prefix.size(), prefix) == 0; }
+// s[at..] is a proper prefix of tag (more bytes could still make it the tag).
+bool could_become(const std::string &s, size_t at, const std::string &tag) {
+    const size_t n = s.size() - at;
+    return n < tag.size() && tag.compare(0, n, s, at, n) == 0;
+}
+// A JSON string's text without the quotes.
+std::string json_escaped(std::string_view s) {
+    std::string q;
+    json::append_quoted(q, s);
+    return q.substr(1, q.size() - 2);
+}
+
 }  // namespace
 
 bool parse_tool_call(const std::string &body, const json::Value *tools, ToolCallOut &out) {
     size_t i = 0;
     skip_ws(body, i);
-    static const std::string kFn = "<function=", kParam = "<parameter=", kParamEnd = "</parameter>", kFnEnd = "</function>";
     if (body.compare(i, kFn.size(), kFn) != 0) return false;
     i += kFn.size();
     const size_t name_end = body.find('>', i);
@@ -184,6 +198,7 @@ bool OutputParser::feed(int32_t id, std::vector<OutputEvent> &out) {
         if (id == call_begin_) {  // held content stays held: trimmed if the call parses, kept if it doesn't
             phase_ = Phase::Call;
             call_body_.clear();
+            call_state_ = CallState::Header, call_at_ = name_scan_ = 0;
             return false;
         }
         add(content_, bytes, out, &stopped_);
@@ -191,13 +206,22 @@ bool OutputParser::feed(int32_t id, std::vector<OutputEvent> &out) {
     case Phase::Call:
         if (id != call_end_) {
             call_body_ += bytes;
+            if (cfg_.stream_calls) advance_call(out);
             return false;
         }
         phase_ = Phase::Content;
+        if (cfg_.stream_calls && call_state_ != CallState::Header && call_state_ != CallState::FnName &&
+            call_state_ != CallState::NoHeader) {
+            if (call_state_ == CallState::Done) {  // well-formed: the arguments close now
+                out.push_back({OutputEvent::Kind::ToolCallArgs, "}", {}});
+                ++tool_calls_;
+            } else {
+                ++malformed_calls_;
+            }
+            return false;
+        }
         if (ToolCallOut call; json::valid_utf8(call_body_) && parse_tool_call(call_body_, cfg_.tools, call)) {
-            static const char *kAlnum = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-            call.id = "call_";
-            for (int k = 0; k < 24; ++k) call.id += kAlnum[rng_() % 62];
+            call.id = new_call_id();
             release(content_, out, true);
             out.push_back({OutputEvent::Kind::ToolCall, {}, std::move(call)});
             ++tool_calls_;
@@ -210,8 +234,172 @@ bool OutputParser::feed(int32_t id, std::vector<OutputEvent> &out) {
     return false;
 }
 
+std::string OutputParser::new_call_id() {
+    static const char *kAlnum = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    std::string id = "call_";
+    for (int k = 0; k < 24; ++k) id += kAlnum[rng_() % 62];
+    return id;
+}
+
+// The streamed form of parse_tool_call: the same grammar, read as far as call_body_ goes, each part sent once it
+// can no longer change.
+void OutputParser::advance_call(std::vector<OutputEvent> &out) {
+    const std::string &b = call_body_;
+    const auto args = [&](std::string piece) { out.push_back({OutputEvent::Kind::ToolCallArgs, std::move(piece), {}}); };
+    // A name between call_at_ and the next '>': its end, npos to wait, or 0 when it can't be one (empty, or a newline
+    // before the '>'). name_scan_: where the last look stopped (no '>' or newline before it).
+    const auto name_end = [&]() -> size_t {
+        const size_t at = std::max(call_at_, name_scan_), e = b.find_first_of(">\n", at);
+        if (e == std::string::npos) {
+            name_scan_ = b.size();
+            return e;
+        }
+        return b[e] == '\n' || e == call_at_ ? 0 : e;
+    };
+    for (;;) {
+        switch (call_state_) {
+        case CallState::Header: {
+            size_t i = call_at_;
+            skip_ws(b, i);
+            call_at_ = i;
+            if (i == b.size() || could_become(b, i, kFn)) return;
+            if (!starts_with(b, i, kFn)) {
+                call_state_ = CallState::NoHeader;
+                return;
+            }
+            call_at_ = name_scan_ = i + kFn.size(), call_state_ = CallState::FnName;
+            break;
+        }
+        case CallState::FnName: {
+            const size_t end = name_end();
+            if (end == std::string::npos) return;
+            const std::string name = end ? b.substr(call_at_, end - call_at_) : std::string();
+            if (!end || !json::valid_utf8(name)) {
+                call_state_ = CallState::NoHeader;
+                return;
+            }
+            // The call goes out: the content before it is trimmed as when a buffered call parses.
+            release(content_, out, true);
+            ToolCallOut start;
+            start.id = new_call_id(), start.name = call_name_ = name;
+            out.push_back({OutputEvent::Kind::ToolCallStart, {}, std::move(start)});
+            args("{");
+            first_param_ = true, params_seen_.clear();
+            call_at_ = end + 1, call_state_ = CallState::Next;
+            break;
+        }
+        case CallState::Next: {
+            size_t i = call_at_;
+            skip_ws(b, i);
+            call_at_ = i;
+            if (i == b.size() || could_become(b, i, kFnEnd) || could_become(b, i, kParam)) return;
+            if (starts_with(b, i, kFnEnd)) {  // the closing "}" waits for </tool_call>, as the buffered parse does
+                call_at_ = i + kFnEnd.size(), call_state_ = CallState::Done;
+            } else if (starts_with(b, i, kParam)) {
+                call_at_ = name_scan_ = i + kParam.size(), call_state_ = CallState::Name;
+            } else {
+                call_state_ = CallState::Broken;
+            }
+            break;
+        }
+        case CallState::Name: {
+            const size_t end = name_end();
+            if (end == std::string::npos) return;
+            param_name_ = end ? b.substr(call_at_, end - call_at_) : std::string();
+            if (!end || !json::valid_utf8(param_name_) || !params_seen_.insert(param_name_).second) {
+                call_state_ = CallState::Broken;
+                break;
+            }
+            value_string_ = is_string_typed(param_schema(cfg_.tools, call_name_, param_name_));
+            if (value_string_) {  // the key goes out now, the value as it comes
+                std::string piece = first_param_ ? "" : ",";
+                json::append_quoted(piece, param_name_);
+                args(piece + ":\"");
+                first_param_ = false;
+            }
+            call_at_ = value_scan_ = end + 1, value_started_ = false, call_state_ = CallState::Value;
+            break;
+        }
+        case CallState::Value: {
+            if (!value_started_) {  // the format's newline after the tag isn't part of the value
+                if (call_at_ == b.size()) return;
+                value_start_ = value_sent_ = call_at_ + (b[call_at_] == '\n');
+                value_started_ = true;
+            }
+            const size_t v_end = b.find(kParamEnd, value_scan_);
+            if (v_end == std::string::npos) value_scan_ = std::max(value_scan_, b.size() - std::min(b.size(), kParamEnd.size() - 1));
+            if (v_end != std::string::npos) {
+                size_t end = v_end;
+                if (end > value_start_ && b[end - 1] == '\n') --end;  // ... nor the one before the closing tag
+                if (value_string_) {
+                    const std::string rest = b.substr(value_sent_, end - value_sent_);
+                    if (!json::valid_utf8(rest)) {
+                        call_state_ = CallState::Broken;
+                        break;
+                    }
+                    args(json_escaped(rest) + "\"");
+                } else {
+                    const std::string raw = b.substr(value_start_, end - value_start_);
+                    if (!json::valid_utf8(raw)) {
+                        call_state_ = CallState::Broken;
+                        break;
+                    }
+                    json::Value v = json::Value::string(raw);
+                    try {
+                        v = json::Value::parse(raw);
+                    } catch (const Error &) {
+                    }
+                    std::string piece = first_param_ ? "" : ",";
+                    json::append_quoted(piece, param_name_);
+                    args(piece + ":" + v.dump());
+                    first_param_ = false;
+                }
+                call_at_ = v_end + kParamEnd.size(), call_state_ = CallState::Next;
+                break;
+            }
+            if (!value_string_) return;  // a typed value goes out whole
+            // Send what can't change any more: not a tail that could still become "</parameter>", not a newline that
+            // could still be the one before it, not part of a character.
+            size_t safe = b.size();
+            for (size_t k = std::min(kParamEnd.size() - 1, b.size() - value_sent_); k > 0; --k)
+                if (kParamEnd.compare(0, k, b, b.size() - k, k) == 0) {
+                    safe = b.size() - k;
+                    break;
+                }
+            if (safe > value_sent_ && b[safe - 1] == '\n') --safe;
+            safe = value_sent_ + whole_chars(b.substr(value_sent_, safe - value_sent_));
+            if (safe == value_sent_) return;
+            const std::string piece = b.substr(value_sent_, safe - value_sent_);
+            if (!json::valid_utf8(piece)) {
+                call_state_ = CallState::Broken;
+                break;
+            }
+            args(json_escaped(piece));
+            value_sent_ = safe;
+            return;
+        }
+        case CallState::Done: {
+            size_t i = call_at_;
+            skip_ws(b, i);
+            call_at_ = i;
+            if (i == b.size()) return;
+            call_state_ = CallState::Broken;  // text after </function>
+            break;
+        }
+        case CallState::NoHeader:
+        case CallState::Broken: return;
+        }
+    }
+}
+
 void OutputParser::finish(std::vector<OutputEvent> &out) {
-    if (phase_ == Phase::Call) dropped_call_ = true;
+    if (phase_ == Phase::Call) {
+        dropped_call_ = true;
+        // A streamed one went out: it stays a call, unterminated (finish_reason tool_calls unless it's length).
+        if (cfg_.stream_calls && call_state_ != CallState::Header && call_state_ != CallState::FnName &&
+            call_state_ != CallState::NoHeader)
+            ++malformed_calls_;
+    }
     release(reasoning_, out, true);
     release(content_, out, true);
 }

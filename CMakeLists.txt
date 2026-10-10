@@ -315,6 +315,10 @@ add_executable(bench_sampler tools/bench_sampler.cpp)
 target_link_libraries(bench_sampler PRIVATE strix_serve)
 add_executable(bench_token_mask tools/bench_token_mask.cpp)
 target_link_libraries(bench_token_mask PRIVATE strix_serve)
+# Streamed tool calls against the buffered parser, host only (no model, no GPU; the model's tokenizer.json):
+# check_stream_calls <tokenizer.json> [random cases] [seed].
+add_executable(check_stream_calls tools/check_stream_calls.cpp)
+target_link_libraries(check_stream_calls PRIVATE strix_serve)
 endif()
 
 add_executable(strix_server tools/strix_server.cpp)

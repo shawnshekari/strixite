@@ -79,3 +79,24 @@ schema - that's what moves a keyword up the list.
 
 A schema is compiled once and cached (the 16 most recent), so repeating one costs nothing the second time. Long
 `maxLength` bounds cost a little on a schema's first use, since every position in the string is its own state.
+
+## Streamed tool calls
+
+In a streamed response (`"stream": true`) a tool call goes out as the model writes it, the way OpenAI streams one:
+the call's `id`, `type` and function `name` as soon as the model has written the name, then its `arguments` piece by
+piece - a string parameter (a file's content, a command) as its characters come, a number, boolean, object or array
+whole once the model closes it, and the closing `}` when the call ends. Joined, the pieces are exactly the
+`arguments` a non-streamed response would have.
+
+A streamed call can't be taken back. A call that turns out malformed - a tag out of place, text after
+`</function>`, a parameter named twice - would come back as plain `content` without streaming (or, named twice,
+with the last value); streamed, it stays a call whose `arguments` never get their closing `}`, so they don't parse
+as JSON. A call cut off - by `max_tokens`, or by the model ending its turn inside it - is left the same way. Either
+way `finish_reason` is `tool_calls` (`length` for a `max_tokens` cut), and `strix.malformed_tool_calls` in the last
+chunk counts such calls (`strix.dropped_partial_tool_call` says one was cut off).
+
+What a client does with unparseable arguments is up to it: most report an error back to the model, which then tries
+again; openai-python's parsing stream helpers (strict tools) raise; a client that repairs partial JSON (LangChain)
+can run the repaired call - complete when the call broke between parameters, wrong when it was cut off inside a
+value. Sent back in the conversation, a call whose arguments were left open this way is shown to the model with no
+parameters, rather than failing the request.

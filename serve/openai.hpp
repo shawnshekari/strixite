@@ -84,6 +84,10 @@ struct ResponseMeta {
     int64_t created = 0;
     std::string thinking;  // strix.thinking: "on" | "off" | "skipped" (thinking_left_out); empty = not reported
 };
+// A streamed call (OutputParser::Config::stream_calls) as OpenAI streams one: the first delta with id, type, name
+// and empty arguments, then deltas with only the index and the next piece of the arguments.
+json::Value tool_call_start_delta(const ToolCallOut &c, int index);
+json::Value tool_call_args_delta(const std::string &piece, int index);
 std::string chunk_body(const ResponseMeta &m, const json::Value &delta, const char *finish_reason);
 std::string usage_chunk_body(const ResponseMeta &m, const GenerationResult &r, bool clamped);
 std::string completion_body(const ResponseMeta &m, const std::string &reasoning, const std::string &content,

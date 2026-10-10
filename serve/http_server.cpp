@@ -230,6 +230,7 @@ void HttpServer::routes() {
         gen.parser.tools = tools->is_null() ? nullptr : tools.get();
         gen.parser.stop = cr.stop;
         gen.parser.id_seed = std::random_device{}();
+        gen.parser.stream_calls = cr.stream;
         gen.thinking_budget = thinking_budget_for(cr, gen.max_tokens);
         auto sink = std::make_shared<QueueSink>();
         const bool thinking_on = !(cr.template_options.enable_thinking.has_value() && !*cr.template_options.enable_thinking);
@@ -256,7 +257,7 @@ void HttpServer::routes() {
                     for (OutputEvent &e : it.events) {
                         if (e.kind == OutputEvent::Kind::Reasoning) reasoning += e.text;
                         else if (e.kind == OutputEvent::Kind::Content) content += e.text;
-                        else calls.push_back(std::move(e.call));
+                        else if (e.kind == OutputEvent::Kind::ToolCall) calls.push_back(std::move(e.call));
                     }
                 if (it.kind == QueueSink::Item::Kind::Done) break;
             }
@@ -302,13 +303,23 @@ void HttpServer::routes() {
                     if (!comment(progress)) return false;
                     break;
                 case QueueSink::Item::Kind::Events:
-                    for (const OutputEvent &e : it.events) {
+                    for (size_t k = 0; k < it.events.size(); ++k) {
+                        const OutputEvent &e = it.events[k];
                         json::Value d = json::Value::object();
                         if (e.kind == OutputEvent::Kind::Reasoning) d.set("reasoning_content", json::Value::string(e.text));
                         else if (e.kind == OutputEvent::Kind::Content) d.set("content", json::Value::string(e.text));
                         else {
                             json::Value tcs = json::Value::array();
-                            tcs.push(tool_call_delta(e.call, tool_index++));
+                            if (e.kind == OutputEvent::Kind::ToolCall) {
+                                tcs.push(tool_call_delta(e.call, tool_index++));
+                            } else if (e.kind == OutputEvent::Kind::ToolCallStart) {
+                                tcs.push(tool_call_start_delta(e.call, tool_index++));
+                            } else {  // ToolCallArgs: consecutive pieces (one token can complete several), as one delta
+                                std::string piece = e.text;
+                                while (k + 1 < it.events.size() && it.events[k + 1].kind == OutputEvent::Kind::ToolCallArgs)
+                                    piece += it.events[++k].text;
+                                tcs.push(tool_call_args_delta(piece, tool_index - 1));
+                            }
                             d.set("tool_calls", std::move(tcs));
                         }
                         if (!send(chunk_body(meta, d, nullptr))) return false;
@@ -393,7 +404,7 @@ void HttpServer::routes() {
                 }
                 if (it.kind == QueueSink::Item::Kind::Events)
                     for (const OutputEvent &e : it.events)
-                        if (e.kind != OutputEvent::Kind::ToolCall) text += e.text;
+                        if (e.is_text()) text += e.text;
                 if (it.kind == QueueSink::Item::Kind::Done) break;
             }
             if (it.result.finish_reason == "error") return send_error(res, 500, it.result.error, "server_error");
@@ -425,7 +436,7 @@ void HttpServer::routes() {
                     break;
                 case QueueSink::Item::Kind::Events:
                     for (const OutputEvent &e : it.events)
-                        if (e.kind != OutputEvent::Kind::ToolCall && !e.text.empty())
+                        if (e.is_text() && !e.text.empty())
                             if (!frame("data: " + text_chunk_body(meta, e.text, nullptr) + "\n\n")) return false;
                     break;
                 case QueueSink::Item::Kind::Done: {

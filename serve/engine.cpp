@@ -270,7 +270,7 @@ void log_detail(const GenerationResult &r) {
                  fmt_n(b.ple_waits).c_str(), fmt_rate(b.ple_wait_seconds, 3).c_str());
     }
     if (r.dropped_partial_call)
-        slog_row(LogLevel::Warning, "tools", "WARNING: dropped a tool call still open when the generation ended (%s)",
+        slog_row(LogLevel::Warning, "tools", "WARNING: a tool call was still open when the generation ended (%s)",
                  r.finish_reason.c_str());
 }
 
@@ -661,9 +661,11 @@ void Engine::run(Job &job) {
         if (!events.empty()) sink.on_events(events);
         res.reasoning_tokens = parser.reasoning_tokens();
         res.dropped_partial_call = parser.dropped_partial_call();
+        res.malformed_tool_calls = parser.malformed_calls();
         res.decode_ms = (now_s() - t_first) * 1e3;
         res.tool_calls = parser.tool_calls();
-        if (reason == "stop" && parser.tool_calls() > 0) reason = "tool_calls";
+        // A streamed call that went out malformed is still a call the client received.
+        if (reason == "stop" && parser.tool_calls() + parser.malformed_calls() > 0) reason = "tool_calls";
         char gen_rate[48];  // the rate leads the row, in the same column as the prefill one (serve/log.hpp)
         std::snprintf(gen_rate, sizeof gen_rate, "%9s t/s",
                       fmt_rate(res.decode_ms > 0 && res.completion_tokens > 1 ? (res.completion_tokens - 1) / (res.decode_ms / 1e3) : 0.0,
