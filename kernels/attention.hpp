@@ -41,7 +41,7 @@ namespace strix::kernels {
 void qk_norm_rope(const void *in, int64_t in_ts, int64_t in_hs, void *out, int64_t out_ts, int64_t out_hs, int64_t T,
                   int64_t heads, int64_t D, const float *w, float eps, int64_t rot_dim, int64_t pos0,
                   const float *inv_freq, Act act, hipStream_t stream, float cos_sin_scale = 1.0f,
-                  const MropePos &pos3 = {});
+                  const MropePos &pos3 = {}, bool hadamard = false);
 
 // Several qk_norm_rope jobs (and verbatim head copies) in one launch, for T tokens at positions pos0 + t: an
 // attention layer's q (in place), k (into the K cache), v (copied into the V cache), the indexer queries and a verify's
@@ -50,12 +50,14 @@ void qk_norm_rope(const void *in, int64_t in_ts, int64_t in_hs, void *out, int64
 // rot_dim dims exactly as qk_norm_rope; w = nullptr copies the heads unchanged. Outputs may not overlap any
 // input except a job's own exactly in place, nor each other. pos3: interleaved-mRoPE section positions for
 // rows [pos0, pos0 + T), null = scalar pos0 + t (the text path's default).
+// hadamard: if true, apply an in-place orthonormal 256-point Fast Walsh-Hadamard Transform after RoPE.
 struct NormRopeJob {
     const void *in = nullptr;
     int64_t in_ts = 0, in_hs = 0;
     void *out = nullptr;
     int64_t out_ts = 0, out_hs = 0, heads = 0, D = 0;
     const float *w = nullptr;
+    bool hadamard = false;
 };
 constexpr int kMaxNormRopeJobs = 5;
 void qk_norm_rope_jobs(const NormRopeJob *jobs, int n, int64_t T, float eps, int64_t rot_dim, int64_t pos0,

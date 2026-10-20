@@ -298,21 +298,31 @@ void Qwen4ExpSession::set_precision(const PrecisionOptions &p) {
 }
 
 const char *kv_format_name(KvFormat f) {
-    STRIX_CHECK(f == KvFormat::Act || f == KvFormat::Q8, "kv_format_name: unknown KvFormat ", (int)f);
-    return f == KvFormat::Q8 ? "q8" : "bf16";
+    STRIX_CHECK(f == KvFormat::Act || f == KvFormat::Q8 || f == KvFormat::Q8H, "kv_format_name: unknown KvFormat ", (int)f);
+    switch (f) {
+        case KvFormat::Q8: return "q8";
+        case KvFormat::Q8H: return "q8h";
+        case KvFormat::Act: return "bf16";
+    }
+    return "unknown";
 }
 
 KvFormat parse_kv_format(const std::string &v) {
     if (v == "bf16") return KvFormat::Act;
     if (v == "q8") return KvFormat::Q8;
-    STRIX_FAIL("parse_kv_format: '", v, "', expected bf16 or q8");
+    if (v == "q8h") return KvFormat::Q8H;
+    STRIX_FAIL("parse_kv_format: '", v, "', expected bf16, q8, or q8h");
 }
+
+namespace {
+inline bool is_q8_format(KvFormat f) { return f == KvFormat::Q8 || f == KvFormat::Q8H; }
+}  // namespace
 
 Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, int64_t max_tokens,
                                  PrefillMath prefill_math, bool mtp, KvFormat kv)
     : m_(model), capacity_(capacity), max_tokens_(max_tokens), prefill_math_(prefill_math), kv_format_(kv),
       mtp_(mtp) {
-    STRIX_CHECK(kv == KvFormat::Act || kv == KvFormat::Q8, "Qwen4ExpSession: unknown KV format ", (int)kv);
+    STRIX_CHECK(kv == KvFormat::Act || kv == KvFormat::Q8 || kv == KvFormat::Q8H, "Qwen4ExpSession: unknown KV format ", (int)kv);
     STRIX_CHECK(prefill_math == PrefillMath::F32 || prefill_math == PrefillMath::WmmaBf16,
                 "Qwen4ExpSession: unknown prefill math ", (int)prefill_math);
     STRIX_CHECK(!mtp || model.has_mtp(), "Qwen4ExpSession: MTP asked for, but the loaded weights have no MTP head "
@@ -328,7 +338,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     const size_t e = es(m_.act());
     const int64_t M = max_tokens, n4 = D.H * D.d, A = D.top_k + 1;
     cap_blocks_ = capacity / kernels::kQsaBlock + 1;
-    const bool q8 = kv == KvFormat::Q8;
+    const bool q8 = kv == KvFormat::Q8 || kv == KvFormat::Q8H;
     kv8_cap_ = (capacity + kernels::kKv8Group - 1) / kernels::kKv8Group * kernels::kKv8Group;
     const int64_t W = D.hkv * D.hd;
     for (int64_t i = 0; i < D.layers; ++i) {
@@ -871,7 +881,7 @@ void Qwen4ExpSession::reset() {
     STRIX_HIP_CHECK(hipMemset(router_err_.get(), 0, 12), "Qwen4ExpSession::reset: zero router error");
     STRIX_HIP_CHECK(hipMemset(expert_err_.get(), 0, 12), "Qwen4ExpSession::reset: zero expert error");
     STRIX_HIP_CHECK(hipMemset(attn_err_.get(), 0, 12), "Qwen4ExpSession::reset: zero attention error");
-    if (kv_format_ == KvFormat::Q8)
+    if (is_q8_format(kv_format_))
         STRIX_HIP_CHECK(hipMemset(kv8_err_.get(), 0, 12), "Qwen4ExpSession::reset: zero 8-bit K/V error");
     pos_ = 0, tail_cur_ = 0, mtp_tail_cur_ = 0, broken_ = false, mtp_chain_step_ = -1, verify_pending_ = false;  // GDN states reset on the first call (reset_state); KV overwritten
     rope_delta_ = 0, history_ever_interleaved_ = false, verify_delta_before_ = 0, verify_ever_before_ = false,
@@ -1025,7 +1035,7 @@ size_t Qwen4ExpSession::state_bytes(int64_t n, int64_t from) const {
     size_t b = sizeof(PleHistory) + sizeof(Qwen4ExpStateHeader);
     for (size_t l = 0; l < conv_state_.size(); ++l) {
         if (D.is_attention[l])
-            b += (kv_format_ == KvFormat::Q8 ? kv8_state_bytes(n, from) : kv) + keys + tail_[0][l].size();
+            b += (is_q8_format(kv_format_) ? kv8_state_bytes(n, from) : kv) + keys + tail_[0][l].size();
         else
             b += conv_state_[l].size() + rec_state_[l].size() * sizeof(float);
     }
@@ -1067,8 +1077,8 @@ void host_copy(uint8_t *&cur, const void *dev, size_t bytes, bool to_host, hipSt
 }  // namespace
 
 size_t Qwen4ExpSession::kv8_state_bytes(int64_t n, int64_t from) const {
-    STRIX_CHECK(kv_format_ == KvFormat::Q8, "Qwen4ExpSession::kv8_state_bytes: the session's K/V is ",
-                kv_format_name(kv_format_), ", not q8");
+    STRIX_CHECK(is_q8_format(kv_format_), "Qwen4ExpSession::kv8_state_bytes: the session's K/V is ",
+                kv_format_name(kv_format_), ", not q8 or q8h");
     STRIX_CHECK(from >= 0 && from <= n && n <= kv8_cap_, "Qwen4ExpSession::kv8_state_bytes: rows [", from, ", ", n,
                 ") outside the 8-bit capacity ", kv8_cap_);
     const Qwen4ExpDims &D = m_.dims();
@@ -1134,7 +1144,7 @@ void Qwen4ExpSession::export_state(const Qwen4ExpSnapshot &s, uint8_t *out, size
     for (size_t l = 0; l < conv_state_.size(); ++l) {
         if (D.is_attention[l]) {
             const size_t row = (size_t)(D.hkv * D.hd) * e, kv = (size_t)(n - from) * row;
-            if (kv_format_ == KvFormat::Q8) {
+            if (is_q8_format(kv_format_)) {
                 kv8_copy(cur, l, n, from, s.kv8_tail_[l], true, &tail_unused);
             } else {
                 host_copy(cur, k_cache_[l].get() + (size_t)from * row, kv, true, stream_, "K cache");
@@ -1227,7 +1237,7 @@ void Qwen4ExpSession::import_state(const uint8_t *in, size_t bytes, int64_t n, i
     for (size_t l = 0; l < conv_state_.size(); ++l) {
         if (D.is_attention[l]) {
             const size_t row = (size_t)(D.hkv * D.hd) * e, kv = (size_t)(n - from) * row;
-            if (kv_format_ == KvFormat::Q8) {
+            if (is_q8_format(kv_format_)) {
                 kv8_copy(cur, l, n, from, kv8_tail_[tail_cur_][l], false, nullptr);
             } else {
                 host_copy(cur, k_cache_[l].get() + (size_t)from * row, kv, false, stream_, "K cache");
@@ -1286,7 +1296,7 @@ std::vector<float> Qwen4ExpSession::read_back(size_t n_floats, const char *what,
     d2h(words, router_err_.get(), 12, "router error");
     d2h(words + 3, expert_err_.get(), 12, "expert error");
     d2h(words + 6, attn_err_.get(), 12, "attention error");
-    if (kv_format_ == KvFormat::Q8) d2h(words + 9, kv8_err_.get(), 12, "8-bit K/V error");
+    if (is_q8_format(kv_format_)) d2h(words + 9, kv8_err_.get(), 12, "8-bit K/V error");
     else std::memset(words + 9, 0, 12);
     d2h(emb, emb_err_.get(), sizeof(kernels::EmbeddingError), "embedding error");
     if (n_floats) d2h(host + kReadbackLogitsAt, logits_.get(), n_floats * 4, "logits");
@@ -1694,12 +1704,13 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             show(L + "gdn_core", gnorm_.get(), D.gz, pt);
             lin(gnorm_.get(), l.out_proj, y_.get(), T, act);
         } else {
-            // Plain K/V caches (empty with KvFormat::Q8).
+            // Plain K/V caches (empty with KvFormat::Q8 / Q8H).
             uint8_t *kc = k_cache_[(size_t)i].size() ? k_cache_[(size_t)i].get() : nullptr,
                     *vc = v_cache_[(size_t)i].size() ? v_cache_[(size_t)i].get() : nullptr;
             // 8-bit K/V: the new rows go to a staging area first ([T][K | V], a verify's into its saved rows for
             // keep_verify_prefix), then kv8_commit quantizes the groups they complete and writes the new tail.
-            const bool q8 = kv_format_ == KvFormat::Q8;
+            const bool q8 = is_q8_format(kv_format_);
+            const bool hadamard = kv_format_ == KvFormat::Q8H;
             const int64_t W = D.hkv * hd;
             uint8_t *kv_rows = !q8 ? nullptr
                                : gdn_to_spare_ ? verify_in_[(size_t)i].get() + (size_t)(kMaxLogits * D.idx_d) * e
@@ -1711,13 +1722,14 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             // One launch: q normed + roped in place, k into the K cache, v copied into the V cache, past the dense
             // limit the indexer queries (normed + roped in place), and in a verify the raw indexer keys copied into
             // the layer's verify_in_ (keep_verify_prefix may replay them) - kernels/attention.hpp qk_norm_rope_jobs.
+            // With q8h, q and k heads are rotated by the orthonormal 256-point Fast Walsh-Hadamard Transform.
             const bool qsa_layer = pos_ + T > D.dense_key_limit();
             kernels::NormRopeJob nr[5] = {
-                {proj_.get(), D.astride, 2 * hd, proj_.get(), D.astride, 2 * hd, D.hq, hd, l.q_norm},
-                {at(proj_, D.hq * 2 * hd), D.astride, hd, k_out, kv_ts, hd, D.hkv, hd, l.k_norm},
-                {at(proj_, D.hq * 2 * hd + D.hkv * hd), D.astride, hd, v_out, kv_ts, hd, D.hkv, hd, nullptr},
+                {proj_.get(), D.astride, 2 * hd, proj_.get(), D.astride, 2 * hd, D.hq, hd, l.q_norm, hadamard},
+                {at(proj_, D.hq * 2 * hd), D.astride, hd, k_out, kv_ts, hd, D.hkv, hd, l.k_norm, hadamard},
+                {at(proj_, D.hq * 2 * hd + D.hkv * hd), D.astride, hd, v_out, kv_ts, hd, D.hkv, hd, nullptr, false},
                 {at(proj_, D.idx_col), D.astride, D.idx_d, at(proj_, D.idx_col), D.astride, D.idx_d, D.idx_h, D.idx_d,
-                 l.idx_q_norm}};
+                 l.idx_q_norm, false}};
             int njobs = 3;
             if (qsa_layer) ++njobs;
             else nr[3] = {};
@@ -1962,7 +1974,7 @@ std::vector<float> Qwen4ExpSession::forward_verify(const std::vector<int32_t> &i
         const size_t e = es(m_.act());
         for (size_t l = 0; l < conv_state_.size(); ++l)
             verify_in_.emplace_back(
-                (size_t)(kMaxLogits * (D.is_attention[l] ? D.idx_d + (kv_format_ == KvFormat::Q8 ? 2 * D.hkv * D.hd : 0)
+                (size_t)(kMaxLogits * (D.is_attention[l] ? D.idx_d + (is_q8_format(kv_format_) ? 2 * D.hkv * D.hd : 0)
                                                          : D.gstride)) * e,
                 "verify rows, layer " + std::to_string(l));
     }
@@ -2048,7 +2060,7 @@ void Qwen4ExpSession::keep_verify_prefix(int64_t rows) {
                                     mk_block_);
             // 8-bit K/V: the groups completed within the kept rows and the tail, from the verify's saved rows and
             // the tail before it (its own commit wrote the other tail buffer, which this overwrites).
-            if (kv_format_ == KvFormat::Q8) {
+            if (is_q8_format(kv_format_)) {
                 const int64_t W = D.hkv * D.hd;
                 const uint8_t *rows_kv = verify_in_[li].get() + (size_t)(kMaxLogits * D.idx_d) * e;
                 kernels::kv8_commit(rows_kv, rows_kv + (size_t)W * e, 2 * W, rows, p0,

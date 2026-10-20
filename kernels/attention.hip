@@ -40,7 +40,7 @@ template <> __device__ inline float round_act<uint16_t>(float v) { return rope_m
 template <typename T>
 __device__ inline void norm_rope_head(const T *x, T *o, int64_t D, const float *w, float eps, int64_t half, int64_t pos,
                                       const int64_t *triple, const float *inv_freq, float cos_sin_scale, float *row,
-                                      float *red) {
+                                      float *red, bool hadamard = false) {
     constexpr bool kBF16 = sizeof(T) == 2;
     // Same reduction shape as rmsnorm_zc (strided partials, tree), same per-element formula.
     float ss = 0.f;
@@ -62,10 +62,33 @@ __device__ inline void norm_rope_head(const T *x, T *o, int64_t D, const float *
             float c, s, y0, y1;
             rope_math::cos_sin<kBF16>(triple ? triple[j % 3] : pos, inv_freq[j], cos_sin_scale, c, s);
             rope_math::rotate<kBF16>(row[j], row[j + half], c, s, y0, y1);
-            store(o, j, y0);
-            store(o, j + half, y1);
-        } else if (j >= 2 * half) {
+            if (!hadamard) {
+                store(o, j, y0);
+                store(o, j + half, y1);
+            } else {
+                row[j] = y0;
+                row[j + half] = y1;
+            }
+        } else if (!hadamard && j >= 2 * half) {
             store(o, j, row[j]);
+        }
+    }
+    if (hadamard) {
+        __syncthreads();
+        // In-place Fast Walsh-Hadamard Transform on row[0..D-1], D a power of 2
+        for (int64_t len = 1; len < D; len <<= 1) {
+            for (int64_t i = threadIdx.x; i < D / 2; i += blockDim.x) {
+                const int64_t a = (i / len) * (2 * len) + (i % len);
+                const int64_t b = a + len;
+                const float u = row[a], v = row[b];
+                row[a] = u + v;
+                row[b] = u - v;
+            }
+            __syncthreads();
+        }
+        const float rs = rsqrtf((float)D);
+        for (int64_t j = threadIdx.x; j < D; j += blockDim.x) {
+            store(o, j, round_act<T>(row[j] * rs));
         }
     }
 }
@@ -74,11 +97,11 @@ template <typename T>
 __global__ void __launch_bounds__(kNormThreads)
     qk_norm_rope_kernel(const T *in, int64_t in_ts, int64_t in_hs, T *out, int64_t out_ts, int64_t out_hs,
                         int64_t heads, int64_t D, const float *w, float eps, int64_t half, int64_t pos0,
-                        const int64_t *pos3, const float *inv_freq, float cos_sin_scale) {
+                        const int64_t *pos3, const float *inv_freq, float cos_sin_scale, bool hadamard = false) {
     extern __shared__ float row[];  // D normalized values, then kNormThreads partial sums
     const int64_t t = blockIdx.x / heads, h = blockIdx.x % heads;
     norm_rope_head(in + t * in_ts + h * in_hs, out + t * out_ts + h * out_hs, D, w, eps, half, pos0 + t,
-                   pos3 ? pos3 + 3 * t : nullptr, inv_freq, cos_sin_scale, row, row + D);
+                   pos3 ? pos3 + 3 * t : nullptr, inv_freq, cos_sin_scale, row, row + D, hadamard);
 }
 
 // Multi-job: blocks job-major, T * heads of each; a job without w copies its heads verbatim.
@@ -106,7 +129,7 @@ __global__ void __launch_bounds__(kNormThreads)
         return;
     }
     norm_rope_head(x, o, jb.D, jb.w, eps, half, pos0 + t, a.pos3 ? a.pos3 + 3 * t : nullptr, inv_freq, cos_sin_scale,
-                   row, row + a.max_d);
+                   row, row + a.max_d, jb.hadamard);
 }
 
 // ---- attention: partial softmax per (key split, KV head, token), one wave per query head --------
@@ -543,13 +566,15 @@ void check_shape(const AttentionShape &s) {
 
 void qk_norm_rope(const void *in, int64_t in_ts, int64_t in_hs, void *out, int64_t out_ts, int64_t out_hs, int64_t T,
                   int64_t heads, int64_t D, const float *w, float eps, int64_t rot_dim, int64_t pos0,
-                  const float *inv_freq, Act act, hipStream_t stream, float cos_sin_scale, const MropePos &pos3) {
+                  const float *inv_freq, Act act, hipStream_t stream, float cos_sin_scale, const MropePos &pos3,
+                  bool hadamard) {
     const char *fn = "qk_norm_rope";
     STRIX_CHECK(in != nullptr && out != nullptr && w != nullptr && inv_freq != nullptr,
                 "qk_norm_rope: null pointer (in=", in, ", out=", out, ", w=", (const void *)w,
                 ", inv_freq=", (const void *)inv_freq, ")");
     STRIX_CHECK(T >= 1 && heads >= 1 && T * heads <= 0x7fffffff, "qk_norm_rope: T = ", T, ", heads = ", heads);
     STRIX_CHECK(D >= 2 && D <= 4096, "qk_norm_rope: D = ", D, ", expected 2..4096");
+    STRIX_CHECK(!hadamard || (D & (D - 1)) == 0, "qk_norm_rope: hadamard requires power-of-2 D, got ", D);
     STRIX_CHECK(rot_dim >= 2 && rot_dim % 2 == 0 && rot_dim <= D, "qk_norm_rope: rot_dim = ", rot_dim,
                 ", expected even, 2..D = ", D);
     STRIX_CHECK(std::isfinite(eps) && eps > 0, "qk_norm_rope: eps = ", eps);
@@ -580,12 +605,12 @@ void qk_norm_rope(const void *in, int64_t in_ts, int64_t in_hs, void *out, int64
         qk_norm_rope_kernel<float><<<grid, block, lds, stream>>>(static_cast<const float *>(in), in_ts, in_hs,
                                                                  static_cast<float *>(out), out_ts, out_hs, heads, D, w,
                                                                  eps, rot_dim / 2, pos0, pos3.pos3, inv_freq,
-                                                                 cos_sin_scale);
+                                                                 cos_sin_scale, hadamard);
     else
         qk_norm_rope_kernel<uint16_t><<<grid, block, lds, stream>>>(static_cast<const uint16_t *>(in), in_ts, in_hs,
                                                                     static_cast<uint16_t *>(out), out_ts, out_hs, heads,
                                                                     D, w, eps, rot_dim / 2, pos0, pos3.pos3, inv_freq,
-                                                                    cos_sin_scale);
+                                                                    cos_sin_scale, hadamard);
     STRIX_HIP_CHECK_LAUNCH("qk_norm_rope ", act_name(act), " T=", T, " heads=", heads, " D=", D);
 }
 
@@ -620,6 +645,7 @@ void qk_norm_rope_jobs(const NormRopeJob *jobs, int n, int64_t T, float eps, int
         STRIX_CHECK(j.in != nullptr && j.out != nullptr, fn, ": job ", k, ": null pointer (in=", j.in, ", out=", j.out, ")");
         STRIX_CHECK(j.heads >= 1 && j.D >= 2 && j.D <= 4096, fn, ": job ", k, ": heads = ", j.heads, ", D = ", j.D,
                     " (expected heads >= 1, D 2..4096)");
+        STRIX_CHECK(!j.hadamard || (j.D & (j.D - 1)) == 0, fn, ": job ", k, ": hadamard requires power-of-2 D, got ", j.D);
         STRIX_CHECK(j.w == nullptr || (rot_dim >= 2 && rot_dim % 2 == 0 && rot_dim <= j.D), fn, ": job ", k,
                     ": rot_dim = ", rot_dim, ", expected even, 2..D = ", j.D);
         for (auto [ts, hs, what] : {std::tuple{j.in_ts, j.in_hs, "in"}, std::tuple{j.out_ts, j.out_hs, "out"}})

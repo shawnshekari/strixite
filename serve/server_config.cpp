@@ -271,7 +271,7 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
         {"attention-precision", K::Text, 0, 0, "exact",
          "prefill attention's P * V: exact (P as BF16 hi + lo) or fast (P as one BF16 term, as flash attention does)"},
         {"kv-cache", K::Text, 0, 0, "q8",
-         "attention K/V cache: q8 (8 bits, layout c: ~56% of bf16's memory and prompt-cache bytes) or bf16"},
+         "attention K/V cache: q8 (8 bits, layout c: ~56% of bf16's memory and prompt-cache bytes), q8h (8 bits with Walsh-Hadamard rotation) or bf16"},
         {"mtp", K::OnOff, 0, 0, "on", "MTP drafting"},
         // MTP defaults: chained drafts at margin 1.5 with a 65536-id draft vocabulary, 7 drafts (reasons in
         // deploy/strix-server.conf).

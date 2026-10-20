@@ -301,9 +301,10 @@ struct ImageInput {
 
 // The full-attention layers' K/V cache: in the activation dtype, or 8 bits (kernels/kv8.hpp). Q8 keeps ~56% of the
 // bytes; the rows of the newest incomplete 32-token group stay in a small tail in the activation dtype.
-enum class KvFormat { Act, Q8 };
-const char *kv_format_name(KvFormat f);  // "bf16" / "q8" (Act is named by the config as bf16)
-KvFormat parse_kv_format(const std::string &v);  // "bf16" -> Act, "q8" -> Q8; anything else throws
+// Q8H applies an orthonormal 256-point Fast Walsh-Hadamard Transform to Q and K to diffuse channel outliers.
+enum class KvFormat { Act, Q8, Q8H };
+const char *kv_format_name(KvFormat f);  // "bf16" / "q8" / "q8h" (Act is named by the config as bf16)
+KvFormat parse_kv_format(const std::string &v);  // "bf16" -> Act, "q8" -> Q8, "q8h" -> Q8H; anything else throws
 
 class Qwen4ExpSession {
 public:

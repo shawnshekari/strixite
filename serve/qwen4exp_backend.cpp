@@ -84,7 +84,9 @@ std::string Qwen4ExpBackend::state_fingerprint() const {
                                 f.meta("source_fingerprint").c_str(), (unsigned long long)strix_hash64(layout.data(), layout.size()),
                                 kernels::act_name(model_.act()), (long long)model_.dims().layers,
                                 session_.has_mtp() ? " mtp" : "", yarn, prec.c_str(),
-                                session_.kv_format() == KvFormat::Q8 ? " kv8" : "");
+                                session_.kv_format() == KvFormat::Q8H   ? " q8h"
+                                : session_.kv_format() == KvFormat::Q8 ? " kv8"
+                                                                       : "");
     STRIX_CHECK(n > 0 && n < (int)sizeof buf, "Qwen4ExpBackend::state_fingerprint: ", n, " characters, expected < ", sizeof buf);
     return buf;
 }
