@@ -46,14 +46,30 @@ __device__ inline void norm_rope_head(const T *x, T *o, int64_t D, const float *
     float ss = 0.f;
     for (int64_t j = threadIdx.x; j < D; j += blockDim.x) {
         const float v = load(x, j);
-        ss += v * v;
+        ss = fmaf(v, v, ss);
     }
-    red[threadIdx.x] = ss;
+    #pragma unroll
+    for (int off = warpSize / 2; off > 0; off >>= 1) {
+        ss += __shfl_down(ss, off, warpSize);
+    }
+    const int lane = threadIdx.x % warpSize;
+    const int wave = threadIdx.x / warpSize;
+    const int num_waves = blockDim.x / warpSize;
+    if (lane == 0) {
+        red[wave] = ss;
+    }
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if ((int)threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-        __syncthreads();
+    if (wave == 0) {
+        float v = (lane < num_waves) ? red[lane] : 0.f;
+        #pragma unroll
+        for (int off = warpSize / 2; off > 0; off >>= 1) {
+            v += __shfl_down(v, off, warpSize);
+        }
+        if (lane == 0) {
+            red[0] = v;
+        }
     }
+    __syncthreads();
     const float inv = 1.0f / sqrtf(red[0] / (float)D + eps);
     for (int64_t j = threadIdx.x; j < D; j += blockDim.x) row[j] = round_act<T>((load(x, j) * inv) * (1.0f + w[j]));
     __syncthreads();  // all of x read and row complete before any write (in place is safe)
@@ -250,18 +266,25 @@ constexpr int kMaxSplits = 1024;
 template <typename T>
 __global__ void __launch_bounds__(kD) attention_combine_kernel(const float *ws, int64_t splits, const T *gate,
                                                                int64_t q_ts, int64_t q_hs, int64_t Hq, T *out) {
-    __shared__ float wgt[kMaxSplits], red[kD];
+    __shared__ float wgt[kMaxSplits], red[kD / 32];
     const int64_t h = blockIdx.x, t = blockIdx.y;
     const float *p = ws + (t * Hq + h) * splits * (kD + 2);
     const int d = threadIdx.x;
     float mx = -INFINITY;
     for (int64_t i = d; i < splits; i += kD) mx = fmaxf(mx, p[i * (kD + 2)]);
-    red[d] = mx;
+    #pragma unroll
+    for (int off = warpSize / 2; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_down(mx, off, warpSize));
+    const int lane = d % warpSize;
+    const int wave = d / warpSize;
+    if (lane == 0) red[wave] = mx;
     __syncthreads();
-    for (int s = kD / 2; s > 0; s >>= 1) {
-        if (d < s) red[d] = fmaxf(red[d], red[d + s]);
-        __syncthreads();
+    if (wave == 0) {
+        float v = (lane < kD / 32) ? red[lane] : -INFINITY;
+        #pragma unroll
+        for (int off = warpSize / 2; off > 0; off >>= 1) v = fmaxf(v, __shfl_down(v, off, warpSize));
+        if (lane == 0) red[0] = v;
     }
+    __syncthreads();
     const float M = red[0];
     __syncthreads();
     float lsum = 0.f;
@@ -271,12 +294,17 @@ __global__ void __launch_bounds__(kD) attention_combine_kernel(const float *ws, 
         wgt[i] = f;
         lsum = fmaf(p[i * (kD + 2) + 1], f, lsum);
     }
-    red[d] = lsum;
+    #pragma unroll
+    for (int off = warpSize / 2; off > 0; off >>= 1) lsum += __shfl_down(lsum, off, warpSize);
+    if (lane == 0) red[wave] = lsum;
     __syncthreads();
-    for (int s = kD / 2; s > 0; s >>= 1) {
-        if (d < s) red[d] += red[d + s];
-        __syncthreads();
+    if (wave == 0) {
+        float v = (lane < kD / 32) ? red[lane] : 0.f;
+        #pragma unroll
+        for (int off = warpSize / 2; off > 0; off >>= 1) v += __shfl_down(v, off, warpSize);
+        if (lane == 0) red[0] = v;
     }
+    __syncthreads();
     const float L = red[0];
     float a = 0.f;
 #pragma unroll 8

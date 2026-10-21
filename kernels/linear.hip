@@ -33,7 +33,7 @@ __device__ inline void store(uint16_t *p, int64_t i, float v) { p[i] = f32_to_bf
 template <typename TX, typename TY>
 __global__ void __launch_bounds__(kThreads)
     linear_bf16w_kernel(const TX *x, const uint16_t *w, TY *y, int64_t M, int64_t N, int64_t K) {
-    __shared__ float red[kRowsPerBlock][kThreads];
+    __shared__ float red[kRowsPerBlock][kThreads / 32];
     int64_t n = blockIdx.x;
     int64_t m0 = (int64_t)blockIdx.y * kRowsPerBlock;
     int rows = (int)((M - m0) < kRowsPerBlock ? (M - m0) : kRowsPerBlock);
@@ -45,18 +45,31 @@ __global__ void __launch_bounds__(kThreads)
         float wv = bf16_bits_to_f32(wr[k]);
 #pragma unroll
         for (int r = 0; r < kRowsPerBlock; ++r)
-            if (r < rows) acc[r] += load(x, (m0 + r) * K + k) * wv;
+            if (r < rows) acc[r] = fmaf(load(x, (m0 + r) * K + k), wv, acc[r]);
     }
 #pragma unroll
-    for (int r = 0; r < kRowsPerBlock; ++r) red[r][threadIdx.x] = acc[r];
+    for (int r = 0; r < kRowsPerBlock; ++r) {
+#pragma unroll
+        for (int off = warpSize / 2; off > 0; off >>= 1) acc[r] += __shfl_down(acc[r], off, warpSize);
+    }
+    const int lane = threadIdx.x % warpSize;
+    const int wave = threadIdx.x / warpSize;
+    const int num_waves = blockDim.x / warpSize;
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < kRowsPerBlock; ++r) red[r][wave] = acc[r];
+    }
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if ((int)threadIdx.x < s) {
+    if (wave == 0) {
 #pragma unroll
-            for (int r = 0; r < kRowsPerBlock; ++r) red[r][threadIdx.x] += red[r][threadIdx.x + s];
+        for (int r = 0; r < kRowsPerBlock; ++r) {
+            float v = (lane < num_waves) ? red[r][lane] : 0.f;
+#pragma unroll
+            for (int off = warpSize / 2; off > 0; off >>= 1) v += __shfl_down(v, off, warpSize);
+            if (lane == 0) red[r][0] = v;
         }
-        __syncthreads();
     }
+    __syncthreads();
     if (threadIdx.x == 0)
         for (int r = 0; r < rows; ++r) store(y, (m0 + r) * N + n, red[r][0]);
 }
