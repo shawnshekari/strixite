@@ -58,6 +58,7 @@ def query_chat_stream(host, port, prompt, max_tokens=1024, temperature=0.0):
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": True,
+        "thinking": {"type": "enabled"},
     }
     req = urllib.request.Request(
         url,
