@@ -58,7 +58,6 @@ def query_chat_stream(host, port, prompt, max_tokens=1024, temperature=0.0):
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": True,
-        "thinking": {"type": "enabled"},
     }
     req = urllib.request.Request(
         url,
@@ -82,7 +81,7 @@ def query_chat_stream(host, port, prompt, max_tokens=1024, temperature=0.0):
             try:
                 chunk = json.loads(data_str)
                 delta = chunk["choices"][0].get("delta", {})
-                content = delta.get("content", "")
+                content = delta.get("content", "") or delta.get("reasoning_content", "") or delta.get("reasoning", "")
                 if content:
                     if ttft is None:
                         ttft = time.perf_counter() - t0
