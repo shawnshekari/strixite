@@ -1998,7 +1998,6 @@ void Qwen4ExpSession::drop_verify() {
     STRIX_CHECK(verify_pending_, "Qwen4ExpSession::drop_verify: no forward_verify to drop");
     copy_state(ple_state_kept_, ple_state_, stream_, "PLE conv state");
     copy_state(mtp_prev_kept_, mtp_prev_, stream_, "MTP previous streams");
-    STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::drop_verify");
     pos_ = verify_pos_, tail_cur_ = verify_tail_cur_, mtp_tail_cur_ = verify_mtp_tail_cur_, ple_hist_ = verify_hist_;
     // mRoPE: the verify's rows never happened - history and rope_delta revert to before it.
     pos3_host_ = verify_hist_before_, rope_delta_ = verify_delta_before_;
@@ -2076,7 +2075,6 @@ void Qwen4ExpSession::keep_verify_prefix(int64_t rows) {
                                        hipMemcpyDeviceToDevice, stream_),
                         "Qwen4ExpSession::keep_verify_prefix: MTP previous streams");
     }
-    STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::keep_verify_prefix");
     // The n-gram history: the one before the verify, advanced over the kept ids.
     PleHistory h = verify_hist_;
     if (D.ple_layer >= 0) {

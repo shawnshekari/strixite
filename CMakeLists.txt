@@ -128,9 +128,10 @@ function(strix_hip_sources target)
 endfunction()
 
 # --- host flags ----------------------------------------------------------------
+set(STRIX_HOST_ARCH "znver5" CACHE STRING "Host microarchitecture target (znver5 for Strix Halo / Zen 5)")
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=znver3 -flto -DNDEBUG")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 -march=znver3 -flto -g -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=${STRIX_HOST_ARCH} -flto -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 -march=${STRIX_HOST_ARCH} -flto -g -DNDEBUG")
 add_link_options(-fuse-ld=lld)
 if(CMAKE_BUILD_TYPE MATCHES "Rel")
     add_link_options(-flto)
