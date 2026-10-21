@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 namespace strix::kernels {
 
@@ -41,16 +42,48 @@ template <> __device__ inline float round_act<uint16_t>(float v) { return bf16_b
 template <typename T>
 __device__ inline float row_inv_rms(const T *xr, int64_t d, float eps, float *red) {
     float ss = 0.f;
+    if constexpr (std::is_same_v<T, uint16_t>) {
+        if ((d & 3) == 0 && ((uintptr_t)xr & 7) == 0) {
+            const int64_t d4 = d / 4;
+            const uint2 *xr4 = reinterpret_cast<const uint2 *>(xr);
+            for (int64_t j = threadIdx.x; j < d4; j += blockDim.x) {
+                uint2 in_u2 = xr4[j];
+                float x0 = bf16_bits_to_f32((uint16_t)in_u2.x);
+                float x1 = bf16_bits_to_f32((uint16_t)(in_u2.x >> 16));
+                float x2 = bf16_bits_to_f32((uint16_t)in_u2.y);
+                float x3 = bf16_bits_to_f32((uint16_t)(in_u2.y >> 16));
+                ss = fmaf(x0, x0, fmaf(x1, x1, fmaf(x2, x2, fmaf(x3, x3, ss))));
+            }
+            goto do_reduce;
+        }
+    }
     for (int64_t j = threadIdx.x; j < d; j += blockDim.x) {
         float v = load(xr, j);
-        ss += v * v;
+        ss = fmaf(v, v, ss);
     }
-    red[threadIdx.x] = ss;
+do_reduce:
+    #pragma unroll
+    for (int off = warpSize / 2; off > 0; off >>= 1) {
+        ss += __shfl_down(ss, off, warpSize);
+    }
+    const int lane = threadIdx.x % warpSize;
+    const int wave = threadIdx.x / warpSize;
+    const int num_waves = blockDim.x / warpSize;
+    if (lane == 0) {
+        red[wave] = ss;
+    }
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if ((int)threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-        __syncthreads();
+    if (wave == 0) {
+        float v = (lane < num_waves) ? red[lane] : 0.f;
+        #pragma unroll
+        for (int off = warpSize / 2; off > 0; off >>= 1) {
+            v += __shfl_down(v, off, warpSize);
+        }
+        if (lane == 0) {
+            red[0] = v;
+        }
     }
+    __syncthreads();
     // 1/sqrtf rather than rsqrtf: sqrtf/division are correctly rounded by default in HIP,
     // rsqrtf is an approximation.
     return 1.0f / sqrtf(red[0] / (float)d + eps);
@@ -61,11 +94,33 @@ __device__ inline float row_inv_rms(const T *xr, int64_t d, float eps, float *re
 template <typename T>
 __global__ void __launch_bounds__(kThreads)
     rmsnorm_zc_kernel(const T *x, const float *w, T *out, int64_t d, int groups, float eps) {
-    __shared__ float red[kThreads];
+    __shared__ float red[kThreads / 32];
     const T *xr = x + (int64_t)blockIdx.x * d;
     T *orow = out + (int64_t)blockIdx.x * d;
     const float *wr = w + (int64_t)(blockIdx.x % (unsigned)groups) * d;
     float inv = row_inv_rms(xr, d, eps, red);
+    if constexpr (std::is_same_v<T, uint16_t>) {
+        if ((d & 3) == 0 && ((uintptr_t)xr & 7) == 0 && ((uintptr_t)orow & 7) == 0 && ((uintptr_t)wr & 15) == 0) {
+            const int64_t d4 = d / 4;
+            const uint2 *xr4 = reinterpret_cast<const uint2 *>(xr);
+            const float4 *wr4 = reinterpret_cast<const float4 *>(wr);
+            uint2 *orow4 = reinterpret_cast<uint2 *>(orow);
+            for (int64_t j = threadIdx.x; j < d4; j += blockDim.x) {
+                uint2 in_u2 = xr4[j];
+                float4 w_f4 = wr4[j];
+                float x0 = bf16_bits_to_f32((uint16_t)in_u2.x);
+                float x1 = bf16_bits_to_f32((uint16_t)(in_u2.x >> 16));
+                float x2 = bf16_bits_to_f32((uint16_t)in_u2.y);
+                float x3 = bf16_bits_to_f32((uint16_t)(in_u2.y >> 16));
+                uint32_t out01 = (uint32_t)f32_to_bf16_bits((x0 * inv) * (1.0f + w_f4.x)) |
+                                 ((uint32_t)f32_to_bf16_bits((x1 * inv) * (1.0f + w_f4.y)) << 16);
+                uint32_t out23 = (uint32_t)f32_to_bf16_bits((x2 * inv) * (1.0f + w_f4.z)) |
+                                 ((uint32_t)f32_to_bf16_bits((x3 * inv) * (1.0f + w_f4.w)) << 16);
+                orow4[j] = make_uint2(out01, out23);
+            }
+            return;
+        }
+    }
     for (int64_t j = threadIdx.x; j < d; j += blockDim.x) store(orow, j, (load(xr, j) * inv) * (1.0f + wr[j]));
 }
 
@@ -89,7 +144,7 @@ template <typename T>
 __global__ void __launch_bounds__(kThreads)
     rmsnorm_gated_kernel(const T *x, const T *z, const float *w, T *out, int64_t d, float eps, bool sigmoid_gate,
                          int64_t z_heads, int64_t z_ts) {
-    __shared__ float red[kThreads];
+    __shared__ float red[kThreads / 32];
     int64_t base = (int64_t)blockIdx.x * d;
     const int64_t zbase = z_heads > 0 ? (int64_t)blockIdx.x / z_heads * z_ts + (int64_t)blockIdx.x % z_heads * d : base;
     float inv = row_inv_rms(x + base, d, eps, red);

@@ -80,8 +80,8 @@ __global__ void __launch_bounds__(kThreads)
                    int64_t d, int r, float eps, int KS, float *h, float *w_in, float *inv) {
     constexpr int kV = (RW + 1) * kH;              // per wave: RW rows' dots per stream, then the sums of squares
     __shared__ float part[kThreads / 32][kV];      // per wave (wave32 worst case)
-    const int lane = threadIdx.x % warpSize, wave = threadIdx.x / warpSize;
-    const int64_t n0 = ((int64_t)blockIdx.x * (blockDim.x / warpSize / KS) + wave / KS) * RW;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    const int64_t n0 = ((int64_t)blockIdx.x * (blockDim.x / 32 / KS) + wave / KS) * RW;
     const int ks = wave % KS;
     const int64_t t = blockIdx.y;
     const T *xr = x + t * K;
@@ -100,7 +100,7 @@ __global__ void __launch_bounds__(kThreads)
 #pragma unroll
     for (int i = 0; i < kV; ++i) v[i] = 0.f;
     if (n0 < R) {  // no early return: every wave reaches the barrier below
-        for (int64_t c = (int64_t)ks * warpSize + lane; c < nc; c += (int64_t)KS * warpSize) {
+        for (int64_t c = (int64_t)ks * 32 + lane; c < nc; c += (int64_t)KS * 32) {
             float xv[kChunk];
             load_x32(xr, c * kChunk, xv);
             const float2 ss = xs[c];
@@ -128,8 +128,10 @@ __global__ void __launch_bounds__(kThreads)
         }
     }
 #pragma unroll
-    for (int i = 0; i < kV; ++i)
-        for (int off = warpSize / 2; off > 0; off >>= 1) v[i] += __shfl_xor(v[i], off);
+    for (int i = 0; i < kV; ++i) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) v[i] += __shfl_down(v[i], off, 32);
+    }
     if (KS > 1) {
         if (lane == 0)
 #pragma unroll

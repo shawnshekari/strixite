@@ -87,9 +87,15 @@ __global__ void __launch_bounds__(kThreads) linear_q4_kernel(const TX *x, const 
                     load_x32(x, (m0 + r) * K + k, xv);
                     float dot = 0.f, xsum = 0.f;
 #pragma unroll
-                    for (int i = 0; i < kChunk; ++i) {
-                        dot = fmaf(xv[i], (float)((words[i / 8] >> (4 * (i % 8))) & 0xFu), dot);
-                        xsum += xv[i];
+                    for (int w = 0; w < 4; ++w) {
+                        uint32_t word = words[w];
+#pragma unroll
+                        for (int b = 0; b < 8; ++b) {
+                            const float qv = (float)((word >> (4 * b)) & 0xFu);
+                            const float xval = xv[8 * w + b];
+                            dot = fmaf(xval, qv, dot);
+                            xsum += xval;
+                        }
                     }
                     acc[r] = fmaf(s, dot, fmaf(mn, xsum, acc[r]));
                 }
@@ -97,8 +103,10 @@ __global__ void __launch_bounds__(kThreads) linear_q4_kernel(const TX *x, const 
         }
     }
 #pragma unroll
-    for (int r = 0; r < MR; ++r)
-        for (int off = warpSize / 2; off > 0; off >>= 1) acc[r] += __shfl_xor(acc[r], off);
+    for (int r = 0; r < MR; ++r) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc[r] += __shfl_down(acc[r], off, 32);
+    }
     if (KS == 1) {
         if (lane == 0 && n < N)
             for (int r = 0; r < rows; ++r) store(y, (m0 + r) * N + n, acc[r]);
@@ -146,9 +154,16 @@ __device__ inline float q4_row_partial(const uint8_t *qrow, const uint16_t *srow
         load_x32(xrow, c * kChunk, xv);
         float dot = 0.f, xsum = 0.f;
 #pragma unroll
-        for (int i = 0; i < kChunk; ++i) {
-            dot = fmaf(xv[i], (float)(((words[i / 8] >> (4 * (i % 8))) & 0xFu) | hb.at(i)), dot);
-            xsum += xv[i];
+        for (int w = 0; w < 4; ++w) {
+            uint32_t word = words[w];
+#pragma unroll
+            for (int b = 0; b < 8; ++b) {
+                const int idx = 8 * w + b;
+                const float qv = (float)(((word >> (4 * b)) & 0xFu) | hb.at(idx));
+                const float xval = xv[idx];
+                dot = fmaf(xval, qv, dot);
+                xsum += xval;
+            }
         }
         acc = fmaf(s, dot, fmaf(mn, xsum, acc));
     }
@@ -158,9 +173,10 @@ __device__ inline float q4_row_partial(const uint8_t *qrow, const uint16_t *srow
 // Wave-reduce each lane's partial, then combine the KS waves of a row in
 // LDS; returns the row total on lane 0 of the row's first wave (ks == 0).
 __device__ inline float reduce_row(float v, float *part, int wave, int ks, int KS) {
-    for (int off = warpSize / 2; off > 0; off >>= 1) v += __shfl_xor(v, off);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down(v, off, 32);
     if (KS == 1) return v;
-    if (threadIdx.x % warpSize == 0) part[wave] = v;
+    if (threadIdx.x % 32 == 0) part[wave] = v;
     __syncthreads();
     if (ks != 0) return 0.f;
     float t = 0.f;
@@ -262,9 +278,16 @@ __global__ void __launch_bounds__(kThreads)
             load_x32(h, (m * A + a) * K + (int64_t)cc * kChunk, xv);
             float dot = 0.f, xsum = 0.f;
 #pragma unroll
-            for (int i = 0; i < kChunk; ++i) {
-                dot = fmaf(xv[i], (float)(((words[i / 8] >> (4 * (i % 8))) & 0xFu) | hb.at(i)), dot);
-                xsum += xv[i];
+            for (int w = 0; w < 4; ++w) {
+                uint32_t word = words[w];
+#pragma unroll
+                for (int b = 0; b < 8; ++b) {
+                    const int idx = 8 * w + b;
+                    const float qv = (float)(((word >> (4 * b)) & 0xFu) | hb.at(idx));
+                    const float xval = xv[idx];
+                    dot = fmaf(xval, qv, dot);
+                    xsum += xval;
+                }
             }
             acc = fmaf(coef[m * A + a], fmaf(s, dot, mn * xsum), acc);
         }
