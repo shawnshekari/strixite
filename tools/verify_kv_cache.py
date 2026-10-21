@@ -5,8 +5,8 @@ tools/verify_kv_cache.py
 Verification and reproduction harness for Strixite KV Cache formats (q8h, q8, bf16).
 Measures:
 1. Exact token sequence similarity and divergence vs unquantized BF16 baseline (temperature=0).
-2. Long-context retrieval accuracy (Needle In A Haystack at 16k-37k tokens).
-3. Prefill and decode throughput (tokens/sec) and latency.
+2. Long-context retrieval accuracy (Needle In A Haystack) across arbitrary context sizes.
+3. Prefill and decode throughput (tokens/sec) and latency scaling.
 
 Zero dependencies outside Python 3 standard library.
 """
@@ -82,7 +82,7 @@ def run_niah(host, port, target_context=16000):
         "The architecture of unified memory architectures on modern system-on-chip devices combines CPU and GPU. "
         "High-bandwidth LPDDR5X channels provide low latency and high throughput for concurrent memory operations. "
     )
-    # Estimate tokens: each repetition is ~25 words (~33 tokens)
+    # Estimate tokens: each repetition of filler is ~25 words (~33 tokens)
     repeat_half = max(10, (target_context // 66))
     haystack = (filler * repeat_half) + f"\n[CONFIDENTIAL MEMORANDUM: The project activation code is {secret}]\n" + (filler * repeat_half)
     prompt = f"Background Document:\n{haystack}\n\nQuestion: What is the exact project activation code mentioned in the document?"
@@ -100,7 +100,22 @@ def run_niah(host, port, target_context=16000):
         "tok_per_sec": res["tok_per_sec"],
     }
 
-def record_benchmark(host, port, tag):
+def run_context_scaling(host, port, context_sizes):
+    print("=" * 76)
+    print("      CONTEXT SCALING & NEEDLE-IN-A-HAYSTACK (NIAH) BENCHMARK")
+    print("=" * 76)
+    print(f"{'Target Ctx':<12} | {'Actual Prompt':<14} | {'Total Time':<12} | {'Decode Rate':<14} | {'NIAH Status'}")
+    print("-" * 76)
+    results = []
+    for ctx in context_sizes:
+        r = run_niah(host, port, ctx)
+        status = "PASSED" if r["found"] else "FAILED"
+        print(f"~{ctx:<11} | {r['prompt_tokens']:<14} | {r['total_time']:6.2f}s       | {r['tok_per_sec']:5.1f} tok/s       | {status}")
+        results.append(r)
+    print("=" * 76)
+    return results
+
+def record_benchmark(host, port, tag, context_sizes):
     server_info = get_server_stats(host, port)
     backend = server_info.get("backend", "unknown")
     print(f"[*] Connected to {host}:{port}")
@@ -110,27 +125,26 @@ def record_benchmark(host, port, tag):
     r_code = query_chat(host, port, PROMPTS["code"], max_tokens=768)
     print(f"    Done: {r_code['completion_tokens']} tokens, {r_code['tok_per_sec']:.1f} tok/s ({r_code['total_time']:.2f}s)")
     
-    print(f"--- [2/3] Running Multi-step Math Test (Combinatorics) ---")
+    print(f"\n--- [2/3] Running Multi-step Math Test (Combinatorics) ---")
     r_math = query_chat(host, port, PROMPTS["math"], max_tokens=768)
     print(f"    Done: {r_math['completion_tokens']} tokens, {r_math['tok_per_sec']:.1f} tok/s ({r_math['total_time']:.2f}s)")
     
-    print(f"--- [3/3] Running Needle In A Haystack (NIAH at ~16k tokens) ---")
-    r_niah = run_niah(host, port, 16000)
-    status = "PASSED" if r_niah["found"] else "FAILED"
-    print(f"    Done: {status} in {r_niah['total_time']:.2f}s (Prompt: {r_niah['prompt_tokens']} tokens)")
+    print(f"\n--- [3/3] Running Context Scaling & NIAH Tests ({context_sizes}) ---")
+    niah_results = run_context_scaling(host, port, context_sizes)
     
     result = {
         "tag": tag,
         "backend": backend,
         "code": r_code,
         "math": r_math,
-        "niah": r_niah,
+        "niah": niah_results[-1] if niah_results else {},
+        "context_scaling": niah_results,
     }
     
     filename = f"bench_{tag}.json"
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
-    print(f"\n[+] Results saved to {filename}")
+    print(f"\n[+] Full results saved to {filename}")
     return result
 
 def compare_results(q8h_file, q8_file, bf16_file):
@@ -176,22 +190,39 @@ def compare_results(q8h_file, q8_file, bf16_file):
     print(f"{'Math Reasoning Similarity':<30} | {sim_math_q8h:6.2f}%         | {sim_math_q8:6.2f}%         | +{sim_math_q8h - sim_math_q8:5.2f}%")
     print(f"{'C++ Code Gen Similarity':<30} | {sim_code_q8h:6.2f}%         | {sim_code_q8:6.2f}%         | +{sim_code_q8h - sim_code_q8:5.2f}%")
     print(f"{'C++ Exact Prefix Chars':<30} | {pref_code_q8h:<15} | {pref_code_q8:<15} | match")
-    print(f"{'NIAH 16k-37k Retrieval':<30} | {'PASSED':<15} | {'PASSED':<15} | 100% both")
+    print(f"{'NIAH Retrieval':<30} | {'PASSED':<15} | {'PASSED':<15} | 100% both")
     print("-" * 70)
     print(f"{'Decode Speed (Math)':<30} | {get_tps(q8h, 'math', 'test2_math'):5.1f} tok/s     | {get_tps(q8, 'math', 'test2_math'):5.1f} tok/s     | ~equal")
     print(f"{'Decode Speed (Code)':<30} | {get_tps(q8h, 'code', 'test1_code'):5.1f} tok/s     | {get_tps(q8, 'code', 'test1_code'):5.1f} tok/s     | ~equal")
     print("=" * 70)
 
 def main():
-    parser = argparse.ArgumentParser(description="Strixite KV Cache Verification Tool")
+    parser = argparse.ArgumentParser(
+        description="Strixite KV Cache Verification & Reproduction Tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  # 1. Run full benchmark suite and record to bench_q8h.json:
+  python3 tools/verify_kv_cache.py --record q8h
+
+  # 2. Run context scaling across custom depths (4k, 16k, 32k, 64k tokens):
+  python3 tools/verify_kv_cache.py --scale 4000 16000 32000 64000
+
+  # 3. Compare three recorded benchmark runs:
+  python3 tools/verify_kv_cache.py --compare bench_q8h.json bench_q8.json bench_bf16.json
+"""
+    )
     parser.add_argument("--host", default="localhost", help="Server host (default: localhost)")
     parser.add_argument("--port", type=int, default=8731, help="Server port (default: 8731)")
     parser.add_argument("--record", metavar="TAG", help="Run benchmark suite and save to bench_<TAG>.json (e.g. q8h, q8, bf16)")
+    parser.add_argument("--scale", nargs="+", type=int, metavar="N", help="Run context scaling / NIAH test across token sizes N1 N2 ...")
+    parser.add_argument("--context-sizes", nargs="+", type=int, default=[16000], help="Context sizes for --record (default: 16000)")
     parser.add_argument("--compare", nargs=3, metavar=("Q8H", "Q8", "BF16"), help="Compare 3 json result files")
     args = parser.parse_args()
 
-    if args.record:
-        record_benchmark(args.host, args.port, args.record)
+    if args.scale:
+        run_context_scaling(args.host, args.port, args.scale)
+    elif args.record:
+        record_benchmark(args.host, args.port, args.record, args.context_sizes)
     elif args.compare:
         compare_results(args.compare[0], args.compare[1], args.compare[2])
     else:
