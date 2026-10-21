@@ -107,12 +107,13 @@ __device__ int block_exclusive_scan(int v, int *buf, int *total) {
             if (lane >= o) ws += y;
         }
         buf[lane] = ws - buf[lane];
-        if (lane == 31) *total = ws;
+        if (lane == 31) buf[32] = ws;
     }
     __syncthreads();
 
     // Stage 3: Add wave prefix to intra-wave sum
     const int incl = x + buf[wid];
+    *total = buf[32];
     __syncthreads();
     return incl - v;
 }
