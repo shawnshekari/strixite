@@ -122,21 +122,36 @@ def query_chat_stream(host, port, prompt, max_tokens=1024, temperature=0.0):
         "raw_predicted_tps": timings.get("predicted_per_second", 0.0),
     }
 
+def generate_unique_context(target_tokens, seed=42):
+    """
+    Generate pseudo-random realistic technical text for prefill stress testing.
+    Uses seeded pseudo-random selection to ensure 100% reproducible yet completely
+    unique token sequences across different context sizes, eliminating prompt-cache
+    prefix hits.
+    """
+    import random
+    rng = random.Random(seed + target_tokens)
+    vocab = [
+        "memory", "bandwidth", "coherence", "register", "pipeline", "latency", "vector",
+        "compute", "architecture", "channel", "hierarchy", "matrix", "tensor", "kernel",
+        "instruction", "scheduling", "cache", "throughput", "execution", "thread",
+        "barrier", "reduction", "cooperative", "dispatch", "interconnect", "bus",
+        "synchronization", "prefetch", "speculative", "verification", "shfl", "atomic"
+    ]
+    # Average ~1.3 tokens per word with numeric suffix in Qwen BPE
+    num_words = max(16, int(target_tokens / 1.35))
+    words = [f"{rng.choice(vocab)}_{rng.randint(100, 9999)}" for _ in range(num_words)]
+    return " ".join(words)
+
 def run_prefill_bench(host, port, context_sizes):
     print("\n--- Running Context Prefill Scaling Benchmark ---")
     print(f"{'Target Ctx':<12} | {'Actual Prompt':<14} | {'TTFT (s)':<10} | {'Client Prefill':<16} | {'Engine Prefill':<16} | {'Cached':<8}")
     print("-" * 88)
     results = []
-    filler_base = (
-        "AMD Strix Halo features a unified system memory architecture with high-bandwidth 256-bit LPDDR5X channels. "
-        "The RDNA 3.5 graphics compute units and Zen 5 CPU cores share a single coherent physical memory space. "
-    )
+    
     for ctx in context_sizes:
-        repeat = max(10, int(ctx / 43.5))
-        # Unique run salt per ctx ensures zero prefix hits against prompt cache
-        salt = f"TestTag-{time.time_ns() % 1000000}-{ctx} "
-        haystack = (filler_base + salt) * repeat
-        prompt = f"Background Document:\n{haystack}\n\nQuestion: Summarize the document in one word."
+        haystack = generate_unique_context(ctx, seed=int(time.time()) % 10000)
+        prompt = f"Background Technical Document:\n{haystack}\n\nQuestion: Summarize the document in one word."
         res = query_chat_stream(host, port, prompt, max_tokens=16, temperature=0.0)
         actual_prompt = res.get("prompt_tokens") or ctx
         ttft = res["ttft_s"]
