@@ -1546,6 +1546,11 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
         STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "before probe '", name, "'");
         probe(name, dev, T, cols, type);
     };
+#define SHOW(name, dev, cols, type)                   \
+    do {                                              \
+        if (__builtin_expect(probe != nullptr, 0))    \
+            show(name, dev, cols, type);              \
+    } while (0)
     // inv_ready: inv_ already holds X's inverse RMS (the preceding injection was hc_inject_inv). xb: the streams
     // to mix, x_ unless given (the MTP layer's mtp_x_).
     auto hc_mix = [&](const Qwen4ExpModel::Hc &hc, bool inject, bool inv_ready = false, uint8_t *xb = nullptr) {
@@ -1626,15 +1631,15 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
     // merged rows overwrite the image_token_id rows in every stream before layer 0 reads x_ (and before
     // the probe below - a probed embed_streams is after the scatter).
     if (image != nullptr) run_tower_and_scatter(ids, *image);
-    show("embed_streams", x_.get(), n4, pt);  // [T, H * d]: the embedding in each of the H streams
+    SHOW("embed_streams", x_.get(), n4, pt);  // [T, H * d]: the embedding in each of the H streams
 
     for (int64_t i = 0; i < D.layers; ++i) {
         const Qwen4ExpModel::Layer &l = m_.layer(i);
-        const std::string L = "L" + std::to_string(i) + ".";
+        const std::string L = __builtin_expect(probe != nullptr, 0) ? ("L" + std::to_string(i) + ".") : "";
         if (i == D.ple_layer) STRIX_TRACE_SET(stage, "L" + std::to_string(i) + " ple");
         if (i == D.ple_layer) {
             // n-gram rows (gathered on the host since the forward started), key|value projection, gate + conv into X.
-            show(L + "ple_in", x_.get(), n4, pt);
+            SHOW(L + "ple_in", x_.get(), n4, pt);
             {
                 const auto t0 = std::chrono::steady_clock::now();
                 ple_ready.get();
@@ -1664,14 +1669,14 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                               ple_state_.get(), sh, D.eps, ple_hist_buf_.get(), ple_sigma_.get(), act, stream_);
             kernels::ple_conv(ple_hist_buf_.get(), ple_sigma_.get(), ple_kv_.get(), l.ple_conv, sh, x_.get(),
                               ple_state_.get(), act, stream_);
-            show(L + "ple_out", x_.get(), n4, pt);
+            SHOW(L + "ple_out", x_.get(), n4, pt);
         }
 
         if (i == D.ple_layer) inv_ready = false;  // the PLE changed X after the last injection
         STRIX_TRACE_SET(stage, "L" + std::to_string(i) + (D.is_attention[(size_t)i] ? " attn" : " gdn"));
         hc_mix(l.hc_attn, true, inv_ready);
-        show(L + "attn_in", u_.get(), D.d, pt);
-        show(L + "attn_w_in", w_in_.get(), D.H, ProbeType::F32);
+        SHOW(L + "attn_in", u_.get(), D.d, pt);
+        SHOW(L + "attn_w_in", w_in_.get(), D.H, ProbeType::F32);
         if (!D.is_attention[(size_t)i]) {
             // A verify writes its in_proj rows straight into the layer's verify_in_ buffer (keep_verify_prefix may
             // replay them) instead of proj_ and a copy.
@@ -1691,7 +1696,7 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             // z (gv heads of kHD a token) read in place from the in_proj rows.
             kernels::rmsnorm_gated(core_.get(), gp + (size_t)D.conv_c * e, l.gdn_norm, gnorm_.get(), T * D.gv, kHD, D.eps,
                                    kernels::GateAct::Sigmoid, act, stream_, D.gv, D.gstride);
-            show(L + "gdn_core", gnorm_.get(), D.gz, pt);
+            SHOW(L + "gdn_core", gnorm_.get(), D.gz, pt);
             lin(gnorm_.get(), l.out_proj, y_.get(), T, act);
         } else {
             // Plain K/V caches (empty with KvFormat::Q8).
@@ -1783,8 +1788,8 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                                     cap_blocks_, qsa_scores_.get(), cap_blocks_, act, stream_);
                 kernels::qsa_topk(qsa_scores_.get(), cap_blocks_, T, pos_, qsa_k, qsa_sel_.get(), qsa_nsel_.get(),
                                   qsa_topk_ws_.get(), qsa_topk_ws_bytes_, stream_);
-                show(L + "qsa_sel", qsa_sel_.get(), qsa_k, ProbeType::I32);
-                show(L + "qsa_nsel", qsa_nsel_.get(), 1, ProbeType::I32);
+                SHOW(L + "qsa_sel", qsa_sel_.get(), qsa_k, ProbeType::I32);
+                SHOW(L + "qsa_nsel", qsa_nsel_.get(), 1, ProbeType::I32);
                 stage_kv8(std::min<int64_t>(D.qsa_budget, pos_ + T));
                 if (wmma_attn && q8)
                     kernels::attention_gathered_wmma(proj_.get(), at(proj_, hd), kv8, as, qsa_sel_.get(),
@@ -1803,16 +1808,16 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                                                 qsa_nsel_.get(), qsa_k, scale, core_.get(), attn_ws_.get(),
                                                 attn_ws_bytes_, attn_err_.get(), act, stream_);
             }
-            show(L + "attn_core", core_.get(), D.hq * D.hd, pt);
+            SHOW(L + "attn_core", core_.get(), D.hq * D.hd, pt);
             lin(core_.get(), l.o_proj, y_.get(), T, act);
         }
-        show(L + "mixer", y_.get(), D.d, pt);
+        SHOW(L + "mixer", y_.get(), D.d, pt);
         inv_ready = inject_y();
 
         STRIX_TRACE_SET(stage, "L" + std::to_string(i) + " moe");
         hc_mix(l.hc_mlp, true, inv_ready);
-        show(L + "mlp_in", u_.get(), D.d, pt);
-        show(L + "mlp_w_in", w_in_.get(), D.H, ProbeType::F32);
+        SHOW(L + "mlp_in", u_.get(), D.d, pt);
+        SHOW(L + "mlp_w_in", w_in_.get(), D.H, ProbeType::F32);
         // Router: logits FP32, 512 routed + the shared gate in one [T, 513] output; prefill-sized
         // forwards on the matrix units (exact BF16 products, FP32 sums - only the summation order differs).
         if (wmma && T >= kWmmaMinTokens)
@@ -1821,12 +1826,12 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
         else
             kernels::linear_bf16w(u_.get(), l.router, router_logits_.get(), T, D.experts + 1, D.d, act, Act::F32,
                                   stream_);
-        show(L + "router_logits", router_logits_.get(), D.experts + 1, ProbeType::F32);
+        SHOW(L + "router_logits", router_logits_.get(), D.experts + 1, ProbeType::F32);
         kernels::moe_router(router_logits_.get(), D.experts + 1, T, D.experts, D.top_k,
                             sep ? nullptr : router_logits_.get() + D.experts, D.experts + 1, (int32_t)D.experts,
                             route_ids_.get(), route_coef_.get(), Act::F32, router_err_.get(), stream_);
-        show(L + "router_ids", route_ids_.get(), A, ProbeType::I32);
-        show(L + "router_coef", route_coef_.get(), A, ProbeType::F32);
+        SHOW(L + "router_ids", route_ids_.get(), A, ProbeType::I32);
+        SHOW(L + "router_coef", route_coef_.get(), A, ProbeType::F32);
         const int64_t Estack = D.experts + (sep ? 0 : 1);
         if (T >= kGroupedMinTokens) {
             // Q4 experts on the matrix units take F16; Q5 stays on BF16 scaled codes
@@ -1854,34 +1859,35 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             kernels::linear_qw_experts_combine(hh_.get(), l.down, Estack, route_ids_.get(), route_coef_.get(), T, A,
                                                y_.get(), act, expert_err_.get(), stream_);
         }
-        show(L + "experts_h", hh_.get(), A * D.inter, pt);  // the routed experts' down input, T rows of A slots
+        SHOW(L + "experts_h", hh_.get(), A * D.inter, pt);  // the routed experts' down input, T rows of A slots
         if (sep) {  // the shared expert as dense projections, then y += sigmoid(its gate logit) * its output
             lin(u_.get(), l.shared_gate_up, gu_.get(), T, act);
             kernels::swiglu(gu_.get(), hh_.get(), T, D.inter, act, stream_);
-            show(L + "shared_h", hh_.get(), D.inter, pt);
+            SHOW(L + "shared_h", hh_.get(), D.inter, pt);
             lin(hh_.get(), l.shared_down, sh_y_.get(), T, act);
         }
         if (sep && !fuse_inv) {  // decode / verify: the gated add and the injection in one launch (bit-identical)
             kernels::moe_shared_add_inject(y_.get(), sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1, T,
                                            D.d, (uint32_t)D.experts, x_.get(), w_in_.get(), D.H, act,
                                            router_err_.get(), stream_);
-            show(L + "moe", y_.get(), D.d, pt);
+            SHOW(L + "moe", y_.get(), D.d, pt);
             inv_ready = false;
         } else {
             if (sep)
                 kernels::moe_shared_add(y_.get(), sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1, T,
                                         D.d, (uint32_t)D.experts, act, router_err_.get(), stream_);
-            show(L + "moe", y_.get(), D.d, pt);
+            SHOW(L + "moe", y_.get(), D.d, pt);
             inv_ready = inject_y();
         }
-        show(L + "out", x_.get(), n4, pt);
+        SHOW(L + "out", x_.get(), n4, pt);
     }
     // Indexer tails: every attention layer wrote tail_out = the other buffer this call.
     tail_cur_ = 1 - tail_cur_;
 
     STRIX_TRACE_SET(stage, "head");
     hc_mix(m_.final_mix(), false, inv_ready);
-    show("final_mixed", u_.get(), D.d, pt);
+    SHOW("final_mixed", u_.get(), D.d, pt);
+#undef SHOW
     if (n_logits > 0)
         lin(at(u_, (T - n_logits) * D.d), m_.lm_head(), logits_.get(), n_logits, Act::F32);
     const bool cands = cand_n_valid > 0 && n_logits > 0;

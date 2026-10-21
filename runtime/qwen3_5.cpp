@@ -234,18 +234,23 @@ std::vector<float> Qwen35Session::forward(const std::vector<int32_t> &ids, int64
         STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "before probe '", name, "'");
         probe(name, b.get(), T, cols);
     };
+#define SHOW(name, b, cols)                           \
+    do {                                              \
+        if (__builtin_expect(probe != nullptr, 0))    \
+            show(name, b, cols);                      \
+    } while (0)
 
     STRIX_HIP_CHECK(hipMemcpyAsync(ids_.get(), ids.data(), (size_t)T * 4, hipMemcpyHostToDevice, stream_),
                     "uploading ", T, " token ids");
     kernels::reset_embedding_error(emb_err_.get(), stream_);
     kernels::embedding_lookup(ids_.get(), T, m_.embed().get(), D.vocab, D.d, x_.get(), act, emb_err_.get(), stream_);
-    show("embed", x_, D.d);
+    SHOW("embed", x_, D.d);
 
     for (int64_t i = 0; i < D.layers; ++i) {
         const Qwen35Model::Layer &l = m_.layer(i);
-        const std::string L = "L" + std::to_string(i) + ".";
+        const std::string L = __builtin_expect(probe != nullptr, 0) ? ("L" + std::to_string(i) + ".") : "";
         kernels::rmsnorm_zc(x_.get(), l.in_norm.get(), n_.get(), T, D.d, D.eps, act, stream_);
-        show(L + "in_norm", n_, D.d);
+        SHOW(L + "in_norm", n_, D.d);
         if (!D.is_attention[(size_t)i]) {
             kernels::linear_bf16w(n_.get(), l.in_proj.get(), proj_.get(), T, gstride, D.d, act, stream_);
             kernels::gdn_front(proj_.get(), {T, D.gk, kHD, D.gv, kHD, gstride, D.conv_c + Z, D.conv_c + Z + D.gv},
@@ -279,19 +284,20 @@ std::vector<float> Qwen35Session::forward(const std::vector<int32_t> &ids, int64
                                attn_ws_.get(), attn_ws_bytes_, act, stream_);
             kernels::linear_bf16w(core_.get(), l.o_proj.get(), mix_.get(), T, D.d, D.hq * hd, act, stream_);
         }
-        show(L + "mixer", mix_, D.d);
+        SHOW(L + "mixer", mix_, D.d);
         kernels::residual_add(x_.get(), mix_.get(), T * D.d, act, stream_);
         kernels::rmsnorm_zc(x_.get(), l.post_norm.get(), n_.get(), T, D.d, D.eps, act, stream_);
-        show(L + "post_norm", n_, D.d);
+        SHOW(L + "post_norm", n_, D.d);
         kernels::linear_bf16w(n_.get(), l.gate_up.get(), gu_.get(), T, 2 * D.inter, D.d, act, stream_);
         kernels::swiglu(gu_.get(), h_.get(), T, D.inter, act, stream_);
         kernels::linear_bf16w(h_.get(), l.down.get(), mix_.get(), T, D.d, D.inter, act, stream_);
-        show(L + "mlp", mix_, D.d);
+        SHOW(L + "mlp", mix_, D.d);
         kernels::residual_add(x_.get(), mix_.get(), T * D.d, act, stream_);
-        show(L + "out", x_, D.d);
+        SHOW(L + "out", x_, D.d);
     }
     kernels::rmsnorm_zc(x_.get(), m_.final_norm().get(), n_.get(), T, D.d, D.eps, act, stream_);
-    show("final_norm", n_, D.d);
+    SHOW("final_norm", n_, D.d);
+#undef SHOW
     if (n_logits > 0)
         kernels::linear_bf16w(at(n_, (T - n_logits) * D.d), m_.embed().get(), logits_.get(), n_logits, D.vocab, D.d,
                               act, stream_);
