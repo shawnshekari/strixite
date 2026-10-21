@@ -79,9 +79,9 @@ __global__ void __launch_bounds__(kThreads) linear_q56_kernel(const TX *x, const
                                                              const uint16_t *minv, TY *y, int64_t M, int64_t N,
                                                              int64_t K, int KS) {
     __shared__ float part[kThreads / 32][MR];
-    const int lane = threadIdx.x % warpSize;
-    const int wave = threadIdx.x / warpSize;
-    const int64_t n = (int64_t)blockIdx.x * (blockDim.x / warpSize / KS) + wave / KS;
+    const int lane = threadIdx.x & 31;
+    const int wave = threadIdx.x >> 5;
+    const int64_t n = (int64_t)blockIdx.x * (blockDim.x / 32 / KS) + wave / KS;
     const int ks = wave % KS;
     const int64_t m0 = (int64_t)blockIdx.y * MR;
     const int rows = (int)((M - m0) < MR ? (M - m0) : MR);
@@ -96,7 +96,7 @@ __global__ void __launch_bounds__(kThreads) linear_q56_kernel(const TX *x, const
         const uint8_t *hi_plane = row + K / 2;
         const uint16_t *srow = scale + n * (K / G);
         const uint16_t *mrow = minv + n * (K / G);
-        for (int64_t k = ((int64_t)ks * warpSize + lane) * kChunk; k < K; k += (int64_t)KS * warpSize * kChunk) {
+        for (int64_t k = ((int64_t)ks * 32 + lane) * kChunk; k < K; k += (int64_t)KS * 32 * kChunk) {
             const uint4 lo = lo_row[k / kChunk];
             const HighBits<HB> hb = HighBits<HB>::load(hi_plane, k);
             const uint32_t lw[4] = {lo.x, lo.y, lo.z, lo.w};
@@ -109,10 +109,16 @@ __global__ void __launch_bounds__(kThreads) linear_q56_kernel(const TX *x, const
                     load_x32(x, (m0 + r) * K + k, xv);
                     float dot = 0.f, xsum = 0.f;
 #pragma unroll
-                    for (int i = 0; i < kChunk; ++i) {
-                        const uint32_t c = ((lw[i / 8] >> (4 * (i % 8))) & 0xFu) | (hb.at(i) << 4);
-                        dot = fmaf(xv[i], (float)c, dot);
-                        xsum += xv[i];
+                    for (int w = 0; w < 4; ++w) {
+                        uint32_t word = lw[w];
+#pragma unroll
+                        for (int b = 0; b < 8; ++b) {
+                            const int idx = 8 * w + b;
+                            const uint32_t c = ((word >> (4 * b)) & 0xFu) | (hb.at(idx) << 4);
+                            const float xval = xv[idx];
+                            dot = fmaf(xval, (float)c, dot);
+                            xsum += xval;
+                        }
                     }
                     acc[r] = fmaf(s, dot, fmaf(mn, xsum, acc[r]));
                 }
@@ -120,8 +126,10 @@ __global__ void __launch_bounds__(kThreads) linear_q56_kernel(const TX *x, const
         }
     }
 #pragma unroll
-    for (int r = 0; r < MR; ++r)
-        for (int off = warpSize / 2; off > 0; off >>= 1) acc[r] += __shfl_xor(acc[r], off);
+    for (int r = 0; r < MR; ++r) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc[r] += __shfl_down(acc[r], off, 32);
+    }
     if (KS == 1) {
         if (lane == 0 && n < N)
             for (int r = 0; r < rows; ++r) store(y, (m0 + r) * N + n, acc[r]);

@@ -52,7 +52,8 @@ __global__ void __launch_bounds__(kLanes)
         sl = load(shared, m * shared_ld);
         if (!isfinite(sl) && E < bad) bad = E;
     }
-    for (int off = kLanes / 2; off > 0; off >>= 1) bad = min(bad, __shfl_xor(bad, off, kLanes));
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) bad = min(bad, __shfl_xor(bad, off, 32));
     int32_t *id_row = ids + m * A;
     float *coef_row = coef + m * A;
     if (bad != INT_MAX) {
@@ -82,9 +83,10 @@ __global__ void __launch_bounds__(kLanes)
     for (int r = 0; r < k; ++r) {
         float bv = lv;
         int bi = li;
-        for (int off = kLanes / 2; off > 0; off >>= 1) {
-            const float ov = __shfl_xor(bv, off, kLanes);
-            const int oi = __shfl_xor(bi, off, kLanes);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor(bv, off, 32);
+            const int oi = __shfl_xor(bi, off, 32);
             if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
         }
         if (r == 0) top = bv;
@@ -100,7 +102,8 @@ __global__ void __launch_bounds__(kLanes)
     // Softmax over the k picks (= the full softmax renormalized over them).
     const float ex = lane < k ? expf(my_v - top) : 0.f;
     float sum = ex;
-    for (int off = kLanes / 2; off > 0; off >>= 1) sum += __shfl_xor(sum, off, kLanes);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor(sum, off, 32);
     if (lane < k) {
         id_row[lane] = my_i;
         coef_row[lane] = ex / sum;

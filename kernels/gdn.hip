@@ -166,7 +166,8 @@ __global__ void __launch_bounds__(kThreads)
         if (t + 1 < p.T) fetch(t + 1, x_n, v_n, b_n, g_n);
         // q and k of key head kh, L2-normalized in FP32.
         float sq = x * x;
-        for (int off = warpSize / 2; off > 0; off >>= 1) sq += __shfl_xor(sq, off);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) sq += __shfl_down(sq, off, 32);
         if (lane == 0) ss[wave] = sq;
         __syncthreads();
         float tot = 0.0f;

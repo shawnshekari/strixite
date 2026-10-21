@@ -75,9 +75,9 @@ __global__ void __launch_bounds__(kThreads) linear_q8_kernel(const TX *x, const 
                                                              const uint16_t *minv, TY *y, int64_t M, int64_t N,
                                                              int64_t K, int KS) {
     __shared__ float part[kThreads / 32][MR];
-    const int lane = threadIdx.x % warpSize;
-    const int wave = threadIdx.x / warpSize;
-    const int64_t n = (int64_t)blockIdx.x * (blockDim.x / warpSize / KS) + wave / KS;
+    const int lane = threadIdx.x & 31;
+    const int wave = threadIdx.x >> 5;
+    const int64_t n = (int64_t)blockIdx.x * (blockDim.x / 32 / KS) + wave / KS;
     const int ks = wave % KS;
     const int64_t m0 = (int64_t)blockIdx.y * MR;
     const int rows = (int)((M - m0) < MR ? (M - m0) : MR);
@@ -90,7 +90,7 @@ __global__ void __launch_bounds__(kThreads) linear_q8_kernel(const TX *x, const 
         const uint4 *qrow = reinterpret_cast<const uint4 *>(q + n * K);
         const uint16_t *srow = scale + n * (K / G);
         const uint16_t *mrow = minv + n * (K / G);
-        for (int64_t k = ((int64_t)ks * warpSize + lane) * kChunk; k < K; k += (int64_t)KS * warpSize * kChunk) {
+        for (int64_t k = ((int64_t)ks * 32 + lane) * kChunk; k < K; k += (int64_t)KS * 32 * kChunk) {
             const uint4 packed = qrow[k / kChunk];
             const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
             const float s = bf16_bits_to_f32(srow[k / G]);
@@ -133,8 +133,10 @@ __global__ void __launch_bounds__(kThreads) linear_q8_kernel(const TX *x, const 
         }
     }
 #pragma unroll
-    for (int r = 0; r < MR; ++r)
-        for (int off = warpSize / 2; off > 0; off >>= 1) acc[r] += __shfl_xor(acc[r], off);
+    for (int r = 0; r < MR; ++r) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc[r] += __shfl_down(acc[r], off, 32);
+    }
     if (KS == 1) {
         if (lane == 0 && n < N)
             for (int r = 0; r < rows; ++r) store(y, (m0 + r) * N + n, acc[r]);

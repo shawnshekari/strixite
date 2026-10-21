@@ -80,20 +80,39 @@ RouteLayout route_layout(int64_t M, int64_t A, int64_t E) {
     return {S, E, S / R + E + 2, S / RW + E + 2};
 }
 
-// Exclusive scan of v over the block's kRouteThreads threads (Hillis-Steele in LDS); returns the prefix, *total
-// the sum.
+// Exclusive scan of v over the block's kRouteThreads threads using a 2-stage hierarchical Wave32 scan;
+// returns the prefix, *total the sum. Reduces barriers from 22 to 3.
 __device__ int block_exclusive_scan(int v, int *buf, int *total) {
+    static_assert(kRouteThreads == 1024, "hierarchical scan assumes 1024 threads (32 waves of 32)");
     const int t = threadIdx.x;
-    buf[t] = v;
-    __syncthreads();
-    for (int off = 1; off < kRouteThreads; off <<= 1) {
-        const int add = t >= off ? buf[t - off] : 0;
-        __syncthreads();
-        buf[t] += add;
-        __syncthreads();
+    const int lane = t & 31;
+    const int wid = t >> 5;
+
+    // Stage 1: Intra-wave inclusive scan
+    int x = v;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int y = __shfl_up(x, o, 32);
+        if (lane >= o) x += y;
     }
-    const int incl = buf[t];
-    *total = buf[kRouteThreads - 1];
+    if (lane == 31) buf[wid] = x;
+    __syncthreads();
+
+    // Stage 2: Wave 0 scans the 32 wave totals
+    if (wid == 0) {
+        int ws = buf[lane];
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int y = __shfl_up(ws, o, 32);
+            if (lane >= o) ws += y;
+        }
+        buf[lane] = ws - buf[lane];
+        if (lane == 31) *total = ws;
+    }
+    __syncthreads();
+
+    // Stage 3: Add wave prefix to intra-wave sum
+    const int incl = x + buf[wid];
     __syncthreads();
     return incl - v;
 }
@@ -174,8 +193,8 @@ __global__ void __launch_bounds__(kThreads)
         ooff[threadIdx.x] = slot * N;
     }
     __syncthreads();
-    const int lane = threadIdx.x % warpSize, wave = threadIdx.x / warpSize, ks = wave % KS;
-    const int64_t n = (int64_t)blockIdx.x * (blockDim.x / warpSize / KS) + wave / KS;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, ks = wave % KS;
+    const int64_t n = (int64_t)blockIdx.x * (blockDim.x / 32 / KS) + wave / KS;
     if (bucket == E) {  // invalid ids: NaN outputs (err was set by moe_group_routes)
         if (lane == 0 && ks == 0 && n < N)
             for (int r = 0; r < rows; ++r) {
@@ -192,7 +211,7 @@ __global__ void __launch_bounds__(kThreads)
         const uint8_t *rowb = q + row * qsplit_row_bytes<HB>(K);  // HB: kernels/qsplit.hpp (0 Q4, 1 Q5)
         const uint4 *qrow = reinterpret_cast<const uint4 *>(rowb);
         const uint16_t *srow = scale + row * (K / G), *mrow = minv + row * (K / G);
-        for (int64_t k = ((int64_t)ks * warpSize + lane) * kChunk; k < K; k += (int64_t)KS * warpSize * kChunk) {
+        for (int64_t k = ((int64_t)ks * 32 + lane) * kChunk; k < K; k += (int64_t)KS * 32 * kChunk) {
             const uint4 packed = qrow[k / kChunk];
             const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
             const QHigh32<HB> hb = QHigh32<HB>::load(rowb, K, k);
@@ -204,9 +223,16 @@ __global__ void __launch_bounds__(kThreads)
                     load_x32(x, xoff[r] + k, xv);
                     float dot = 0.f, xsum = 0.f;
 #pragma unroll
-                    for (int i = 0; i < kChunk; ++i) {
-                        dot = fmaf(xv[i], (float)(((words[i / 8] >> (4 * (i % 8))) & 0xFu) | hb.at(i)), dot);
-                        xsum += xv[i];
+                    for (int w = 0; w < 4; ++w) {
+                        uint32_t word = words[w];
+#pragma unroll
+                        for (int b = 0; b < 8; ++b) {
+                            const int idx = 8 * w + b;
+                            const float qv = (float)(((word >> (4 * b)) & 0xFu) | hb.at(idx));
+                            const float xval = xv[idx];
+                            dot = fmaf(xval, qv, dot);
+                            xsum += xval;
+                        }
                     }
                     acc[r] = fmaf(s, dot, fmaf(mn, xsum, acc[r]));
                 }
@@ -214,8 +240,10 @@ __global__ void __launch_bounds__(kThreads)
         }
     }
 #pragma unroll
-    for (int r = 0; r < R; ++r)
-        for (int off = warpSize / 2; off > 0; off >>= 1) acc[r] += __shfl_xor(acc[r], off);
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc[r] += __shfl_xor(acc[r], off, 32);
+    }
     if (KS > 1) {
         if (lane == 0)
 #pragma unroll
@@ -497,17 +525,18 @@ template <typename T>
 __global__ void __launch_bounds__(kThreads)
     combine_reduce_kernel(const float *partial, const int32_t *ids, const float *coef, int64_t M, int64_t A,
                           int64_t E, int64_t N, T *y, bool pbf16) {
-    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= M * N) return;
-    const int64_t m = i / N, n = i % N;
+    const int64_t m = blockIdx.y;
+    const int64_t n = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= M || n >= N) return;
     bool ok = true;
     float v = 0.f;
+#pragma unroll 4
     for (int64_t a = 0; a < A; ++a) {
         const int32_t id = ids[m * A + a];
         ok = ok && id >= 0 && id < E;
         v = fmaf(coef[m * A + a], get_partial(partial, (m * A + a) * N + n, pbf16), v);
     }
-    store(y, i, ok ? v : __int_as_float(0x7fc00000));
+    store(y, m * N + n, ok ? v : __int_as_float(0x7fc00000));
 }
 
 // Split-K as linear_q4 (each wave ~2048 codes of a row): K = 2560 and 640 give 1.
@@ -667,16 +696,16 @@ void experts_combine_grouped(const char *fn, const void *h, const Q4DeviceView &
     check_no_overlap(fn, "y", y, M * N * es, "h", h, M * A * w.K * es);
     check_no_overlap(fn, "y", y, M * N * es, "partial", partial, M * A * N * 4);
     check_no_overlap(fn, "partial", partial, M * A * N * 4, "h", h, M * A * w.K * es);
-    const unsigned blocks = (unsigned)((M * N + kThreads - 1) / kThreads);
+    dim3 grid((unsigned)((N + kThreads - 1) / kThreads), (unsigned)M), block(kThreads);
     const bool pbf16 = math == MoeMath::WmmaF16;  // the F16 kernel writes BF16 partials (put_partial), the others FP32
     if (act == Act::F32) {
         launch_grouped<float, true, HB>(static_cast<const float *>(h), w, E, ws, M, A, nullptr, partial, math, stream);
-        combine_reduce_kernel<float><<<blocks, kThreads, 0, stream>>>(partial, ids, coef, M, A, E, N,
-                                                                      static_cast<float *>(y), pbf16);
+        combine_reduce_kernel<float><<<grid, block, 0, stream>>>(partial, ids, coef, M, A, E, N,
+                                                                 static_cast<float *>(y), pbf16);
     } else {
         launch_grouped<uint16_t, true, HB>(static_cast<const uint16_t *>(h), w, E, ws, M, A, nullptr, partial, math, stream);
-        combine_reduce_kernel<uint16_t><<<blocks, kThreads, 0, stream>>>(partial, ids, coef, M, A, E, N,
-                                                                         static_cast<uint16_t *>(y), pbf16);
+        combine_reduce_kernel<uint16_t><<<grid, block, 0, stream>>>(partial, ids, coef, M, A, E, N,
+                                                                    static_cast<uint16_t *>(y), pbf16);
     }
     STRIX_HIP_CHECK_LAUNCH(fn, " ", act_name(act), math == MoeMath::WmmaBf16 ? " wmma" : math == MoeMath::WmmaF16 ? " wmma-f16" : "", " M=", M, " A=", A, " E=",
                            E, " N=", N, " K=", w.K, " G=", w.G);

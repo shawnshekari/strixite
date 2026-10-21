@@ -49,12 +49,12 @@ __device__ inline void norm_rope_head(const T *x, T *o, int64_t D, const float *
         ss = fmaf(v, v, ss);
     }
     #pragma unroll
-    for (int off = warpSize / 2; off > 0; off >>= 1) {
-        ss += __shfl_down(ss, off, warpSize);
+    for (int off = 16; off > 0; off >>= 1) {
+        ss += __shfl_down(ss, off, 32);
     }
-    const int lane = threadIdx.x % warpSize;
-    const int wave = threadIdx.x / warpSize;
-    const int num_waves = blockDim.x / warpSize;
+    const int lane = threadIdx.x & 31;
+    const int wave = threadIdx.x >> 5;
+    const int num_waves = blockDim.x >> 5;
     if (lane == 0) {
         red[wave] = ss;
     }
@@ -62,8 +62,8 @@ __device__ inline void norm_rope_head(const T *x, T *o, int64_t D, const float *
     if (wave == 0) {
         float v = (lane < num_waves) ? red[lane] : 0.f;
         #pragma unroll
-        for (int off = warpSize / 2; off > 0; off >>= 1) {
-            v += __shfl_down(v, off, warpSize);
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down(v, off, 32);
         }
         if (lane == 0) {
             red[0] = v;
@@ -229,15 +229,18 @@ __global__ void attention_partial_kernel(const T *q, int64_t q_ts, int64_t q_hs,
 #pragma unroll
             for (int e = 0; e < kVec; ++e) dot = fmaf(qr[e], kf[e], dot);
         }
-        for (int off = kTile; off < warpSize; off <<= 1) dot += __shfl_xor(dot, off);
+#pragma unroll
+        for (int off = kTile; off < 32; off <<= 1) dot += __shfl_xor(dot, off, 32);
         const float s = key_lane < nk ? dot * scale : -INFINITY;
         float tile_max = s;
-        for (int off = warpSize / 2; off > 0; off >>= 1) tile_max = fmaxf(tile_max, __shfl_xor(tile_max, off));
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) tile_max = fmaxf(tile_max, __shfl_xor(tile_max, off, 32));
         const float m_new = fmaxf(m, tile_max);
         const float alpha = expf(m - m_new);  // m = -inf on the first tile: alpha = 0
         const float p = key_lane < nk ? expf(s - m_new) : 0.f;
         float psum = lane < kTile ? p : 0.f;
-        for (int off = warpSize / 2; off > 0; off >>= 1) psum += __shfl_xor(psum, off);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) psum += __shfl_xor(psum, off, 32);
         l = l * alpha + psum;
 #pragma unroll
         for (int e = 0; e < kPerLane; ++e) acc[e] *= alpha;
@@ -273,15 +276,15 @@ __global__ void __launch_bounds__(kD) attention_combine_kernel(const float *ws, 
     float mx = -INFINITY;
     for (int64_t i = d; i < splits; i += kD) mx = fmaxf(mx, p[i * (kD + 2)]);
     #pragma unroll
-    for (int off = warpSize / 2; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_down(mx, off, warpSize));
-    const int lane = d % warpSize;
-    const int wave = d / warpSize;
+    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_down(mx, off, 32));
+    const int lane = d & 31;
+    const int wave = d >> 5;
     if (lane == 0) red[wave] = mx;
     __syncthreads();
     if (wave == 0) {
         float v = (lane < kD / 32) ? red[lane] : -INFINITY;
         #pragma unroll
-        for (int off = warpSize / 2; off > 0; off >>= 1) v = fmaxf(v, __shfl_down(v, off, warpSize));
+        for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_down(v, off, 32));
         if (lane == 0) red[0] = v;
     }
     __syncthreads();
@@ -295,13 +298,13 @@ __global__ void __launch_bounds__(kD) attention_combine_kernel(const float *ws, 
         lsum = fmaf(p[i * (kD + 2) + 1], f, lsum);
     }
     #pragma unroll
-    for (int off = warpSize / 2; off > 0; off >>= 1) lsum += __shfl_down(lsum, off, warpSize);
+    for (int off = 16; off > 0; off >>= 1) lsum += __shfl_down(lsum, off, 32);
     if (lane == 0) red[wave] = lsum;
     __syncthreads();
     if (wave == 0) {
         float v = (lane < kD / 32) ? red[lane] : 0.f;
         #pragma unroll
-        for (int off = warpSize / 2; off > 0; off >>= 1) v += __shfl_down(v, off, warpSize);
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_down(v, off, 32);
         if (lane == 0) red[0] = v;
     }
     __syncthreads();

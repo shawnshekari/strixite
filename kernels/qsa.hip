@@ -414,13 +414,14 @@ constexpr int kRowWaves = kRowThreads / 32;  // warpSize >= 32
 // Exclusive sum of v over the threads before this one (thread order) and the workgroup's total; wave shuffles, then
 // the wave totals. Every thread calls. Sums must not overflow 32 bits (the caller packs two 16-bit counts).
 __device__ inline uint32_t row_scan_u32(uint32_t v, int *s_wave, uint32_t &total) {
-    const int lane = (int)threadIdx.x % warpSize, wave = (int)threadIdx.x / warpSize, nw = kRowThreads / warpSize;
+    const int lane = (int)threadIdx.x & 31, wave = (int)threadIdx.x >> 5, nw = kRowThreads >> 5;
     uint32_t inc = v;
-    for (int off = 1; off < warpSize; off <<= 1) {
-        const uint32_t o = (uint32_t)__shfl_up((int)inc, off);
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        const uint32_t o = (uint32_t)__shfl_up((int)inc, off, 32);
         if (lane >= off) inc += o;
     }
-    if (lane == warpSize - 1) s_wave[wave] = (int)inc;
+    if (lane == 31) s_wave[wave] = (int)inc;
     __syncthreads();
     uint32_t wbefore = 0, tot = 0;
     for (int w = 0; w < nw; ++w) {
