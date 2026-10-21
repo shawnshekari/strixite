@@ -40,7 +40,7 @@ template <> __device__ inline float round_act<uint16_t>(float v) { return rope_m
 template <typename T>
 __device__ inline void norm_rope_head(const T *x, T *o, int64_t D, const float *w, float eps, int64_t half, int64_t pos,
                                       const int64_t *triple, const float *inv_freq, float cos_sin_scale, float *row,
-                                      float *red, bool hadamard = false) {
+                                      float *red, bool hadamard = false, float hadamard_scale = 0.0f) {
     constexpr bool kBF16 = sizeof(T) == 2;
     // Same reduction shape as rmsnorm_zc (strided partials, tree), same per-element formula.
     float ss = 0.f;
@@ -86,9 +86,9 @@ __device__ inline void norm_rope_head(const T *x, T *o, int64_t D, const float *
             }
             __syncthreads();
         }
-        const float rs = rsqrtf((float)D);
+        const float scale = hadamard_scale > 0.0f ? hadamard_scale : rsqrtf((float)D);
         for (int64_t j = threadIdx.x; j < D; j += blockDim.x) {
-            store(o, j, round_act<T>(row[j] * rs));
+            store(o, j, round_act<T>(row[j] * scale));
         }
     }
 }
@@ -125,11 +125,31 @@ __global__ void __launch_bounds__(kNormThreads)
     const T *x = static_cast<const T *>(jb.in) + t * jb.in_ts + h * jb.in_hs;
     T *o = static_cast<T *>(jb.out) + t * jb.out_ts + h * jb.out_hs;
     if (jb.w == nullptr) {
-        for (int64_t j = threadIdx.x; j < jb.D; j += blockDim.x) o[j] = x[j];
+        if (!jb.hadamard) {
+            for (int64_t j = threadIdx.x; j < jb.D; j += blockDim.x) o[j] = x[j];
+            return;
+        }
+        for (int64_t j = threadIdx.x; j < jb.D; j += blockDim.x) row[j] = load(x, j);
+        __syncthreads();
+        // Wide FWHT across all jb.D channels for V (diffuses block outliers)
+        for (int64_t len = 1; len < jb.D; len <<= 1) {
+            for (int64_t i = threadIdx.x; i < jb.D / 2; i += blockDim.x) {
+                const int64_t a = (i / len) * (2 * len) + (i % len);
+                const int64_t b = a + len;
+                const float u = row[a], v = row[b];
+                row[a] = u + v;
+                row[b] = u - v;
+            }
+            __syncthreads();
+        }
+        const float scale = jb.hadamard_scale > 0.0f ? jb.hadamard_scale : rsqrtf((float)jb.D);
+        for (int64_t j = threadIdx.x; j < jb.D; j += blockDim.x) {
+            store(o, j, round_act<T>(row[j] * scale));
+        }
         return;
     }
     norm_rope_head(x, o, jb.D, jb.w, eps, half, pos0 + t, a.pos3 ? a.pos3 + 3 * t : nullptr, inv_freq, cos_sin_scale,
-                   row, row + a.max_d, jb.hadamard);
+                   row, row + a.max_d, jb.hadamard, jb.hadamard_scale);
 }
 
 // ---- attention: partial softmax per (key split, KV head, token), one wave per query head --------
@@ -272,7 +292,8 @@ __global__ void attention_partial_kernel(const T *q, int64_t q_ts, int64_t q_hs,
 constexpr int kMaxSplits = 1024;
 template <typename T>
 __global__ void __launch_bounds__(kD) attention_combine_kernel(const float *ws, int64_t splits, const T *gate,
-                                                               int64_t q_ts, int64_t q_hs, int64_t Hq, T *out) {
+                                                               int64_t q_ts, int64_t q_hs, int64_t Hq, T *out,
+                                                               bool hadamard = false) {
     __shared__ float wgt[kMaxSplits], red[kD];
     const int64_t h = blockIdx.x, t = blockIdx.y;
     const float *p = ws + (t * Hq + h) * splits * (kD + 2);
@@ -301,11 +322,28 @@ __global__ void __launch_bounds__(kD) attention_combine_kernel(const float *ws, 
         __syncthreads();
     }
     const float L = red[0];
+    __syncthreads();
     float a = 0.f;
 #pragma unroll 8
     for (int64_t i = 0; i < splits; ++i) a = fmaf(p[i * (kD + 2) + 2 + d], wgt[i], a);
+    float val = a / L;
+    if (hadamard) {
+        red[d] = val;
+        __syncthreads();
+        for (int64_t len = 1; len < kD; len <<= 1) {
+            if (d < kD / 2) {
+                const int64_t a_idx = (d / len) * (2 * len) + (d % len);
+                const int64_t b_idx = a_idx + len;
+                const float u = red[a_idx], v = red[b_idx];
+                red[a_idx] = u + v;
+                red[b_idx] = u - v;
+            }
+            __syncthreads();
+        }
+        val = red[d] * 0.0625f;
+    }
     const float g = load(gate, t * q_ts + h * q_hs + d);
-    store(out, t * Hq * kD + h * kD + d, (a / L) * (1.0f / (1.0f + expf(-g))));
+    store(out, t * Hq * kD + h * kD + d, val * (1.0f / (1.0f + expf(-g))));
 }
 
 // ---- attention on the matrix units (BF16, multi-token forwards) ----------------------------------
@@ -770,6 +808,7 @@ void attention_impl(const void *q, const void *gate, const KvArg &kv, int64_t ca
     dim3 grid((unsigned)splits, (unsigned)s.Hk, (unsigned)s.T), block((unsigned)(warp * (s.Hq / s.Hk)));
     dim3 cgrid((unsigned)s.Hq, (unsigned)s.T), cblock(kD);
     const size_t q_lds = (size_t)(s.Hq / s.Hk) * kD * 4;
+    const bool hadamard = kv.q8 != nullptr && kv.q8->hadamard;
     if (act == Act::F32) {
         with_reader<float>(kv, s.Hk * kD, [&](auto rd) {
             attention_partial_kernel<float, false><<<grid, block, q_lds, stream>>>(
@@ -777,7 +816,8 @@ void attention_impl(const void *q, const void *gate, const KvArg &kv, int64_t ca
                 nullptr, nullptr, 0, nullptr);
         });
         attention_combine_kernel<float><<<cgrid, cblock, 0, stream>>>(workspace, splits, static_cast<const float *>(gate),
-                                                                      s.q_ts, s.q_hs, s.Hq, static_cast<float *>(out));
+                                                                      s.q_ts, s.q_hs, s.Hq, static_cast<float *>(out),
+                                                                      hadamard);
     } else {
         with_reader<uint16_t>(kv, s.Hk * kD, [&](auto rd) {
             attention_partial_kernel<uint16_t, false><<<grid, block, q_lds, stream>>>(
@@ -786,7 +826,8 @@ void attention_impl(const void *q, const void *gate, const KvArg &kv, int64_t ca
         });
         attention_combine_kernel<uint16_t><<<cgrid, cblock, 0, stream>>>(workspace, splits,
                                                                          static_cast<const uint16_t *>(gate), s.q_ts,
-                                                                         s.q_hs, s.Hq, static_cast<uint16_t *>(out));
+                                                                         s.q_hs, s.Hq, static_cast<uint16_t *>(out),
+                                                                         hadamard);
     }
     STRIX_HIP_CHECK_LAUNCH(fn, " ", act_name(act), kv.q8 ? " kv8" : "", " T=", s.T, " pos0=", s.pos0, " Hq=", s.Hq,
                            " Hk=", s.Hk, " splits=", splits);
@@ -843,6 +884,7 @@ void attention_gathered_impl(const void *q, const void *gate, const KvArg &kv, i
     dim3 grid((unsigned)splits, (unsigned)s.Hk, (unsigned)s.T), block((unsigned)(warp * (s.Hq / s.Hk)));
     dim3 cgrid((unsigned)s.Hq, (unsigned)s.T), cblock(kD);
     const size_t q_lds = (size_t)(s.Hq / s.Hk) * kD * 4;
+    const bool hadamard = kv.q8 != nullptr && kv.q8->hadamard;
     if (act == Act::F32) {
         with_reader<float>(kv, s.Hk * kD, [&](auto rd) {
             attention_partial_kernel<float, true><<<grid, block, q_lds, stream>>>(
@@ -850,7 +892,8 @@ void attention_gathered_impl(const void *q, const void *gate, const KvArg &kv, i
                 sel, nsel, sel_ld, err);
         });
         attention_combine_kernel<float><<<cgrid, cblock, 0, stream>>>(workspace, splits, static_cast<const float *>(gate),
-                                                                      s.q_ts, s.q_hs, s.Hq, static_cast<float *>(out));
+                                                                      s.q_ts, s.q_hs, s.Hq, static_cast<float *>(out),
+                                                                      hadamard);
     } else {
         with_reader<uint16_t>(kv, s.Hk * kD, [&](auto rd) {
             attention_partial_kernel<uint16_t, true><<<grid, block, q_lds, stream>>>(
@@ -859,7 +902,8 @@ void attention_gathered_impl(const void *q, const void *gate, const KvArg &kv, i
         });
         attention_combine_kernel<uint16_t><<<cgrid, cblock, 0, stream>>>(workspace, splits,
                                                                          static_cast<const uint16_t *>(gate), s.q_ts,
-                                                                         s.q_hs, s.Hq, static_cast<uint16_t *>(out));
+                                                                         s.q_hs, s.Hq, static_cast<uint16_t *>(out),
+                                                                         hadamard);
     }
     STRIX_HIP_CHECK_LAUNCH(fn, " ", act_name(act), kv.q8 ? " kv8" : "", " T=", s.T, " pos0=", s.pos0, " Hq=", s.Hq,
                            " Hk=", s.Hk, " splits=", splits);
@@ -919,9 +963,11 @@ void wmma_attention_launch(bool gather, const void *q, const void *gate, const K
         if (precision == AttnPrecision::Fast) partial(std::true_type{});
         else partial(std::false_type{});
     });
+    const bool hadamard = kv.q8 != nullptr && kv.q8->hadamard;
     attention_combine_kernel<uint16_t><<<cgrid, cblock, 0, stream>>>(workspace, splits,
                                                                      static_cast<const uint16_t *>(gate), s.q_ts,
-                                                                     s.q_hs, s.Hq, static_cast<uint16_t *>(out));
+                                                                     s.q_hs, s.Hq, static_cast<uint16_t *>(out),
+                                                                     hadamard);
 }
 void wmma_attention_checks(const char *fn, const void *q, const void *gate, const KvArg &kv, const void *out,
                            const float *workspace, int64_t capacity, const AttentionShape &s, float scale, Act act) {

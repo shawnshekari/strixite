@@ -64,6 +64,7 @@ struct Kv8View {
     int64_t new_ts = 0, pos0 = 0;
     const void *staged_k = nullptr, *staged_v = nullptr;
     int64_t staged_rows = 0;
+    bool hadamard = false;
 };
 
 // Append T rows at positions pos0 .. pos0 + T - 1: row t's K at k_new[t * new_ts ..] and V at v_new[t * new_ts ..]

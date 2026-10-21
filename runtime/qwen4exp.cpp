@@ -1725,11 +1725,11 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             // With q8h, q and k heads are rotated by the orthonormal 256-point Fast Walsh-Hadamard Transform.
             const bool qsa_layer = pos_ + T > D.dense_key_limit();
             kernels::NormRopeJob nr[5] = {
-                {proj_.get(), D.astride, 2 * hd, proj_.get(), D.astride, 2 * hd, D.hq, hd, l.q_norm, hadamard},
-                {at(proj_, D.hq * 2 * hd), D.astride, hd, k_out, kv_ts, hd, D.hkv, hd, l.k_norm, hadamard},
-                {at(proj_, D.hq * 2 * hd + D.hkv * hd), D.astride, hd, v_out, kv_ts, hd, D.hkv, hd, nullptr, false},
+                {proj_.get(), D.astride, 2 * hd, proj_.get(), D.astride, 2 * hd, D.hq, hd, l.q_norm, hadamard, 0.0625f},
+                {at(proj_, D.hq * 2 * hd), D.astride, hd, k_out, kv_ts, hd, D.hkv, hd, l.k_norm, hadamard, 0.0625f},
+                {at(proj_, D.hq * 2 * hd + D.hkv * hd), D.astride, hd, v_out, kv_ts, hd, D.hkv, hd, nullptr, hadamard, 0.0625f},
                 {at(proj_, D.idx_col), D.astride, D.idx_d, at(proj_, D.idx_col), D.astride, D.idx_d, D.idx_h, D.idx_d,
-                 l.idx_q_norm, false}};
+                 l.idx_q_norm, false, 0.0f}};
             int njobs = 3;
             if (qsa_layer) ++njobs;
             else nr[3] = {};
@@ -1758,6 +1758,7 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                                     kv8_err_.get(), stream_);
                 kv8 = {kv8_store_[li].get(), kv8_cap_, W,
                        pos_ % kernels::kKv8Group ? kv8_tail_[tail_cur_][li].get() : nullptr, k_out, v_out, kv_ts, pos_};
+                kv8.hadamard = hadamard;
             }
             // Prefill-sized forwards with BF16 activations: the attention on the matrix units (kernels/attention.hpp).
             const bool wmma_attn = wmma && act == Act::BF16 && T >= kWmmaMinTokens;

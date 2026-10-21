@@ -58,6 +58,7 @@ struct NormRopeJob {
     int64_t out_ts = 0, out_hs = 0, heads = 0, D = 0;
     const float *w = nullptr;
     bool hadamard = false;
+    float hadamard_scale = 0.0f;
 };
 constexpr int kMaxNormRopeJobs = 5;
 void qk_norm_rope_jobs(const NormRopeJob *jobs, int n, int64_t T, float eps, int64_t rot_dim, int64_t pos0,
