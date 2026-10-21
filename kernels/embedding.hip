@@ -34,6 +34,17 @@ __global__ void __launch_bounds__(kThreads)
         return;
     }
     const uint16_t *row = table + (int64_t)id * d;
+    if constexpr (sizeof(T) == 2) {
+        if ((d & 7) == 0 && ((uintptr_t)row & 15) == 0 && ((uintptr_t)orow & 15) == 0 && copies == 1) {
+            const int64_t d8 = d / 8;
+            const uint4 *row4 = reinterpret_cast<const uint4 *>(row);
+            uint4 *orow4 = reinterpret_cast<uint4 *>(orow);
+            for (int64_t j = threadIdx.x; j < d8; j += blockDim.x) {
+                orow4[j] = row4[j];
+            }
+            return;
+        }
+    }
     for (int64_t j = threadIdx.x; j < d; j += blockDim.x) {
         T v;
         if constexpr (sizeof(T) == 2) v = row[j];  // BF16 -> BF16: copy bits
