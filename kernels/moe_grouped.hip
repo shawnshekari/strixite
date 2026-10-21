@@ -526,18 +526,20 @@ template <typename T>
 __global__ void __launch_bounds__(kThreads)
     combine_reduce_kernel(const float *partial, const int32_t *ids, const float *coef, int64_t M, int64_t A,
                           int64_t E, int64_t N, T *y, bool pbf16) {
-    const int64_t m = blockIdx.y;
-    const int64_t n = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (m >= M || n >= N) return;
-    bool ok = true;
-    float v = 0.f;
+    for (int64_t m = blockIdx.y; m < M; m += gridDim.y) {
+        for (int64_t n = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; n < N;
+             n += (int64_t)gridDim.x * blockDim.x) {
+            bool ok = true;
+            float v = 0.f;
 #pragma unroll 4
-    for (int64_t a = 0; a < A; ++a) {
-        const int32_t id = ids[m * A + a];
-        ok = ok && id >= 0 && id < E;
-        v = fmaf(coef[m * A + a], get_partial(partial, (m * A + a) * N + n, pbf16), v);
+            for (int64_t a = 0; a < A; ++a) {
+                const int32_t id = ids[m * A + a];
+                ok = ok && id >= 0 && id < E;
+                v = fmaf(coef[m * A + a], get_partial(partial, (m * A + a) * N + n, pbf16), v);
+            }
+            store(y, m * N + n, ok ? v : __int_as_float(0x7fc00000));
+        }
     }
-    store(y, m * N + n, ok ? v : __int_as_float(0x7fc00000));
 }
 
 // Split-K as linear_q4 (each wave ~2048 codes of a row): K = 2560 and 640 give 1.
@@ -697,7 +699,8 @@ void experts_combine_grouped(const char *fn, const void *h, const Q4DeviceView &
     check_no_overlap(fn, "y", y, M * N * es, "h", h, M * A * w.K * es);
     check_no_overlap(fn, "y", y, M * N * es, "partial", partial, M * A * N * 4);
     check_no_overlap(fn, "partial", partial, M * A * N * 4, "h", h, M * A * w.K * es);
-    dim3 grid((unsigned)((N + kThreads - 1) / kThreads), (unsigned)M), block(kThreads);
+    const int64_t blocks_x = (N + kThreads - 1) / kThreads;
+    dim3 grid((unsigned)(blocks_x < 65535 ? blocks_x : 65535), (unsigned)(M < 65535 ? M : 65535)), block(kThreads);
     const bool pbf16 = math == MoeMath::WmmaF16;  // the F16 kernel writes BF16 partials (put_partial), the others FP32
     if (act == Act::F32) {
         launch_grouped<float, true, HB>(static_cast<const float *>(h), w, E, ws, M, A, nullptr, partial, math, stream);

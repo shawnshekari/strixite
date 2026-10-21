@@ -69,7 +69,7 @@ __global__ void __launch_bounds__(kThreads)
         float rkx = lane < (kThreads / 32) ? red[2][lane] : 0.f;
         float rv = lane < (kThreads / 32) ? red[3][lane] : 0.f;
 #pragma unroll
-        for (int off = 4; off > 0; off >>= 1) {
+        for (int off = 16; off > 0; off >>= 1) {
             rk += __shfl_down(rk, off, 32);
             rx += __shfl_down(rx, off, 32);
             rkx += __shfl_down(rkx, off, 32);

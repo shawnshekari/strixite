@@ -69,6 +69,9 @@ def query_chat_stream(host, port, prompt, max_tokens=1024, temperature=0.0):
     ttft = None
     chunks = []
     tokens = 0
+    usage = {}
+    timings = {}
+    strix_info = {}
     
     with urllib.request.urlopen(req) as resp:
         for line in resp:
@@ -80,13 +83,21 @@ def query_chat_stream(host, port, prompt, max_tokens=1024, temperature=0.0):
                 break
             try:
                 chunk = json.loads(data_str)
-                delta = chunk["choices"][0].get("delta", {})
-                content = delta.get("content", "") or delta.get("reasoning_content", "") or delta.get("reasoning", "")
-                if content:
-                    if ttft is None:
-                        ttft = time.perf_counter() - t0
-                    tokens += 1
-                    chunks.append(content)
+                if "usage" in chunk:
+                    usage = chunk["usage"]
+                if "timings" in chunk:
+                    timings = chunk["timings"]
+                if "strix" in chunk:
+                    strix_info = chunk["strix"]
+                choices = chunk.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content", "") or delta.get("reasoning_content", "") or delta.get("reasoning", "")
+                    if content:
+                        if ttft is None:
+                            ttft = time.perf_counter() - t0
+                        tokens += 1
+                        chunks.append(content)
             except Exception:
                 pass
                 
@@ -105,32 +116,45 @@ def query_chat_stream(host, port, prompt, max_tokens=1024, temperature=0.0):
         "overall_tps": overall_tps,
         "ms_per_tok": (1000.0 / decode_tps) if decode_tps > 0 else 0.0,
         "content_length": sum(len(c) for c in chunks),
+        "prompt_tokens": usage.get("prompt_tokens", 0),
+        "cached_tokens": usage.get("prompt_tokens_details", {}).get("cached_tokens", 0),
+        "raw_prompt_tps": timings.get("prompt_per_second", 0.0),
+        "raw_predicted_tps": timings.get("predicted_per_second", 0.0),
     }
 
 def run_prefill_bench(host, port, context_sizes):
     print("\n--- Running Context Prefill Scaling Benchmark ---")
-    print(f"{'Target Ctx':<12} | {'Actual Prompt':<14} | {'Total Time':<12} | {'Prefill Rate':<14}")
-    print("-" * 62)
+    print(f"{'Target Ctx':<12} | {'Actual Prompt':<14} | {'TTFT (s)':<10} | {'Client Prefill':<16} | {'Engine Prefill':<16} | {'Cached':<8}")
+    print("-" * 88)
     results = []
-    filler = (
+    filler_base = (
         "AMD Strix Halo features a unified system memory architecture with high-bandwidth 256-bit LPDDR5X channels. "
         "The RDNA 3.5 graphics compute units and Zen 5 CPU cores share a single coherent physical memory space. "
     )
     for ctx in context_sizes:
-        repeat = max(10, ctx // 32)
-        haystack = filler * repeat
+        repeat = max(10, int(ctx / 43.5))
+        # Unique run salt per ctx ensures zero prefix hits against prompt cache
+        salt = f"TestTag-{time.time_ns() % 1000000}-{ctx} "
+        haystack = (filler_base + salt) * repeat
         prompt = f"Background Document:\n{haystack}\n\nQuestion: Summarize the document in one word."
         res = query_chat_stream(host, port, prompt, max_tokens=16, temperature=0.0)
-        # In short output, ttft reflects prefill time
-        prefill_tps = (ctx / res["ttft_s"]) if res["ttft_s"] > 0 else 0.0
-        print(f"~{ctx:<11} | {ctx:<14} | {res['ttft_s']:6.2f}s       | {prefill_tps:6.1f} t/s")
+        actual_prompt = res.get("prompt_tokens") or ctx
+        ttft = res["ttft_s"]
+        client_prefill_tps = (actual_prompt / ttft) if ttft > 0 else 0.0
+        engine_prefill_tps = res.get("raw_prompt_tps", 0.0)
+        cached = res.get("cached_tokens", 0)
+        
+        print(f"~{ctx:<11} | {actual_prompt:<14} | {ttft:6.2f}s    | {client_prefill_tps:6.1f} t/s        | {engine_prefill_tps:6.1f} t/s        | {cached:<8}")
         results.append({
             "context_size": ctx,
-            "ttft_s": res["ttft_s"],
-            "prefill_tps": prefill_tps,
+            "actual_prompt_tokens": actual_prompt,
+            "cached_tokens": cached,
+            "ttft_s": ttft,
+            "prefill_tps": client_prefill_tps,
+            "engine_prefill_tps": engine_prefill_tps,
             "total_time_s": res["total_time_s"]
         })
-    print("-" * 62)
+    print("-" * 88)
     return results
 
 def run_full_suite(host, port, tag, prefill_sizes=[4000, 16000, 32000]):
@@ -189,8 +213,21 @@ def compare_runs(baseline_file, opt_file):
             bp = b_pref[ctx]
             op = o_pref[ctx]
             diff = ((op - bp) / bp) * 100.0 if bp > 0 else 0.0
-            name = f"Prefill ~{ctx//1000}k tokens"
+            name = f"Client Prefill ~{ctx//1000}k tokens"
             print(f"{name:<28} | {bp:5.0f} t/s    | {op:5.0f} t/s    | {diff:+5.2f}% ({op - bp:+4.0f} t/s)")
+
+    b_pref_eng = {p["context_size"]: p.get("engine_prefill_tps", 0) for p in b.get("prefill_benchmarks", [])}
+    o_pref_eng = {p["context_size"]: p.get("engine_prefill_tps", 0) for p in o.get("prefill_benchmarks", [])}
+    if any(b_pref_eng.values()) or any(o_pref_eng.values()):
+        print("-" * 78)
+        print("Raw GPU Engine Prefill (Internal Server Timings):")
+        for ctx in b_pref_eng:
+            if ctx in o_pref_eng:
+                bp = b_pref_eng[ctx]
+                op = o_pref_eng[ctx]
+                diff = ((op - bp) / bp) * 100.0 if bp > 0 else 0.0
+                name = f"Engine Prefill ~{ctx//1000}k"
+                print(f"{name:<28} | {bp:5.0f} t/s    | {op:5.0f} t/s    | {diff:+5.2f}% ({op - bp:+4.0f} t/s)")
     print("=" * 78)
 
 def main():

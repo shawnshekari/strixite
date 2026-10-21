@@ -132,6 +132,7 @@ __global__ void __launch_bounds__(kThreads)
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) v[i] += __shfl_down(v[i], off, 32);
     }
+    // Reduction across wave; lane 0 accumulates full sum. Lane 0 is the sole reader/writer below.
     if (KS > 1) {
         if (lane == 0)
 #pragma unroll
