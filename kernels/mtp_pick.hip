@@ -29,9 +29,9 @@ __device__ inline Part merge(const Part &a, const Part &b) {
     return {w.b1, fmaxf(w.b2, l.b1), w.i1, a.nan | b.nan};
 }
 
-__device__ inline Part shfl_down(const Part &p, int off) {
-    return {__shfl_down(p.b1, off, kLanes), __shfl_down(p.b2, off, kLanes), __shfl_down(p.i1, off, kLanes),
-            (uint32_t)__shfl_down((int)p.nan, off, kLanes)};
+__device__ inline Part shfl_xor(const Part &p, int off) {
+    return {__shfl_xor(p.b1, off, kLanes), __shfl_xor(p.b2, off, kLanes), __shfl_xor(p.i1, off, kLanes),
+            (uint32_t)__shfl_xor((int)p.nan, off, kLanes)};
 }
 
 __global__ void __launch_bounds__(kThreads)
@@ -55,13 +55,13 @@ __global__ void __launch_bounds__(kThreads)
         }
     }
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) p = merge(p, shfl_down(p, off));
+    for (int off = 16; off > 0; off >>= 1) p = merge(p, shfl_xor(p, off));
     if (lane == 0) wave_part[wave] = p;
     __syncthreads();
     if (wave != 0) return;
     p = lane < kThreads / kLanes ? wave_part[lane] : Part{-INFINITY, -INFINITY, INT_MAX, 0u};
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) p = merge(p, shfl_down(p, off));
+    for (int off = 16; off > 0; off >>= 1) p = merge(p, shfl_xor(p, off));
     if (lane == 0) {
         out->best = p.i1 == INT_MAX ? 0 : p.i1;  // every logit NaN: top2 would answer 0 (and flag it)
         out->best_v = p.b1, out->second_v = p.b2, out->nan = p.nan;
