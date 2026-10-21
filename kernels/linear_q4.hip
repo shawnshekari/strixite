@@ -60,9 +60,9 @@ __global__ void __launch_bounds__(kThreads) linear_q4_kernel(const TX *x, const 
                                                              const uint16_t *minv, TY *y, int64_t M, int64_t N,
                                                              int64_t K, int KS) {
     __shared__ float part[kThreads / 32][MR];  // per wave (wave32 worst case)
-    const int lane = threadIdx.x % warpSize;
-    const int wave = threadIdx.x / warpSize;
-    const int64_t n = (int64_t)blockIdx.x * (blockDim.x / warpSize / KS) + wave / KS;
+    const int lane = threadIdx.x & 31;
+    const int wave = threadIdx.x >> 5;
+    const int64_t n = (int64_t)blockIdx.x * (blockDim.x / 32 / KS) + wave / KS;
     const int ks = wave % KS;
     const int64_t m0 = (int64_t)blockIdx.y * MR;
     const int rows = (int)((M - m0) < MR ? (M - m0) : MR);
@@ -75,7 +75,7 @@ __global__ void __launch_bounds__(kThreads) linear_q4_kernel(const TX *x, const 
         const uint4 *qrow = reinterpret_cast<const uint4 *>(q + n * (K / 2));
         const uint16_t *srow = scale + n * (K / G);
         const uint16_t *mrow = minv + n * (K / G);
-        for (int64_t k = ((int64_t)ks * warpSize + lane) * kChunk; k < K; k += (int64_t)KS * warpSize * kChunk) {
+        for (int64_t k = ((int64_t)ks * 32 + lane) * kChunk; k < K; k += (int64_t)KS * 32 * kChunk) {
             uint4 packed = qrow[k / kChunk];
             uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
             const float s = bf16_bits_to_f32(srow[k / G]);
@@ -144,7 +144,7 @@ template <typename T, int G, int HB = 0>
 __device__ inline float q4_row_partial(const uint8_t *qrow, const uint16_t *srow, const uint16_t *mrow, const T *xrow,
                                        int64_t chunks, int ks, int KS, int lane, int64_t K = 0) {
     float acc = 0.f;
-    for (int64_t c = (int64_t)ks * warpSize + lane; c < chunks; c += (int64_t)KS * warpSize) {
+    for (int64_t c = (int64_t)ks * 32 + lane; c < chunks; c += (int64_t)KS * 32) {
         uint4 packed = reinterpret_cast<const uint4 *>(qrow)[c];
         uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
         const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, c * kChunk);
@@ -191,8 +191,8 @@ __global__ void __launch_bounds__(kThreads)
                                     const int32_t *ids, int64_t E, int64_t A, T *y, int64_t N, int64_t K, int KS,
                                     uint32_t *err) {
     __shared__ float part[kThreads / 32];
-    const int lane = threadIdx.x % warpSize, wave = threadIdx.x / warpSize, ks = wave % KS;
-    const int64_t n = (int64_t)blockIdx.x * (blockDim.x / warpSize / KS) + wave / KS;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, ks = wave % KS;
+    const int64_t n = (int64_t)blockIdx.x * (blockDim.x / 32 / KS) + wave / KS;
     const int64_t slot = (int64_t)blockIdx.z * A + blockIdx.y;
     const int32_t id = ids[slot];
     const bool ok = id >= 0 && id < E;
@@ -224,8 +224,8 @@ __global__ void __launch_bounds__(kThreads)
                                            const int32_t *ids, int64_t E, int64_t A, T *y, int64_t N, int64_t K,
                                            int KS, uint32_t *err) {
     __shared__ float part_g[kThreads / 32], part_u[kThreads / 32];
-    const int lane = threadIdx.x % warpSize, wave = threadIdx.x / warpSize, ks = wave % KS;
-    const int64_t I = N / 2, j = (int64_t)blockIdx.x * (blockDim.x / warpSize / KS) + wave / KS;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, ks = wave % KS;
+    const int64_t I = N / 2, j = (int64_t)blockIdx.x * (blockDim.x / 32 / KS) + wave / KS;
     const int64_t slot = (int64_t)blockIdx.z * A + blockIdx.y;
     const int32_t id = ids[slot];
     const bool ok = id >= 0 && id < E;
@@ -257,15 +257,15 @@ __global__ void __launch_bounds__(kThreads)
                                      const int32_t *ids, const float *coef, int64_t E, int64_t A, T *y, int64_t N,
                                      int64_t K, int KS, uint32_t *err) {
     __shared__ float part[kThreads / 32];
-    const int lane = threadIdx.x % warpSize, wave = threadIdx.x / warpSize, ks = wave % KS;
-    const int64_t n = (int64_t)blockIdx.x * (blockDim.x / warpSize / KS) + wave / KS;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, ks = wave % KS;
+    const int64_t n = (int64_t)blockIdx.x * (blockDim.x / 32 / KS) + wave / KS;
     const int64_t m = blockIdx.y;
     const uint32_t kc = (uint32_t)(K / kChunk);  // chunks per expert row (32-bit: A*kc < 2^32, checked on launch)
     bool ok = true;
     for (int64_t a = 0; a < A; ++a) ok = ok && ids[m * A + a] >= 0 && ids[m * A + a] < E;
     float acc = 0.f;
     if (ok && n < N) {
-        for (uint32_t c = (uint32_t)(ks * warpSize + lane); c < (uint32_t)A * kc; c += (uint32_t)(KS * warpSize)) {
+        for (uint32_t c = (uint32_t)(ks * 32 + lane); c < (uint32_t)A * kc; c += (uint32_t)(KS * 32)) {
             const uint32_t a = c / kc, cc = c % kc;
             const int64_t row = (int64_t)ids[m * A + a] * N + n;
             const uint8_t *qrow = q + row * qsplit_row_bytes<HB>(K);

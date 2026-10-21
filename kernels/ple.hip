@@ -32,7 +32,7 @@ template <typename T>
 __global__ void __launch_bounds__(kThreads)
     ple_gate_kernel(const T *kv, int64_t ld, const T *x, const float *wk, const float *wq, const float *wc,
                     const T *state_in, int64_t d, int64_t H, int64_t S, float eps, T *hist, float *sigma) {
-    __shared__ float red[4][kThreads];
+    __shared__ float red[4][kThreads / 32];
     const int64_t s = blockIdx.x, t = blockIdx.y, n4 = H * d;
     if (t == 0)  // this stream's slice of the state rows, ahead of the new ones
         for (int64_t i = threadIdx.x; i < S * d; i += blockDim.x) {
@@ -48,14 +48,41 @@ __global__ void __launch_bounds__(kThreads)
         kx = fmaf(k * xv, (1.0f + wk[s * d + j]) * (1.0f + wq[s * d + j]), kx);
         vv = fmaf(v, v, vv);
     }
-    red[0][threadIdx.x] = kk, red[1][threadIdx.x] = xx, red[2][threadIdx.x] = kx, red[3][threadIdx.x] = vv;
-    __syncthreads();
-    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
-        if ((int)threadIdx.x < o)
 #pragma unroll
-            for (int q = 0; q < 4; ++q) red[q][threadIdx.x] += red[q][threadIdx.x + o];
-        __syncthreads();
+    for (int off = 16; off > 0; off >>= 1) {
+        kk += __shfl_down(kk, off, 32);
+        xx += __shfl_down(xx, off, 32);
+        kx += __shfl_down(kx, off, 32);
+        vv += __shfl_down(vv, off, 32);
     }
+    const int lane = (int)threadIdx.x & 31, wave = (int)threadIdx.x >> 5;
+    if (lane == 0) {
+        red[0][wave] = kk;
+        red[1][wave] = xx;
+        red[2][wave] = kx;
+        red[3][wave] = vv;
+    }
+    __syncthreads();
+    if (wave == 0) {
+        float rk = lane < (kThreads / 32) ? red[0][lane] : 0.f;
+        float rx = lane < (kThreads / 32) ? red[1][lane] : 0.f;
+        float rkx = lane < (kThreads / 32) ? red[2][lane] : 0.f;
+        float rv = lane < (kThreads / 32) ? red[3][lane] : 0.f;
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1) {
+            rk += __shfl_down(rk, off, 32);
+            rx += __shfl_down(rx, off, 32);
+            rkx += __shfl_down(rkx, off, 32);
+            rv += __shfl_down(rv, off, 32);
+        }
+        if (lane == 0) {
+            red[0][0] = rk;
+            red[1][0] = rx;
+            red[2][0] = rkx;
+            red[3][0] = rv;
+        }
+    }
+    __syncthreads();
     const float fd = (float)d;
     const float inv_k = 1.0f / sqrtf(red[0][0] / fd + eps), inv_q = 1.0f / sqrtf(red[1][0] / fd + eps);
     float g = inv_k * inv_q * red[2][0] / sqrtf(fd);

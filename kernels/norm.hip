@@ -63,12 +63,12 @@ __device__ inline float row_inv_rms(const T *xr, int64_t d, float eps, float *re
 do_reduce:
     // Fast wave-level shuffle down reduction (zero LDS, zero syncthreads for intra-wave)
     #pragma unroll
-    for (int off = warpSize / 2; off > 0; off >>= 1) {
-        ss += __shfl_down(ss, off, warpSize);
+    for (int off = 16; off > 0; off >>= 1) {
+        ss += __shfl_down(ss, off, 32);
     }
-    const int lane = threadIdx.x % warpSize;
-    const int wave = threadIdx.x / warpSize;
-    const int num_waves = blockDim.x / warpSize;
+    const int lane = threadIdx.x & 31;
+    const int wave = threadIdx.x >> 5;
+    const int num_waves = blockDim.x >> 5;
     if (lane == 0) {
         red[wave] = ss;
     }
@@ -76,8 +76,8 @@ do_reduce:
     if (wave == 0) {
         float v = (lane < num_waves) ? red[lane] : 0.f;
         #pragma unroll
-        for (int off = warpSize / 2; off > 0; off >>= 1) {
-            v += __shfl_down(v, off, warpSize);
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down(v, off, 32);
         }
         if (lane == 0) {
             red[0] = v;

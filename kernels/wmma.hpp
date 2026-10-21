@@ -34,7 +34,7 @@ __device__ inline wmma_f32x8 wmma_bf16(wmma_bf16x16 a, wmma_bf16x16 b, wmma_f32x
 // One 16-value K run of row (lane % 16) of a row-major BF16 tile (bits) with row stride ld (elements, even): an A
 // fragment, or a B fragment from W [N, K] rows. p must be 4-byte aligned at every row.
 __device__ inline wmma_bf16x16 wmma_load_rows(const uint16_t *p, int ld) {
-    const uint32_t *r = reinterpret_cast<const uint32_t *>(p + (threadIdx.x % 16) * ld);
+    const uint32_t *r = reinterpret_cast<const uint32_t *>(p + (threadIdx.x & 15) * ld);
     wmma_u32x8 v;
 #pragma unroll
     for (int i = 0; i < 8; ++i) v[i] = r[i];
@@ -44,7 +44,7 @@ __device__ inline wmma_bf16x16 wmma_load_rows(const uint16_t *p, int ld) {
 // wmma_load_rows for 16-byte aligned rows (p and ld * 2 bytes multiples of 16): two 128-bit LDS reads per lane
 // instead of eight 32-bit ones (the compiler can't prove the alignment itself).
 __device__ inline wmma_bf16x16 wmma_load_rows_a16(const uint16_t *p, int ld) {
-    const uint4 *r = reinterpret_cast<const uint4 *>(p + (threadIdx.x % 16) * ld);
+    const uint4 *r = reinterpret_cast<const uint4 *>(p + (threadIdx.x & 15) * ld);
     const uint4 lo = r[0], hi = r[1];
     const wmma_u32x8 v = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
     return __builtin_bit_cast(wmma_bf16x16, v);
@@ -60,14 +60,14 @@ __device__ inline wmma_f32x8 wmma_f16(wmma_f16x16 a, wmma_f16x16 b, wmma_f32x8 c
 
 // An F16 A fragment from 16-byte aligned LDS rows (as wmma_load_rows_a16, F16 bits).
 __device__ inline wmma_f16x16 wmma_load_rows_a16_f16(const uint16_t *p, int ld) {
-    const uint4 *r = reinterpret_cast<const uint4 *>(p + (threadIdx.x % 16) * ld);
+    const uint4 *r = reinterpret_cast<const uint4 *>(p + (threadIdx.x & 15) * ld);
     const uint4 lo = r[0], hi = r[1];
     const wmma_u32x8 v = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
     return __builtin_bit_cast(wmma_f16x16, v);
 }
 
 // Row of accumulator element v on this lane (its column is lane % 16).
-__device__ inline int wmma_c_row(int v) { return 2 * v + (int)(threadIdx.x % 32) / 16; }
+__device__ inline int wmma_c_row(int v) { return 2 * v + (((int)threadIdx.x & 31) >> 4); }
 #endif
 
 }  // namespace strix::kernels

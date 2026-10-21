@@ -50,11 +50,11 @@ __global__ void __launch_bounds__(kThreads)
 #pragma unroll
     for (int r = 0; r < kRowsPerBlock; ++r) {
 #pragma unroll
-        for (int off = warpSize / 2; off > 0; off >>= 1) acc[r] += __shfl_down(acc[r], off, warpSize);
+        for (int off = 16; off > 0; off >>= 1) acc[r] += __shfl_down(acc[r], off, 32);
     }
-    const int lane = threadIdx.x % warpSize;
-    const int wave = threadIdx.x / warpSize;
-    const int num_waves = blockDim.x / warpSize;
+    const int lane = threadIdx.x & 31;
+    const int wave = threadIdx.x >> 5;
+    const int num_waves = blockDim.x >> 5;
     if (lane == 0) {
 #pragma unroll
         for (int r = 0; r < kRowsPerBlock; ++r) red[r][wave] = acc[r];
@@ -65,7 +65,7 @@ __global__ void __launch_bounds__(kThreads)
         for (int r = 0; r < kRowsPerBlock; ++r) {
             float v = (lane < num_waves) ? red[r][lane] : 0.f;
 #pragma unroll
-            for (int off = warpSize / 2; off > 0; off >>= 1) v += __shfl_down(v, off, warpSize);
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_down(v, off, 32);
             if (lane == 0) red[r][0] = v;
         }
     }
@@ -96,8 +96,8 @@ template <typename TX, typename TY, int MR>
 __global__ void __launch_bounds__(kThreads)
     linear_bf16w_rows_kernel(const TX *x, const uint16_t *w, TY *y, int64_t M, int64_t N, int64_t K, int KS) {
     __shared__ float part[kThreads / 32][MR];  // per wave (wave32 worst case)
-    const int lane = threadIdx.x % warpSize, wave = threadIdx.x / warpSize;
-    const int64_t n = (int64_t)blockIdx.x * (blockDim.x / warpSize / KS) + wave / KS;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    const int64_t n = (int64_t)blockIdx.x * (blockDim.x / 32 / KS) + wave / KS;
     const int ks = wave % KS;
     const int64_t m0 = (int64_t)blockIdx.y * MR;
     const int rows = (int)((M - m0) < MR ? (M - m0) : MR);
@@ -106,7 +106,7 @@ __global__ void __launch_bounds__(kThreads)
     for (int r = 0; r < MR; ++r) acc[r] = 0.f;
     if (n < N) {  // no early return: every wave reaches the barrier below
         const uint4 *wr = reinterpret_cast<const uint4 *>(w + n * K);
-        for (int64_t k = ((int64_t)ks * warpSize + lane) * kW8; k < K; k += (int64_t)KS * warpSize * kW8) {
+        for (int64_t k = ((int64_t)ks * 32 + lane) * kW8; k < K; k += (int64_t)KS * 32 * kW8) {
             const uint4 u = wr[k / kW8];
             const uint32_t w4[4] = {u.x, u.y, u.z, u.w};
             float wv[kW8];
@@ -125,8 +125,10 @@ __global__ void __launch_bounds__(kThreads)
         }
     }
 #pragma unroll
-    for (int r = 0; r < MR; ++r)
-        for (int off = warpSize / 2; off > 0; off >>= 1) acc[r] += __shfl_xor(acc[r], off);
+    for (int r = 0; r < MR; ++r) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc[r] += __shfl_down(acc[r], off, 32);
+    }
     if (KS == 1) {
         if (lane == 0 && n < N)
             for (int r = 0; r < rows; ++r) store(y, (m0 + r) * N + n, acc[r]);
