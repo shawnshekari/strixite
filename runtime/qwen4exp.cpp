@@ -569,7 +569,7 @@ void Qwen4ExpSession::prefetch_ple(const std::vector<int32_t> &ids, int64_t firs
     ple_ngram_ids(m_.ngram_rows().hash_params(), tok.data(), T, h, rows.data());
     rows.erase(rows.begin(), rows.begin() + first * 16);
     // A prefetch that doesn't keep up is worth nothing: past a few queued, skip (the gather reads the rows itself).
-    constexpr size_t kMaxQueued = 8;
+    constexpr size_t kMaxQueued = 32;
     const bool queued = ple_prefetcher_.post(
         [this, rows = std::move(rows)] {
             const auto t0 = std::chrono::steady_clock::now();

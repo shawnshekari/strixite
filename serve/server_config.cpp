@@ -275,8 +275,8 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
         {"mtp", K::OnOff, 0, 0, "on", "MTP drafting"},
         // MTP defaults: chained drafts at margin 1.5 with a 65536-id draft vocabulary, 7 drafts (reasons in
         // deploy/strix-server.conf).
-        {"mtp-draft", K::Int, 1, 15, "7", "MTP: most drafts per verify (the head chained)"},
-        {"mtp-margin", K::Number, 0, 100, "1.5", "MTP: draft only while the top-1 logit margin is at least this"},
+        {"mtp-draft", K::Int, 1, 15, "9", "MTP: most drafts per verify (the head chained)"},
+        {"mtp-margin", K::Number, 0, 100, "2.0", "MTP: draft only while the top-1 logit margin is at least this"},
         {"mtp-vocab", K::Int, 0, 1 << 30, "65536", "MTP: drafts are scored over token ids [0, N); 0 = the whole vocabulary"},
         {"ngram-cache-rows", K::Int, 0, 1 << 26, std::to_string(kServedNgramCacheRows),
          "the n-gram table's LRU row cache in rows (320 B each, plus index); 0 = none"},

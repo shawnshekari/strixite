@@ -781,7 +781,7 @@ void Engine::run(Job &job) {
                         draft_at = so->after(draft_at, d);
                     }
                     ids.push_back(d);
-                    if (step + 1 < steps) be_.prefetch_ple(ids, (int64_t)ids.size() - 1);  // the last: nothing to hide behind
+                    be_.prefetch_ple(ids, (int64_t)ids.size() - 1);
                 }
                 const int64_t k = (int64_t)ids.size() - 1;
                 if (k > 0) {

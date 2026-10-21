@@ -306,7 +306,7 @@ class Engine {
 public:
     struct Options {
         PromptCache *cache = nullptr;
-        float mtp_margin = 1.5f;  // logit margin (top1 - top2) required to draft MTP token
+        float mtp_margin = 2.0f;  // logit margin (top1 - top2) required to draft MTP token
         int64_t mtp_draft = 1;    // most drafts per verify (the head chained), 1..15
         // Non-empty: every finished request's token ids and MTP steps are written there (serve/capture.hpp). The
         // directory must exist.
@@ -339,7 +339,7 @@ public:
     };
 
     Engine(LmBackend &backend, const Tokenizer &tok, const Options &options);
-    Engine(LmBackend &backend, const Tokenizer &tok, PromptCache *cache = nullptr, float mtp_margin = 1.5f);
+    Engine(LmBackend &backend, const Tokenizer &tok, PromptCache *cache = nullptr, float mtp_margin = 2.0f);
     ~Engine();  // finishes the running request, fails the queued ones, joins the worker
     Engine(const Engine &) = delete;
     Engine &operator=(const Engine &) = delete;
