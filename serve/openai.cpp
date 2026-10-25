@@ -69,14 +69,19 @@ void check_tools(const json::Value &tools) {
 }
 
 // Several leading system messages (opencode sends two) become one, their texts joined by a blank line - the
-// template accepts a single system message, first. Content may be a string or text parts.
+// template accepts a single system message, first. Content may be a string or text parts. OpenAI-style agent
+// harnesses (dsh) send their instructions with role "developer"; that role normalizes to "system" here.
 json::Value merge_leading_system(const json::Value &messages) {
     const auto &ms = messages.as_array("messages");
     size_t n = 0;
-    while (n < ms.size() && ms[n].is_object() && ms[n].find("role") && ms[n].find("role")->is_string() &&
-           ms[n].find("role")->as_string("role") == "system")
+    bool has_developer = false;
+    while (n < ms.size() && ms[n].is_object() && ms[n].find("role") && ms[n].find("role")->is_string()) {
+        const std::string &role = ms[n].find("role")->as_string("role");
+        if (role == "developer") has_developer = true;
+        if (role != "system" && role != "developer") break;
         ++n;
-    if (n < 2) return messages;
+    }
+    if (n < 2 && !has_developer) return messages;  // a lone "developer" message still rewrites to system below
     std::string text;
     for (size_t k = 0; k < n; ++k) {
         const json::Value *c = ms[k].find("content");
