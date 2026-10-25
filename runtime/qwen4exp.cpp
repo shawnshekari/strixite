@@ -3165,7 +3165,7 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                     // blocks, gathered attention. Queries that still see every key keep all their blocks -
                     // the dense set. Scores / selection are row-indexed: each run gets its slice.
                     const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
-                    const int64_t qsa_tile = std::min<int64_t>(M, 1024);
+                    const int64_t qsa_tile = std::min<int64_t>(max_tokens_, 1024);
                     for (int64_t off = 0; off < r.Tr; off += qsa_tile) {
                         const int64_t tile_t = std::min<int64_t>(r.Tr - off, qsa_tile);
                         void *tile_q = at(proj_, (r.base + off) * D.astride + D.idx_col);
