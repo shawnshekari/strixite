@@ -63,14 +63,20 @@ ServerSettings::ServerSettings(std::vector<ConfigOption> options) : options_(std
         if (o.kind == ConfigOption::Kind::Int || o.kind == ConfigOption::Kind::Number)
             STRIX_CHECK(o.lo <= o.hi, "ServerSettings: option '", o.name, "' has range [", o.lo, ", ", o.hi, "]");
         STRIX_CHECK(!o.help.empty(), "ServerSettings: option '", o.name, "' has no help text");
+        if (!o.alias_for.empty())
+            STRIX_CHECK(o.alias_for != o.name, "ServerSettings: option '", o.name, "' aliases itself");
         validate(i, o.default_value, "the default of '" + o.name + "'");
         settings_.push_back({o.default_value, "default"});
     }
 }
 
 size_t ServerSettings::index(const std::string &name, const char *caller) const {
-    for (size_t i = 0; i < options_.size(); ++i)
-        if (options_[i].name == name) return i;
+    for (size_t i = 0; i < options_.size(); ++i) {
+        if (options_[i].name == name) {
+            if (!options_[i].alias_for.empty()) return index(options_[i].alias_for, caller);
+            return i;
+        }
+    }
     STRIX_FAIL("ServerSettings::", caller, ": no option '", name, "' in the table");
 }
 
@@ -111,15 +117,18 @@ void ServerSettings::load_file(const std::string &path) {
         while (i < options_.size() && options_[i].name != key) ++i;
         STRIX_CHECK(i < options_.size(), where, ": unknown key '", key, "'",
                     key.rfind("--", 0) == 0 ? " (keys are flag names without --)" : "", "; see strix_server --help");
-        STRIX_CHECK(seen_at[i].empty(), where, ": duplicate key '", key, "', already set on line ", seen_at[i]);
-        STRIX_CHECK(!value.empty(), where, ": ", key, " has an empty value; expected ", placeholder(options_[i].kind));
-        validate(i, value, where);
-        const ConfigOption::Kind k = options_[i].kind;
+        const size_t target_i = options_[i].alias_for.empty() ? i : index(options_[i].alias_for, "load_file");
+        STRIX_CHECK(seen_at[target_i].empty(), where, ": duplicate key '", key, "', '", options_[target_i].name,
+                    "' already set on line ", seen_at[target_i]);
+        STRIX_CHECK(!value.empty(), where, ": ", key, " has an empty value; expected ", placeholder(options_[target_i].kind));
+        validate(target_i, value, where);
+        const ConfigOption::Kind k = options_[target_i].kind;
         if (k == ConfigOption::Kind::Path || (k == ConfigOption::Kind::PathOrOff && value != "off"))
             STRIX_CHECK(value[0] == '/', where, ": ", key, " = '", value,
                         "' is relative; expected an absolute path (a file's paths can't depend on the working directory)");
+        seen_at[target_i] = std::to_string(line);
         seen_at[i] = std::to_string(line);
-        settings_[i] = {value, "file:" + std::to_string(line)};
+        settings_[target_i] = {value, "file:" + std::to_string(line)};
     }
     STRIX_CHECK(f.eof(), "config file '", path, "': read error");
 }
@@ -154,10 +163,12 @@ void ServerSettings::load(const std::vector<std::string> &args) {
         size_t i = 0;
         while (i < options_.size() && options_[i].name != name) ++i;
         STRIX_CHECK(i < options_.size(), "command line: unknown option '", k, "'; see strix_server --help");
-        STRIX_CHECK(!flagged[i], "command line: ", k, " given twice");
-        validate(i, v, "command line");
+        const size_t target_i = options_[i].alias_for.empty() ? i : index(options_[i].alias_for, "load");
+        STRIX_CHECK(!flagged[target_i], "command line: ", k, " given twice (or '", options_[target_i].name, "' already set)");
+        validate(target_i, v, "command line");
+        flagged[target_i] = true;
         flagged[i] = true;
-        flags.emplace_back(i, v);
+        flags.emplace_back(target_i, v);
     }
     if (have_config) load_file(config_path_);
     for (const auto &[i, v] : flags) settings_[i] = {v, "flag"};
@@ -203,6 +214,10 @@ std::string ServerSettings::usage(const std::string &program) const {
         u << "  --" << o.name << ' ' << placeholder(o.kind);
         if (o.kind == ConfigOption::Kind::Int || o.kind == ConfigOption::Kind::Number)
             u << " [" << fmt_number(o.lo) << ", " << fmt_number(o.hi) << "]";
+        if (!o.alias_for.empty()) {
+            u << "  (alias for --" << o.alias_for << ")\n      " << o.help << '\n';
+            continue;
+        }
         u << "  (default " << o.default_value << ")\n      " << o.help << '\n';
     }
     return u.str();
@@ -211,8 +226,10 @@ std::string ServerSettings::usage(const std::string &program) const {
 std::string ServerSettings::render() const {
     std::ostringstream r;
     r << "# strix_server effective settings; each line's source after the value\n";
-    for (size_t i = 0; i < options_.size(); ++i)
+    for (size_t i = 0; i < options_.size(); ++i) {
+        if (!options_[i].alias_for.empty()) continue;
         r << options_[i].name << " = " << settings_[i].value << "  # " << settings_[i].source << '\n';
+    }
     return r.str();
 }
 
@@ -243,7 +260,12 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
          "seconds a connection may go silent while its request body is still arriving before the read is abandoned "
          "and a retryable 408 goes out; per-read inactivity, not total upload time (httplib's default was 5 s, too "
          "short for multi-MB histories over weak Wi-Fi - strixite #15)"},
-        {"capacity", K::Int, 4096, 1 << 20, "524288", "positions per session (at most 262144 x rope-yarn-factor)"},
+        {"slot-capacity", K::Int, 4096, 1 << 20, "524288",
+         "positions per slot/session (at most 262144 x rope-yarn-factor)"},
+        {"capacity", K::Int, 4096, 1 << 20, "524288",
+         "alias for slot-capacity (backward compatibility)", "slot-capacity"},
+        {"total-capacity", K::Int, 0, 1 << 24, "0",
+         "global physical capacity ceiling across all slots in tokens; 0 = unconstrained by a global ceiling"},
         {"total-slots", K::Int, 1, 8, "2",
          "conversations served at once, each its own state at the full capacity (one slot's state is ~8 GiB at 512k "
          "with 8-bit K/V); requests past them wait in arrival order. Startup refuses a count the memory doesn't hold, "
@@ -303,6 +325,8 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
          "prefill attention's P * V: exact (P as BF16 hi + lo) or fast (P as one BF16 term, as flash attention does)"},
         {"kv-cache", K::Text, 0, 0, "q8",
          "attention K/V cache: q8 (8 bits, layout c: ~56% of bf16's memory and prompt-cache bytes) or bf16"},
+        {"kv-precommit", K::OnOff, 0, 0, "on",
+         "pre-commit and map the full capacity for every slot upfront at startup (eliminates mid-generation OOM and page-fault latency spikes)"},
         {"mtp", K::OnOff, 0, 0, "on", "MTP drafting"},
         // MTP defaults: chained drafts at margin 1.5 with a 65536-id draft vocabulary, 7 drafts (reasons in
         // deploy/strix-server.conf).

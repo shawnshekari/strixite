@@ -543,6 +543,34 @@ Qwen4ExpSeqState::Qwen4ExpSeqState(const Qwen4ExpModel &model, int64_t capacity,
     }
 }
 
+void Qwen4ExpSeqState::reclaim_paged(const Qwen4ExpModel &model, int64_t capacity, KvFormat kv) {
+    const Qwen4ExpDims &D = model.dims();
+    const size_t e = es(model.act());
+    const int64_t cap_blocks = capacity / kernels::kQsaBlock + 1;
+    const int64_t kv8_cap = (capacity + kernels::kKv8Group - 1) / kernels::kKv8Group * kernels::kKv8Group;
+    const int64_t W = D.hkv * D.hd;
+    const bool q8 = kv == KvFormat::Q8;
+    for (int64_t i = 0; i < D.layers; ++i) {
+        const std::string tag = "layer " + std::to_string(i);
+        const bool attn = D.is_attention[(size_t)i];
+        if (attn && !q8) {
+            k_cache[(size_t)i] = PagedDeviceBuffer((size_t)(capacity * W) * e, kPageBytes, "K cache " + tag);
+            v_cache[(size_t)i] = PagedDeviceBuffer((size_t)(capacity * W) * e, kPageBytes, "V cache " + tag);
+        }
+        if (attn && q8) {
+            kv8_store[(size_t)i] = PagedDeviceBuffer(kernels::kv8_bytes(kv8_cap, W), kPageBytes, "8-bit K/V " + tag);
+        }
+        if (attn) {
+            block_keys[(size_t)i] = PagedDeviceBuffer((size_t)(cap_blocks * D.idx_d) * e, kPageBytes, "block keys " + tag);
+        }
+    }
+    if (mtp) {
+        k_cache_mtp = PagedDeviceBuffer((size_t)(capacity * D.hkv * D.hd) * e, kPageBytes, "MTP K cache");
+        v_cache_mtp = PagedDeviceBuffer((size_t)(capacity * D.hkv * D.hd) * e, kPageBytes, "MTP V cache");
+        block_keys_mtp = PagedDeviceBuffer((size_t)(cap_blocks * D.idx_d) * e, kPageBytes, "MTP block keys");
+    }
+}
+
 // /proc/meminfo's MemAvailable in bytes (the slot allocation guard); 0 if it can't be read (the guard then refuses
 // any slot past the first rather than guess).
 uint64_t Qwen4ExpSession::mem_available_bytes() {
@@ -597,9 +625,21 @@ void Qwen4ExpSession::for_paged(Qwen4ExpSeqState &sq, int64_t end, const std::fu
 }
 
 void Qwen4ExpSession::ensure_rows(Qwen4ExpSeqState &sq, int64_t end) {
+    if (total_capacity_ > 0) {
+        int64_t total_tokens = 0;
+        for (const auto &s : seqs_) {
+            total_tokens += (s.get() == &sq ? end : s->ensured_rows);
+        }
+        STRIX_CHECK(total_tokens <= total_capacity_,
+                    "Qwen4ExpSession: total tokens across all slots would reach ", total_tokens,
+                    ", exceeding total-capacity ", total_capacity_);
+    }
     uint64_t missing = 0;
     for_paged(sq, end, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &r) { missing += b.missing_bytes(r); });
-    if (missing == 0) return;
+    if (missing == 0) {
+        sq.ensured_rows = std::max(sq.ensured_rows, end);
+        return;
+    }
     if (kv_budget_) {
         kv_budget_(missing);  // throws to refuse (nothing mapped yet)
     } else {
@@ -609,6 +649,14 @@ void Qwen4ExpSession::ensure_rows(Qwen4ExpSeqState &sq, int64_t end) {
                     kSlotFloorBytes >> 30, " GiB floor");
     }
     for_paged(sq, end, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &r) { b.ensure(r); });
+    sq.ensured_rows = std::max(sq.ensured_rows, end);
+}
+
+void Qwen4ExpSession::precommit() {
+    for (size_t k = 0; k < seqs_.size(); ++k) {
+        ensure_rows(*seqs_[k], capacity_);
+    }
+    precommitted_ = true;
 }
 
 uint64_t Qwen4ExpSession::kv_full_bytes() const {
@@ -1604,7 +1652,7 @@ void Qwen4ExpSession::reset_seq_state(Qwen4ExpSeqState &s) {
     });
     const int slot = seq_index(s);
     kv_budget_for_reset(s);  // the budget refusal first, before any buffer steps (the per-buffer check is a drift guard)
-    if (kv_layout_.generations > 1 && !fresh) {
+    if (!precommitted_ && kv_layout_.generations > 1 && !fresh) {
         uint32_t gen_now = 0, gen_cap = 0;  // every buffer of the slot advances together; the log names the slot
         auto advance = [&](PagedDeviceBuffer &b) {
             if (b.capacity() == 0) return;  // the other layer kind's default-constructed buffer
@@ -1626,6 +1674,7 @@ void Qwen4ExpSession::reset_seq_state(Qwen4ExpSeqState &s) {
              "(one-use addresses; reaching %u refuses the next switch - only a restart reclaims)",
              slot, gen_now, gen_cap, gen_cap);
     }
+    s.ensured_rows = 0;
     {
         s.pos = 0, s.tail_cur = 0, s.mtp_tail_cur = 0, s.mtp_chain_step = -1, s.verify_pending = false;  // GDN states reset on the first call (reset_state); KV overwritten
         s.verify_rows = 0, s.verify_carry = 0, s.verify_row_base = 0, s.verify_ple_wbase = 0;

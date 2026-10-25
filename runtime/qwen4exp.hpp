@@ -517,6 +517,13 @@ struct Qwen4ExpSeqState {
 
     int64_t pos3Hend() const { return pos3_start + (int64_t)pos3_host.size() / 3; }  // == pos when non-empty
 
+    // Current ensured positions across all paged arrays of this slot.
+    int64_t ensured_rows = 0;
+
+    // Releases mapped physical K/V pages back to the system by recreating the paged buffers
+    // with fresh zero-mapped virtual address reservations.
+    void reclaim_paged(const Qwen4ExpModel &model, int64_t capacity, KvFormat kv);
+
     // The MTP head's state exists with mtp (Qwen4ExpSession::forward's MTP catch-up and the draft check this).
     bool mtp = false;
 
@@ -557,6 +564,11 @@ public:
     // Paged slot K/V: before a slot's arrays map more pages, f(bytes) is asked for
     // the RAM (the server's prompt cache makes room - K/V first) and throws to refuse; unset, growth is refused only
     // when it would leave MemAvailable below the slot floor. A refusal fails the call before any page is mapped.
+    // Pre-commits and maps all capacity pages for every sequence upfront, avoiding runtime growth jitter.
+    void precommit();
+    bool is_precommitted() const { return precommitted_; }
+    void set_total_capacity(int64_t tokens) { total_capacity_ = tokens; }
+    int64_t total_capacity() const { return total_capacity_; }
     void set_kv_budget(std::function<void(uint64_t bytes)> f) { kv_budget_ = std::move(f); }
     // The bytes one slot's paged arrays map at the full capacity (the startup memory plan's deep-slot term).
     uint64_t kv_full_bytes() const;
@@ -924,6 +936,8 @@ private:
     int64_t capacity_, max_tokens_, cap_blocks_ = 0;
     PrefillMath prefill_math_;
     PrecisionOptions precision_;
+    bool precommitted_ = false;
+    int64_t total_capacity_ = 0;
     hipStream_t stream_ = nullptr;
     // KvFormat::Q8 (the states' k_cache / v_cache empty then): kv_new_ [max_tokens][2W] the forward's new
     // K | V rows before kv8_commit; kv8_err_ the fp16-overflow flag; per attention layer the 8-bit storage

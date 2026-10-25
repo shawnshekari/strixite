@@ -35,6 +35,10 @@ public:
     // Which K/V generation the conversation's slot stands at (the parked budget's other side; the tests and
     // /health read it - reaching the last one is the switch-count exhaustion refusal).
     int64_t kv_generation() const { return session_->kv_generation(0); }
+    void precommit() { session_->precommit(); }
+    bool is_precommitted() const { return session_->is_precommitted(); }
+    void set_total_capacity(int64_t tc) { session_->set_total_capacity(tc); }
+    int64_t total_capacity() const { return session_->total_capacity(); }
     void set_kv_budget(std::function<void(uint64_t)> f);  // kept for a renewed session too
     void reset() override { session_->reset(); }
     // The soft K/V reset (LmBackend::renew): a new session on the same loaded model, built with the same
