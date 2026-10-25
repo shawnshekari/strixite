@@ -630,8 +630,21 @@ void Qwen4ExpSession::ensure_rows(Qwen4ExpSeqState &sq, int64_t end) {
         for (const auto &s : seqs_) {
             total_tokens += (s.get() == &sq ? end : s->ensured_rows);
         }
+        if (total_tokens > total_capacity_) {
+            // Evict/reclaim memory from idle slots to make room in the global pool
+            for (size_t k = 0; k < seqs_.size(); ++k) {
+                if (seqs_[k].get() != &sq && !seqs_[k]->verify_pending && seqs_[k]->ensured_rows > precommitted_rows_) {
+                    reset_seq_state(*seqs_[k]);
+                    total_tokens = 0;
+                    for (const auto &s : seqs_) {
+                        total_tokens += (s.get() == &sq ? end : s->ensured_rows);
+                    }
+                    if (total_tokens <= total_capacity_) break;
+                }
+            }
+        }
         STRIX_CHECK(total_tokens <= total_capacity_,
-                    "Qwen4ExpSession: total tokens across all slots would reach ", total_tokens,
+                    "Qwen4ExpSession: total tokens across all active slots would reach ", total_tokens,
                     ", exceeding total-capacity ", total_capacity_);
     }
     uint64_t missing = 0;
@@ -653,10 +666,14 @@ void Qwen4ExpSession::ensure_rows(Qwen4ExpSeqState &sq, int64_t end) {
 }
 
 void Qwen4ExpSession::precommit() {
-    for (size_t k = 0; k < seqs_.size(); ++k) {
-        ensure_rows(*seqs_[k], capacity_);
+    int64_t per_slot = capacity_;
+    if (total_capacity_ > 0 && (int64_t)seqs_.size() * capacity_ > total_capacity_) {
+        per_slot = total_capacity_ / (int64_t)seqs_.size();
     }
-    precommitted_ = true;
+    for (size_t k = 0; k < seqs_.size(); ++k) {
+        ensure_rows(*seqs_[k], per_slot);
+    }
+    precommitted_rows_ = per_slot;
 }
 
 uint64_t Qwen4ExpSession::kv_full_bytes() const {
@@ -1652,7 +1669,7 @@ void Qwen4ExpSession::reset_seq_state(Qwen4ExpSeqState &s) {
     });
     const int slot = seq_index(s);
     kv_budget_for_reset(s);  // the budget refusal first, before any buffer steps (the per-buffer check is a drift guard)
-    if (!precommitted_ && kv_layout_.generations > 1 && !fresh) {
+    if (!is_precommitted() && kv_layout_.generations > 1 && !fresh) {
         uint32_t gen_now = 0, gen_cap = 0;  // every buffer of the slot advances together; the log names the slot
         auto advance = [&](PagedDeviceBuffer &b) {
             if (b.capacity() == 0) return;  // the other layer kind's default-constructed buffer
@@ -1674,7 +1691,7 @@ void Qwen4ExpSession::reset_seq_state(Qwen4ExpSeqState &s) {
              "(one-use addresses; reaching %u refuses the next switch - only a restart reclaims)",
              slot, gen_now, gen_cap, gen_cap);
     }
-    s.ensured_rows = 0;
+    s.ensured_rows = precommitted_rows_;
     {
         s.pos = 0, s.tail_cur = 0, s.mtp_tail_cur = 0, s.mtp_chain_step = -1, s.verify_pending = false;  // GDN states reset on the first call (reset_state); KV overwritten
         s.verify_rows = 0, s.verify_carry = 0, s.verify_row_base = 0, s.verify_ple_wbase = 0;

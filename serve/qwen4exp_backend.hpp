@@ -37,6 +37,7 @@ public:
     int64_t kv_generation() const { return session_->kv_generation(0); }
     void precommit() { session_->precommit(); }
     bool is_precommitted() const { return session_->is_precommitted(); }
+    int64_t precommitted_rows() const { return session_->precommitted_rows(); }
     void set_total_capacity(int64_t tc) { session_->set_total_capacity(tc); }
     int64_t total_capacity() const { return session_->total_capacity(); }
     void set_kv_budget(std::function<void(uint64_t)> f);  // kept for a renewed session too

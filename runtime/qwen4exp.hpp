@@ -566,7 +566,8 @@ public:
     // when it would leave MemAvailable below the slot floor. A refusal fails the call before any page is mapped.
     // Pre-commits and maps all capacity pages for every sequence upfront, avoiding runtime growth jitter.
     void precommit();
-    bool is_precommitted() const { return precommitted_; }
+    bool is_precommitted() const { return precommitted_rows_ > 0; }
+    int64_t precommitted_rows() const { return precommitted_rows_; }
     void set_total_capacity(int64_t tokens) { total_capacity_ = tokens; }
     int64_t total_capacity() const { return total_capacity_; }
     void set_kv_budget(std::function<void(uint64_t bytes)> f) { kv_budget_ = std::move(f); }
@@ -936,7 +937,7 @@ private:
     int64_t capacity_, max_tokens_, cap_blocks_ = 0;
     PrefillMath prefill_math_;
     PrecisionOptions precision_;
-    bool precommitted_ = false;
+    int64_t precommitted_rows_ = 0;
     int64_t total_capacity_ = 0;
     hipStream_t stream_ = nullptr;
     // KvFormat::Q8 (the states' k_cache / v_cache empty then): kv_new_ [max_tokens][2W] the forward's new
