@@ -40,6 +40,8 @@ public:
     int64_t precommitted_rows() const { return session_->precommitted_rows(); }
     void set_total_capacity(int64_t tc) { session_->set_total_capacity(tc); }
     int64_t total_capacity() const { return session_->total_capacity(); }
+    void set_slot_busy(int seq, bool busy) override { session_->set_slot_busy(seq, busy); }
+    void set_on_slot_evicted(std::function<void(int seq)> f) override { session_->set_on_slot_evicted(std::move(f)); }
     void set_kv_budget(std::function<void(uint64_t)> f);  // kept for a renewed session too
     void reset() override { session_->reset(); }
     // The soft K/V reset (LmBackend::renew): a new session on the same loaded model, built with the same

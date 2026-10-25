@@ -631,10 +631,12 @@ void Qwen4ExpSession::ensure_rows(Qwen4ExpSeqState &sq, int64_t end) {
             total_tokens += (s.get() == &sq ? end : s->ensured_rows);
         }
         if (total_tokens > total_capacity_) {
-            // Evict/reclaim memory from idle slots to make room in the global pool
+            // Evict/reclaim memory only from IDLE slots (!slot_busy_[k])
             for (size_t k = 0; k < seqs_.size(); ++k) {
-                if (seqs_[k].get() != &sq && !seqs_[k]->verify_pending && seqs_[k]->ensured_rows > precommitted_rows_) {
+                if (seqs_[k].get() != &sq && (k >= slot_busy_.size() || !slot_busy_[k]) &&
+                    seqs_[k]->ensured_rows > precommitted_rows_) {
                     reset_seq_state(*seqs_[k]);
+                    if (on_slot_evicted_) on_slot_evicted_((int)k);
                     total_tokens = 0;
                     for (const auto &s : seqs_) {
                         total_tokens += (s.get() == &sq ? end : s->ensured_rows);
@@ -666,14 +668,10 @@ void Qwen4ExpSession::ensure_rows(Qwen4ExpSeqState &sq, int64_t end) {
 }
 
 void Qwen4ExpSession::precommit() {
-    int64_t per_slot = capacity_;
-    if (total_capacity_ > 0 && (int64_t)seqs_.size() * capacity_ > total_capacity_) {
-        per_slot = total_capacity_ / (int64_t)seqs_.size();
-    }
     for (size_t k = 0; k < seqs_.size(); ++k) {
-        ensure_rows(*seqs_[k], per_slot);
+        ensure_rows(*seqs_[k], capacity_);
     }
-    precommitted_rows_ = per_slot;
+    precommitted_rows_ = capacity_;
 }
 
 uint64_t Qwen4ExpSession::kv_full_bytes() const {
@@ -1188,6 +1186,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
         seqs_.push_back(std::make_unique<Qwen4ExpSeqState>(m_, capacity, max_tokens, mtp, kv, *kv_res_, kv_layout_,
                                                             /*slot=*/k));
     }
+    slot_busy_.assign(seqs_.size(), false);
     reset();
 }
 

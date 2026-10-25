@@ -570,6 +570,10 @@ public:
     int64_t precommitted_rows() const { return precommitted_rows_; }
     void set_total_capacity(int64_t tokens) { total_capacity_ = tokens; }
     int64_t total_capacity() const { return total_capacity_; }
+    void set_slot_busy(int seq, bool busy) {
+        if (seq >= 0 && (size_t)seq < slot_busy_.size()) slot_busy_[(size_t)seq] = busy;
+    }
+    void set_on_slot_evicted(std::function<void(int seq)> f) { on_slot_evicted_ = std::move(f); }
     void set_kv_budget(std::function<void(uint64_t bytes)> f) { kv_budget_ = std::move(f); }
     // The bytes one slot's paged arrays map at the full capacity (the startup memory plan's deep-slot term).
     uint64_t kv_full_bytes() const;
@@ -939,6 +943,8 @@ private:
     PrecisionOptions precision_;
     int64_t precommitted_rows_ = 0;
     int64_t total_capacity_ = 0;
+    std::vector<bool> slot_busy_;
+    std::function<void(int seq)> on_slot_evicted_;
     hipStream_t stream_ = nullptr;
     // KvFormat::Q8 (the states' k_cache / v_cache empty then): kv_new_ [max_tokens][2W] the forward's new
     // K | V rows before kv8_commit; kv8_err_ the fp16-overflow flag; per attention layer the 8-bit storage

@@ -218,15 +218,20 @@ int run(int argc, char **argv) {
     if (total_capacity > 0) {
         STRIX_CHECK(slot_capacity <= total_capacity,
                     "startup: slot-capacity (", slot_capacity, ") cannot exceed total-capacity (", total_capacity, ")");
+        if (kv_precommit) {
+            STRIX_CHECK(total_slots * slot_capacity <= total_capacity,
+                        "startup: kv-precommit: total-slots (", total_slots, ") * slot-capacity (", slot_capacity,
+                        " = ", total_slots * slot_capacity, " tokens) exceeds total-capacity (", total_capacity,
+                        "); to use dynamic oversubscription across slots, set kv-precommit = off");
+        }
     }
     Qwen4ExpBackend backend(model, slot_capacity, chunk, use_mtp, mtp_vocab, precision, kv_format, total_slots,
                             kv_generations);
     if (total_capacity > 0) backend.set_total_capacity(total_capacity);
     if (kv_precommit) {
         backend.precommit();
-        const int64_t per_slot = backend.precommitted_rows();
-        slog(LogLevel::Info, "startup: KV cache: statically pre-committed %s tokens per slot (%lld slots, total %s tokens)",
-             fmt_n(per_slot).c_str(), (long long)total_slots, fmt_n(per_slot * total_slots).c_str());
+        slog(LogLevel::Info, "startup: KV cache: statically pre-committed full capacity (%s tokens per slot, %lld slots, total %s tokens)",
+             fmt_n(slot_capacity).c_str(), (long long)total_slots, fmt_n(slot_capacity * total_slots).c_str());
     }
     if (total_slots > 1)
         slog(LogLevel::Info, "startup: %lld slots: %lld conversations at once, each at slot-capacity %s (total-capacity: %s, kv-precommit: %s)",

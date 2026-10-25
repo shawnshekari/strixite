@@ -108,6 +108,8 @@ public:
     // Hint before a forward: the ids of the forward after it (a long prompt's next chunk), so the backend can
     // prepare for them during this one. Only a hint - nothing may depend on it being used.
     virtual void set_lookahead(const std::vector<int32_t> &next_ids) { (void)next_ids; }
+    virtual void set_slot_busy(int seq, bool busy) { (void)seq, (void)busy; }
+    virtual void set_on_slot_evicted(std::function<void(int seq)> f) { (void)f; }
     virtual std::vector<float> forward(const std::vector<int32_t> &ids, int64_t n_logits) {
         return forward(ids, n_logits > 0);
     }
