@@ -1126,10 +1126,11 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
         }
     }
     if (qsa) {
-        qsa_scores_ = DeviceBuffer<float>((size_t)(M * cap_blocks_), "QSA block scores");
+        const int64_t qsa_tile = std::min<int64_t>(M, 1024);
+        qsa_scores_ = DeviceBuffer<float>((size_t)(qsa_tile * cap_blocks_), "QSA block scores");
         qsa_sel_ = DeviceBuffer<int32_t>((size_t)(M * qsa_k), "QSA kept blocks");
         qsa_nsel_ = DeviceBuffer<int32_t>((size_t)M, "QSA kept block counts");
-        qsa_topk_ws_bytes_ = kernels::qsa_topk_workspace_bytes(M);
+        qsa_topk_ws_bytes_ = kernels::qsa_topk_workspace_bytes(qsa_tile);
         qsa_topk_ws_ = DeviceBuffer<uint8_t>(qsa_topk_ws_bytes_, "QSA top-k workspace");
         STRIX_HIP_CHECK(hipMemset(qsa_topk_ws_.get(), 0, qsa_topk_ws_bytes_), "zero the QSA top-k workspace");
     }
@@ -3164,13 +3165,18 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                     // blocks, gathered attention. Queries that still see every key keep all their blocks -
                     // the dense set. Scores / selection are row-indexed: each run gets its slice.
                     const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
-                    void *iq = at(proj_, r.base * D.astride + D.idx_col);  // normed + roped by the jobs above
-                    kernels::qsa_scores(iq, D.astride, D.idx_d, r.Tr, r.p, D.idx_h, D.idx_d,
-                                        sq.block_keys[(size_t)i].get(), cap_blocks_,
-                                        qsa_scores_.get() + (size_t)(r.base * cap_blocks_), cap_blocks_, act, stream_);
-                    kernels::qsa_topk(qsa_scores_.get() + (size_t)(r.base * cap_blocks_), cap_blocks_, r.Tr, r.p, qsa_k,
-                                      qsa_sel_.get() + (size_t)(r.base * qsa_k), qsa_nsel_.get() + r.base,
-                                      qsa_topk_ws_.get(), qsa_topk_ws_bytes_, stream_);
+                    const int64_t qsa_tile = std::min<int64_t>(M, 1024);
+                    for (int64_t off = 0; off < r.Tr; off += qsa_tile) {
+                        const int64_t tile_t = std::min<int64_t>(r.Tr - off, qsa_tile);
+                        void *tile_q = at(proj_, (r.base + off) * D.astride + D.idx_col);
+                        kernels::qsa_scores(tile_q, D.astride, D.idx_d, tile_t, r.p + off, D.idx_h, D.idx_d,
+                                            sq.block_keys[(size_t)i].get(), cap_blocks_,
+                                            qsa_scores_.get(), cap_blocks_, act, stream_);
+                        kernels::qsa_topk(qsa_scores_.get(), cap_blocks_, tile_t, r.p + off, qsa_k,
+                                          qsa_sel_.get() + (size_t)((r.base + off) * qsa_k),
+                                          qsa_nsel_.get() + r.base + off,
+                                          qsa_topk_ws_.get(), qsa_topk_ws_bytes_, stream_);
+                    }
                     show(L + "qsa_sel", qsa_sel_.get() + (size_t)(r.base * qsa_k), qsa_k, ProbeType::I32);
                     show(L + "qsa_nsel", qsa_nsel_.get() + r.base, 1, ProbeType::I32);
                     stage_kv8(std::min<int64_t>(D.qsa_budget, r.p + r.Tr));
