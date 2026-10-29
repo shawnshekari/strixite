@@ -257,6 +257,10 @@ target_link_libraries(check_stream_calls PRIVATE strix_serve)
 add_executable(strix_server tools/strix_server.cpp)
 target_link_libraries(strix_server PRIVATE strix_serve_model)
 
+add_executable(test_vmm_reclaim_safety tools/test_vmm_reclaim_safety.cpp)
+strix_hip_sources(test_vmm_reclaim_safety tools/test_vmm_reclaim_safety.cpp)
+target_link_libraries(test_vmm_reclaim_safety PRIVATE strix_kernels strix_runtime)
+
 
 
 # The tutorials live in the public repo only; built when present.
