@@ -36,6 +36,12 @@ Times are from my machine (Strix Halo, fast NVMe); a slower drive takes longer, 
 writing. You need room for the original, the results (~114 GiB) and, for a few minutes, the temporary 16-bit table
 (95 GiB, deleted at the end).
 
+Every layer stacks its experts into one gate/up matrix, and the server takes the expert count from that stack's row
+count instead of assuming the 512 this architecture ships with (the per-tensor count the converter records is
+checked against it), so a checkpoint converted from an expert-subset extraction of the same architecture - fewer
+experts per layer - loads as it is. Whether it is worth running is a different question: what that costs in quality
+depends entirely on how the subset was chosen, and nothing in this toolchain measures it for you.
+
 The server looks for its files under `~/models/strix-infer`, so the steps below put everything there. Run them from
 your strixite folder:
 

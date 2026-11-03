@@ -97,6 +97,23 @@ Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngra
         STRIX_CHECK(f.meta("shared_expert") == (shared_separate_ ? "separate" : "stacked"), "Qwen4ExpModel: '", weights,
                     "' has shared_expert metadata '", f.meta("shared_expert"), "' but layer 0's shared expert is ",
                     shared_separate_ ? "separate" : "stacked");
+    // How many routed experts per layer: the tensors decide, as they do for the shared expert's placement. Every
+    // layer stacks its routed experts (and the shared one, when it is stacked) into one [slots*2*inter, d] gate|up
+    // matrix, so the row count gives the slot count; Qwen4ExpDims::experts defaults to the 512 this architecture
+    // ships with, and a checkpoint of the same architecture converted with fewer experts per layer (an expert-subset
+    // extraction) carries its own count. The file's own count (StrixwTensor::experts, formats/strixw) must agree.
+    const StrixwTensor *gu = f.find(kLm + "layers.0.mlp.experts_gate_up");
+    STRIX_CHECK(gu != nullptr, "Qwen4ExpModel: '", weights, "': no layers.0.mlp.experts_gate_up (the routed experts)");
+    STRIX_CHECK(gu->shape.size() == 2 && gu->shape[1] % (2 * D.inter) == 0 && gu->shape[0] % (2 * D.inter) == 0,
+                "Qwen4ExpModel: '", weights, "': layers.0.mlp.experts_gate_up is [", gu->shape[0], ", ", gu->shape[1],
+                "], expected [expert slots x ", 2 * D.inter, ", ", D.d, "]");
+    const int64_t slots = gu->shape[0] / (2 * D.inter);
+    STRIX_CHECK(gu->experts == 0 || gu->experts == slots, "Qwen4ExpModel: '", weights, "': layers.0.mlp.experts_gate_up "
+                "records ", gu->experts, " experts, its ", gu->shape[0], " rows imply ", slots);
+    D.experts = slots - (shared_separate_ ? 0 : 1);  // a stacked shared expert is the stack's last slot
+    STRIX_CHECK(D.experts >= 1 && D.top_k >= 1 && D.top_k <= D.experts && D.top_k <= 32,
+                "Qwen4ExpModel: '", weights, "': ", D.experts, " experts with top ", D.top_k,
+                " selected; the router kernel (kernels/moe_router) takes k in 1..min(experts, 32)");
     const int64_t n4 = D.H * D.d, Estack = D.experts + (shared_separate_ ? 0 : 1);
     const auto &emb_info = f.get(kLm + "embed_tokens.weight");
     if (emb_info.encoding == StrixwEncoding::Q8RowMajor) {
