@@ -117,6 +117,9 @@ private:
     LogitMasks batch_masks(const std::vector<VerifyRun> &runs) const;
     LogitRows rows_of(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid,
                       const LogitMasks *masks, bool verify);
+    // The n-gram table, when the model has n-gram rows and they come from a table file. Nullptr when it has no
+    // rows at all (a checkpoint without a PLE layer) and when its rows live in the checkpoint's shards instead.
+    const NgramTableRows *ngram_table() const;
     const Qwen4ExpModel &model_;
     Qwen4ExpSession session_;
     std::vector<std::vector<Qwen4ExpSnapshot>> snapshots_;  // [seq][snapshot slot]

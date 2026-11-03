@@ -35,6 +35,11 @@ const Qwen4ExpSnapshot &Qwen4ExpBackend::snap(int seq, int slot) const {
     return snapshots_[(size_t)seq][(size_t)slot];
 }
 
+const NgramTableRows *Qwen4ExpBackend::ngram_table() const {
+    if (!model_.has_ngram_rows()) return nullptr;
+    return dynamic_cast<const NgramTableRows *>(&model_.ngram_rows());
+}
+
 BackendStats Qwen4ExpBackend::backend_stats() const {
     BackendStats s;
     const Qwen4ExpSession::PleStats p = session_.ple_stats();
@@ -42,7 +47,7 @@ BackendStats Qwen4ExpBackend::backend_stats() const {
     s.ple_gather_seconds = p.gather_seconds, s.ple_wait_seconds = p.wait_seconds;
     s.ple_wait_max_seconds = p.wait_max_seconds;
     s.ple_prefetches = p.prefetches, s.ple_prefetch_skipped = p.prefetch_skipped, s.ple_prefetch_seconds = p.prefetch_seconds;
-    if (const auto *t = dynamic_cast<const NgramTableRows *>(&model_.ngram_rows())) {  // the checkpoint source keeps none
+    if (const NgramTableRows *t = ngram_table()) {
         const NgramTableRows::Stats n = t->stats();
         s.ngram_rows_requested = (int64_t)n.requested, s.ngram_rows_unique = (int64_t)n.unique;
         s.ngram_rows_cached = (int64_t)n.hits, s.ngram_rows_read = (int64_t)n.reads;
@@ -103,7 +108,7 @@ std::string Qwen4ExpBackend::describe() const {
            kv_format_name(session_.kv_format()) +
            (has_mtp() ? ", mtp (draft vocabulary " + std::to_string(session_.mtp_vocab()) + ")" : "") +
            (model_.has_vision() ? ", vision tower on" : "") + [&] {
-               const auto *t = dynamic_cast<const NgramTableRows *>(&model_.ngram_rows());
+               const NgramTableRows *t = ngram_table();
                return t ? ", n-gram row cache " + std::to_string(t->cache_rows()) + " rows" : std::string();
            }();
 }
