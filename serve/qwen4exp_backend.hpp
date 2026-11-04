@@ -87,6 +87,10 @@ public:
     }
     std::vector<LogitRows> verify_batch(const std::vector<VerifyRun> &runs, bool cands, int64_t n_valid) override;
     int64_t max_verify_rows() const override { return Qwen4ExpSession::kMaxLogits; }
+    // A conversation that has run an image carries mRoPE position state for good (issue #29): its verifies run
+    // alone. Safe to ask off the GPU token - a slot's position state is written only by that slot's forwards,
+    // and this one has no run in a batch yet (GpuArbiter::verify checks that before asking).
+    bool batchable(int seq) const override { return session_.batchable(seq); }
     // carry -1 (none) is the session's 0; a carried token id 0 is then unchecked (Qwen4ExpSession::keep_verify).
     void keep_verify(int seq, int64_t rows, int32_t carry) override { session_.keep_verify(seq, rows, carry < 0 ? 0 : carry); }
     void drop_verify(int seq) override { session_.drop_verify(seq); }

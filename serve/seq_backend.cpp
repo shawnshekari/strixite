@@ -1,6 +1,7 @@
 #include "serve/seq_backend.hpp"
 
 #include "common/check.hpp"
+#include "serve/log.hpp"  // the exclusion is announced in the request's log block
 
 #include <algorithm>
 #include <chrono>
@@ -14,7 +15,8 @@ double now_s() {
 }  // namespace
 
 GpuArbiter::GpuArbiter(LmBackend &be)
-    : be_(be), epoch_((size_t)be.n_seqs(), 0), last_call_batch_((size_t)be.n_seqs(), 0) {
+    : be_(be), epoch_((size_t)be.n_seqs(), 0), last_call_batch_((size_t)be.n_seqs(), 0),
+      window_((size_t)be.n_seqs()), solo_announced_((size_t)be.n_seqs(), 0) {
     STRIX_CHECK(be.n_seqs() >= 1, "GpuArbiter: the backend holds ", be.n_seqs(), " conversations, expected >= 1");
 }
 
@@ -137,6 +139,15 @@ void GpuArbiter::run_batch(std::unique_lock<std::mutex> &lock) {
         const Pending &p = pending_[s];
         const int64_t r = (int64_t)p.run.ids.size();
         if (!runs.empty() && (rows + r > budget || p.cands != cands || p.n_valid != n_valid)) continue;
+        // A run whose slot carries mRoPE position state is not batchable at all: with another run in the forward
+        // it throws (LmBackend::batchable, issue #29) and the throw takes every run of the batch down with it.
+        // So it goes by itself: as the batch when it is the oldest waiting run, otherwise this pack stops in
+        // front of it - the batch's runs go now, it goes alone right after, never behind newer arrivals.
+        if (!p.batchable) {
+            if (!runs.empty()) break;
+            runs.push_back(p.run), members.push_back(s), rows += r;
+            break;
+        }
         if (runs.empty()) cands = p.cands, n_valid = p.n_valid;
         runs.push_back(p.run), members.push_back(s), rows += r;
     }
@@ -168,6 +179,13 @@ void GpuArbiter::run_batch(std::unique_lock<std::mutex> &lock) {
         if (!err) {
             ++stats_.verify_batches, stats_.verify_runs += (int64_t)members.size();
             stats_.max_runs = std::max(stats_.max_runs, (int64_t)members.size());
+            // Who ran with whom, per run: shared is the batch's whole point, solo_mrope is the run that could not
+            // have joined any batch at all. Both land in the slot's decode window (the request's block reads it).
+            for (int m : members) {
+                VerifyWindow &w = window_[(size_t)m];
+                if (members.size() > 1) ++w.shared;
+                else if (!pending_[m].batchable) ++w.solo_mrope, ++stats_.verify_solo_mrope;
+            }
         }
     }
     cv_.notify_all();
@@ -181,7 +199,15 @@ LogitRows GpuArbiter::verify(int seq, const LmBackend::VerifyRun &run, bool cand
     STRIX_CHECK(run.seq == seq, "GpuArbiter: seq ", seq, " sends a run of seq ", run.seq);
     if (owner_ == seq) owner_ = -1;  // the chain is done
     Pending &me = pending_[seq];
-    me.run = run, me.cands = cands, me.n_valid = n_valid, me.since = now_s();
+    // Asked here, not while packing: the run's own thread still owns this slot's state (it has no run in a
+    // batch yet - checked above), so reading it costs no GPU token.
+    me.run = run, me.cands = cands, me.n_valid = n_valid, me.batchable = be_.batchable(seq), me.since = now_s();
+    if (!me.batchable && !solo_announced_[(size_t)seq]) {  // said once per conversation, not once per step
+        solo_announced_[(size_t)seq] = 1;
+        slog(LogLevel::Info, "batching off: this conversation carries mRoPE position state (it ran an image, or "
+                             "resumed one) - a multi-run forward takes scalar positions only, so its verifies run "
+                             "alone (strix_verify_solo_mrope_total)");
+    }
     cv_.notify_all();
     for (;;) {
         if (me.done) break;
@@ -222,6 +248,8 @@ void GpuArbiter::reset(int seq) {
         if (whole) failed_ = false;  // the other seqs' epochs stay behind: each resets before its next call
         epoch_[(size_t)seq] = failures_;
         resolving_.erase(seq);
+        solo_announced_[(size_t)seq] = 0;  // a reset clears the mRoPE state: the exclusion could apply again
+        window_[(size_t)seq] = VerifyWindow{};
         if (owner_ == seq) owner_ = -1;
     } else if (be_.failed()) {
         fail_locked();
@@ -231,10 +259,16 @@ void GpuArbiter::reset(int seq) {
     if (err) std::rethrow_exception(err);
 }
 
+GpuArbiter::VerifyWindow GpuArbiter::verify_window(int seq) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return (size_t)seq < window_.size() ? window_[(size_t)seq] : VerifyWindow{};
+}
+
 void GpuArbiter::set_decoding(int seq, bool on) {
     {
         std::lock_guard<std::mutex> lock(mu_);
-        if (on) decoding_.insert(seq);
+        // The window opens with the request's decode: what its log block reports is what this decode did.
+        if (on) decoding_.insert(seq), window_[(size_t)seq] = VerifyWindow{};
         else decoding_.erase(seq);
     }
     cv_.notify_all();

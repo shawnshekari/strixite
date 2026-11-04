@@ -223,6 +223,7 @@ EngineStats Engine::stats() const {
     if (arbiter_) {
         const GpuArbiter::Stats a = arbiter_->stats();
         s.verify_batches = a.verify_batches, s.verify_batch_runs = a.verify_runs;
+        s.verify_solo_mrope = a.verify_solo_mrope;
         s.decoding_slots = arbiter_->decoding_count();
     }
     return s;
@@ -460,6 +461,13 @@ void Engine::report_resume_loss(const std::vector<int32_t> &prompt, int64_t star
 namespace {
 // A finished request's detail rows, before its cache saves: MTP and PLE (debug), a dropped tool call.
 void log_detail(const GenerationResult &r) {
+    // Only when it happens: a conversation that lost batching to its own history is worth a line, one that
+    // never did is not. This is why a slot verifies never show up in a batch, in the block that pays for it.
+    if (r.verify_solo_mrope > 0)
+        slog_row(LogLevel::Info, "batching",
+                 "alone %s (mRoPE position state: an image in this conversation - a multi-run forward takes scalar "
+                 "positions only), shared %s",
+                 fmt_n(r.verify_solo_mrope).c_str(), fmt_n(r.verify_shared_runs).c_str());
     if (r.mtp_drafted_tokens > 0) {
         char per_forward[48] = "";
         if (r.decode_forwards > 0)
@@ -1109,6 +1117,10 @@ void Engine::run(Job &job, Slot &sl) {
             step(0, 0, 1);
         }
         decoding.end();
+        if (sl.proxy) {  // the window closed with the decode: these numbers are this request own
+            const GpuArbiter::VerifyWindow vw = sl.proxy->verify_window();
+            res.verify_shared_runs = vw.shared, res.verify_solo_mrope = vw.solo_mrope;
+        }
         parser.finish(events);
         if (!events.empty()) sink.on_events(events);
         res.reasoning_tokens = parser.reasoning_tokens();

@@ -742,6 +742,11 @@ void HttpServer::routes() {
         metric("strix_verify_batches_total", "counter", "Batched MTP verifies across slots.", (double)s.verify_batches);
         metric("strix_verify_batch_runs_total", "counter",
                "Slots' runs in those batched verifies (/ batches = runs per batched forward).", (double)s.verify_batch_runs);
+        metric("strix_verify_solo_mrope_total", "counter",
+               "Verifies that ran alone because the conversation carries mRoPE position state (it ran an image, "
+               "or resumed one): a multi-run forward takes scalar positions only, so that conversation never "
+               "shares a batch (issue #29).",
+               (double)s.verify_solo_mrope);
         metric("strix_idle_seconds", "gauge",
                "Seconds since the last request finished; 0 while one runs or waits. Batch clients: wait for a gap here.",
                s.idle_seconds);

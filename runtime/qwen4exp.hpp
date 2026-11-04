@@ -618,6 +618,16 @@ public:
     void keep_verify(int seq, int64_t rows, int32_t carry = 0);
     void drop_verify(int seq);
     int64_t verify_rows(int seq) const { return seqs_[(size_t)seq]->verify_rows; }  // a pending verify's rows for keep_verify
+    // Can this slot's next forward share one with other slots'? forward_batch's multi-run contract (its
+    // declaration) takes scalar positions only, and what breaks it is the mRoPE position state: the interleaved
+    // history an image leaves behind, the position delta recomputed from it, set_positions' triples not yet
+    // forwarded. The history and the delta are the conversation's for good - resumed out of the prompt cache it
+    // comes back with them (the saved has_image) - so this is a property of the conversation, not of the step:
+    // a slot that once ran an image never shares a batch again.
+    bool batchable(int seq) const {
+        const Qwen4ExpSeqState &s = *seqs_[(size_t)seq];
+        return s.pending3.empty() && !s.history_ever_interleaved && s.rope_delta == 0;
+    }
     // The third way out of a verify: keep only its first `rows` (1 <= rows < its size) - the state as if forward()
     // had run just ids[0, rows), without running them again (an MTP rejection after rows - 1 accepted drafts; the
     // engine then forwards the corrected token alone). From the states before the verify (still intact): the GDN
