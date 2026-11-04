@@ -175,7 +175,8 @@ PromptCache::PromptCache(std::string dir, uint64_t max_bytes, std::string finger
     : PromptCache(std::move(dir), max_bytes, std::move(fingerprint), Options{}) {}
 
 PromptCache::PromptCache(std::string dir, uint64_t max_bytes, std::string fingerprint, Options options)
-    : dir_(std::move(dir)), fingerprint_(std::move(fingerprint)), max_bytes_(max_bytes), opt_(std::move(options)) {
+    : dir_(std::move(dir)), fingerprint_(std::move(fingerprint)), max_bytes_(max_bytes), opt_(std::move(options)),
+      gov_(opt_.ram_margin, [this] { return mem_available(); }) {
     STRIX_CHECK(!dir_.empty(), "PromptCache: empty directory");
     STRIX_CHECK(max_bytes >= (1ull << 20), "PromptCache: max_bytes ", max_bytes, ", expected >= 1 MiB");
     STRIX_CHECK(!fingerprint_.empty() && fingerprint_.size() < kFpBytes, "PromptCache: fingerprint of ",
@@ -261,7 +262,7 @@ PromptCache::~PromptCache() {
     shutting_down_ = true;
     std::vector<EntryPtr> todo;
     for (const EntryPtr &e : entries_)
-        if (!e->ram.empty() && e->path.empty() && !e->queued && !e->ram_only) todo.push_back(e);
+        if (e->in_ram() && e->path.empty() && !e->queued && !e->ram_only) todo.push_back(e);
     std::sort(todo.begin(), todo.end(), [](const EntryPtr &a, const EntryPtr &b) { return a->last_used > b->last_used; });
     for (const EntryPtr &e : todo)
         if (!e->queued) enqueue_locked(e, Why::Shutdown);  // (a delta's enqueue may have queued its base already)
@@ -277,6 +278,14 @@ PromptCache::~PromptCache() {
     lock.unlock();
     cv_.notify_all();
     if (thread_.joinable()) thread_.join();
+    // The shutdown flush retires records of its own writes, and nothing drains this list after the cache is
+    // gone: the engine's last drain ran earlier, so those parked pages go with the process. The backend that
+    // owns them outlives this destructor (declaration order), so nothing dangles - but a shutdown that lost
+    // more than the flush's own writes means the serving drain was not running, and that deserves a line.
+    const std::vector<int64_t> left = take_retired();
+    if (!left.empty())
+        slog(LogLevel::Warning, "prompt cache: %s parked records were retired by the shutdown flush - their "
+             "pages stay mapped until the process ends", fmt_n((long long)left.size()).c_str());
 }
 
 uint64_t PromptCache::mem_available() const {
@@ -322,7 +331,7 @@ PromptCache::Nearest PromptCache::nearest(const std::vector<int32_t> &prompt) co
         if (m <= r.common) continue;  // can't share more than the best so far
         int64_t k = 0;
         while (k < m && e->tokens[(size_t)k] == prompt[(size_t)k]) ++k;
-        if (k > r.common) r = Nearest{k, (int64_t)e->tokens.size(), e->kind, !e->ram.empty()};
+        if (k > r.common) r = Nearest{k, (int64_t)e->tokens.size(), e->kind, e->in_ram()};
     }
     return r;
 }
@@ -337,7 +346,7 @@ bool PromptCache::in_ram(const int32_t *tokens, int64_t n) const {
     STRIX_CHECK(tokens != nullptr && n >= 1, "PromptCache::in_ram: ", n, " tokens at ", (const void *)tokens);
     std::lock_guard<std::mutex> lock(mu_);
     const int i = find_locked(tokens, n);
-    return i >= 0 && !entries_[(size_t)i]->ram.empty();
+    return i >= 0 && entries_[(size_t)i]->in_ram();
 }
 
 bool PromptCache::on_disk(const int32_t *tokens, int64_t n) const {
@@ -408,13 +417,18 @@ bool PromptCache::with_state(const std::vector<int32_t> &prompt, int64_t n,
         std::unique_lock<std::mutex> lock(mu_);
         // A part whose eviction write is giving its RAM back reads as zero pages: wait for the file (the writer
         // notifies idle_cv_ after every write), then it is a disk part. The entry may be gone after the wait.
+        // The same wait covers a paged entry mid-write: its parked pages leave RAM only as the gather finishes
+        // (write_entry drops both halves the moment the file is there), and until then neither half is a
+        // state this path can hand - so a resume that came from with_paged's miss on a queued entry waits
+        // for the write and reads the file, exactly as it does for a releasing whole entry.
+        const auto waits = [](const Entry &f) { return f.releasing || (!f.paged.empty() && f.queued); };
         bool logged = false;
         const double deadline = now_s() + 120;
         for (;;) {
             const int i = find_locked(prompt.data(), n);
             if (i < 0) return false;  // gone since best()
             const EntryPtr e = entries_[(size_t)i];
-            const Entry *busy = e->releasing ? e.get() : e->base && e->base->releasing ? e->base.get() : nullptr;
+            const Entry *busy = waits(*e) ? e.get() : e->base && waits(*e->base) ? e->base.get() : nullptr;
             if (busy == nullptr) {
                 if (e->base) parts.push_back({e->base, {}, {}});
                 parts.push_back({e, {}, {}});
@@ -434,9 +448,17 @@ bool PromptCache::with_state(const std::vector<int32_t> &prompt, int64_t n,
         }
         for (Part &p : parts) {
             p.e->last_used = ++clock_, p.e->touched_s = now_s(), p.e->no_room = false;
-            STRIX_CHECK(!p.e->ram.empty() || !p.e->path.empty(), "PromptCache::with_state: the entry of ",
+            STRIX_CHECK(p.e->in_ram() || !p.e->path.empty(), "PromptCache::with_state: the entry of ",
                         p.e->tokens.size(), " tokens is neither in RAM nor on disk");
-            if (!p.e->ram.empty()) ++p.e->readers;
+            // A paged entry's small buffer without its parked pages is not a state - importing it would restore
+            // a corrupt conversation - so it is refused by name, never quietly served: read it with with_paged
+            // while it is in RAM. A file means the gather already ran, and the file has the whole state: that
+            // is what this path reads (the write itself was waited for above; a paged entry keeps no RAM past it).
+            STRIX_CHECK(p.e->paged.empty() || !p.e->path.empty(),
+                        "PromptCache::with_state: the ", fmt_n((long long)p.e->tokens.size()),
+                        "-token entry is paged: its state's big ranges are parked pages that only with_paged can "
+                        "hand (its file, if it has one, has the whole state)");
+            if (p.e->in_ram() && p.e->paged.empty()) ++p.e->readers;
             else p.path = p.e->path, p.file_bytes = p.e->file_bytes;
         }
     }
@@ -446,13 +468,13 @@ bool PromptCache::with_state(const std::vector<int32_t> &prompt, int64_t n,
         std::vector<Part> &parts;
         bool loaded_ok = false;
         ~Done() {
-            std::vector<HostBuffer> trash;
+            Handback hb;
             std::lock_guard<std::mutex> lock(c.mu_);
             for (Part &p : parts) {
                 if (p.path.empty()) {
                     c.release_locked(*p.e);
                 } else if (p.loaded.capacity() > 0) {
-                    if (loaded_ok && !p.e->dead && p.e->ram.empty()) {  // promoted: the next hit is a RAM hit
+                    if (loaded_ok && !p.e->dead && !p.e->in_ram()) {  // promoted: the next hit is a RAM hit
                         c.ram_bytes_ += p.loaded.capacity();
                         p.e->ram = std::move(p.loaded);
                     } else {
@@ -461,7 +483,7 @@ bool PromptCache::with_state(const std::vector<int32_t> &prompt, int64_t n,
                 }
             }
             if (loaded_ok) c.make_room_locked();
-            trash.swap(c.trash_);
+            hb.take(&c);
         }
     } done{*this, parts};
     const double t0 = now_s();
@@ -476,7 +498,7 @@ bool PromptCache::with_state(const std::vector<int32_t> &prompt, int64_t n,
                  "more; MemAvailable %s GiB, margin %s GiB)", fmt_n((long long)p.e->tokens.size()).c_str(),
                  fmt_rate((p.file_bytes - p.loaded.capacity()) / 1e9, 1).c_str(),
                  fmt_rate(mem_available() / (double)(1ull << 30), 1).c_str(),
-                 fmt_rate(opt_.ram_margin / (double)(1ull << 30), 0).c_str());
+                 fmt_rate(gov_.floor() / (double)(1ull << 30), 0).c_str());
             if (parts.size() == 2 && &p == &parts[0])
                 slog(LogLevel::Warning, "%sit is the base of the %s-token entry the prompt resumes from", kCont,
                      fmt_n((long long)parts[1].e->tokens.size()).c_str());
@@ -517,10 +539,10 @@ HostBuffer PromptCache::take_buffer() {
     const uint64_t want = prefault_bytes_;
     bool spare_fits = false;
     for (const HostBuffer &b : spares_) spare_fits |= b.capacity() >= want;
-    if (want > 0 && !spare_fits && mem_available() < opt_.ram_margin + want) {
+    if (want > 0 && !spare_fits && !gov_.room_now(want)) {
         Entry *lru = nullptr;
         for (const EntryPtr &e : entries_)
-            if (e->ram.capacity() >= want && !e->path.empty() && e->readers == 0 && !e->queued &&
+            if (e->ram.capacity() >= want && e->paged.empty() && !e->path.empty() && e->readers == 0 && !e->queued &&
                 (!lru || e->last_used < lru->last_used))
                 lru = e.get();
         if (lru) {
@@ -542,12 +564,13 @@ HostBuffer PromptCache::take_buffer() {
 HostBuffer PromptCache::take_replaced_buffer(const int32_t *tokens, int64_t n, int64_t keep_n) {
     STRIX_CHECK(tokens != nullptr && n >= 1, "PromptCache::take_replaced_buffer: ", n, " tokens at ", (const void *)tokens);
     STRIX_CHECK(keep_n >= 0 && keep_n < n, "PromptCache::take_replaced_buffer: keep_n = ", keep_n, ", expected 0..", n - 1);
-    std::vector<HostBuffer> trash;
+    Handback hb;
     std::lock_guard<std::mutex> lock(mu_);
     int best = -1;
     for (size_t i = 0; i < entries_.size(); ++i) {
         const Entry &e = *entries_[i];
-        if (e.kind != Kind::Turn || (int64_t)e.tokens.size() >= n || e.ram.empty() || e.readers > 0 || e.queued ||
+        if (e.kind != Kind::Turn || (int64_t)e.tokens.size() >= n || !e.in_ram() || !e.paged.empty() ||
+            e.readers > 0 || e.queued ||
             e.dependents > 0 || (int64_t)e.tokens.size() == keep_n)  // a base stays: its deltas need it
             continue;
         if (best >= 0 && e.tokens.size() <= entries_[(size_t)best]->tokens.size()) continue;
@@ -559,15 +582,15 @@ HostBuffer PromptCache::take_replaced_buffer(const int32_t *tokens, int64_t n, i
     HostBuffer b = std::move(e.ram);
     remove_locked((size_t)best);  // its RAM is already out: only the index and a disk file go
     ++stats_.replaced, ++stats_.turn_buffers_reused;
-    trash.swap(trash_);
+    hb.take(this);
     return b;
 }
 
 void PromptCache::give_back(HostBuffer b) {
-    std::vector<HostBuffer> trash;
+    Handback hb;
     std::lock_guard<std::mutex> lock(mu_);
     keep_spare_locked(std::move(b));
-    trash.swap(trash_);
+    hb.take(this);
 }
 
 void PromptCache::keep_spare_locked(HostBuffer b) {
@@ -585,8 +608,10 @@ void PromptCache::keep_spare_locked(HostBuffer b) {
 }
 
 void PromptCache::drop_ram_locked(Entry &e, bool to_spare) {
-    if (e.ram.capacity() == 0) return;
-    ram_bytes_ -= e.ram.capacity();
+    if (e.ram_cost() == 0) return;
+    ram_bytes_ -= e.ram_cost();
+    if (!e.paged.empty())  // its parked pages wait in retired_ for their owner (take_retired; never HIP here)
+        retired_.push_back(e.paged.parked_id), e.paged = PagedState();
     HostBuffer b = std::move(e.ram);
     if (to_spare) keep_spare_locked(std::move(b));
     else trash_.push_back(std::move(b));
@@ -629,6 +654,11 @@ int64_t PromptCache::delta_base(const int32_t *tokens, int64_t n, Kind kind) con
     for (const EntryPtr &e : entries_) {
         const int64_t b = (int64_t)e->tokens.size();
         if (e->base || e->dead || b <= best || b >= n) continue;  // whole entries only; deltas don't chain
+        // A paged entry never bases a delta: with_state would refuse it by name (its state's big ranges are
+        // parked pages), and a resume from the delta must be able to import its base - so the base has to be
+        // a state this cache can hand over as bytes. A turn that would land on a parked conversation saves
+        // whole (and may become the next parked record itself).
+        if (!e->paged.empty()) continue;
         // A Checkpoint's base is never a Turn: the next turn replaces a Turn, and the checkpoint would go with it.
         if (kind == Kind::Checkpoint && e->kind == Kind::Turn) continue;
         if (std::memcmp(e->tokens.data(), tokens, (size_t)b * 4) == 0) best = b;
@@ -640,14 +670,41 @@ int64_t PromptCache::delta_base(const int32_t *tokens, int64_t n, Kind kind) con
 
 bool PromptCache::put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, bool ram_only, int64_t base_n,
                       int64_t saved_by) {
+    return put_impl(std::move(tokens), kind, std::move(state), PagedState(), ram_only, base_n, saved_by);
+}
+
+bool PromptCache::put_paged(std::vector<int32_t> tokens, Kind kind, HostBuffer small, PagedState paged,
+                            bool ram_only, int64_t base_n, int64_t saved_by) {
+    STRIX_CHECK(!paged.empty(), "PromptCache::put_paged: ", tokens.size(),
+                " tokens with no parked record - a whole state goes through put()");
+    STRIX_CHECK(!small.empty(), "PromptCache::put_paged: a paged entry of ", tokens.size(),
+                " tokens with no small-state buffer");
+    // The two halves must be the whole state exactly: the writer gathers from them and cannot notice a byte that
+    // is in neither. (paged_state checked the tiling; this checks what the CALLER brought.)
+    size_t ranges = 0;
+    for (const PagedChunk &c : paged.chunks) {
+        STRIX_CHECK(c.bytes > 0 && c.host != nullptr, "PromptCache::put_paged: a range at state byte ", c.state_off,
+                    " with ", c.bytes, " bytes at host ", static_cast<const void *>(c.host),
+                    " (", tokens.size(), " tokens; expected bytes > 0 and an address)");
+        ranges += c.bytes;
+    }
+    STRIX_CHECK(ranges + small.size() == paged.state_bytes, "PromptCache::put_paged: ", ranges, " parked + ",
+                small.size(), " small bytes, the state is ", paged.state_bytes, " (", tokens.size(), " tokens)");
+    return put_impl(std::move(tokens), kind, std::move(small), std::move(paged), ram_only, base_n, saved_by);
+}
+
+bool PromptCache::put_impl(std::vector<int32_t> tokens, Kind kind, HostBuffer state, PagedState paged, bool ram_only,
+                           int64_t base_n, int64_t saved_by) {
+    const uint64_t page_bytes = paged.bytes();  // RAM this entry holds besides its buffer, until it is given back
     STRIX_CHECK(saved_by >= 0, "PromptCache::put: saved_by request id ", saved_by, ", expected >= 0");
-    STRIX_CHECK(!tokens.empty() && !state.empty(), "PromptCache::put: ", tokens.size(), " tokens, ", state.size(), " state bytes");
+    STRIX_CHECK(!tokens.empty() && !(state.empty() && paged.empty()), "PromptCache::put: ", tokens.size(),
+                " tokens, ", state.size(), " buffer + ", page_bytes, " parked state bytes");
     STRIX_CHECK(kind == Kind::System || kind == Kind::Turn || kind == Kind::Checkpoint, "PromptCache::put: kind ",
                 (uint32_t)kind, ", expected 1..3");
     STRIX_CHECK(base_n >= 0 && base_n < (int64_t)tokens.size() && (base_n == 0 || kind != Kind::System),
                 "PromptCache::put: base of ", base_n, " tokens for a kind ", (uint32_t)kind, " entry of ", tokens.size(),
                 " (a delta is a Turn or a Checkpoint on a shorter base)");
-    std::vector<HostBuffer> trash;
+    Handback hb;
     std::lock_guard<std::mutex> lock(mu_);
     EntryPtr base;
     if (base_n > 0) {
@@ -656,7 +713,8 @@ bool PromptCache::put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, 
             slog(LogLevel::Warning, "prompt cache: dropped a %s-token delta: its %s-token base is gone",
                  fmt_n((long long)tokens.size()).c_str(), fmt_n(base_n).c_str());
             keep_spare_locked(std::move(state));
-            trash.swap(trash_);
+            if (!paged.empty()) retired_.push_back(paged.parked_id), paged = PagedState();  // never stored
+            hb.take(this);
             return false;
         }
         base = entries_[(size_t)b];
@@ -666,14 +724,15 @@ bool PromptCache::put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, 
         Entry &e = *entries_[(size_t)i];
         e.last_used = ++clock_, e.touched_s = now_s(), e.no_room = false;  // already there
         if (!ram_only) e.ram_only = false;  // a request that may continue it wants it on disk too
-        if (e.ram.empty() && !e.dead) {  // on disk only: this copy saves the next hit a read
-            ram_bytes_ += state.capacity();
-            e.ram = std::move(state);
+        if (!e.in_ram() && !e.dead) {  // on disk only: this copy saves the next hit a read
+            ram_bytes_ += state.capacity() + page_bytes;
+            e.ram = std::move(state), e.paged = std::move(paged);
             make_room_locked();
-        } else {
+        } else {  // it has a state already: this copy is surplus, and its pages go back
             keep_spare_locked(std::move(state));
+            if (!paged.empty()) retired_.push_back(paged.parked_id), paged = PagedState();
         }
-        trash.swap(trash_);
+        hb.take(this);
         return true;
     }
     // A new turn or checkpoint replaces the turns it extends (the same conversation, one step further); checkpoints
@@ -711,19 +770,19 @@ bool PromptCache::put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, 
         }
     }
     // The spares to keep ready follow whole states (a delta's few hundred MB would shrink them below the next rebase).
-    if (!base) prefault_bytes_ = state.size() + opt_.prefault_headroom;
+    if (!base) prefault_bytes_ = state.size() + page_bytes + opt_.prefault_headroom;
     auto e = std::make_shared<Entry>();
     e->tokens = std::move(tokens), e->kind = kind, e->last_used = ++clock_, e->touched_s = now_s();
     e->ram_only = ram_only, e->saved_by = saved_by;
     if (base) {
         e->base = base, ++base->dependents;
-        ++stats_.delta_puts, stats_.delta_bytes += (int64_t)state.size();
+        ++stats_.delta_puts, stats_.delta_bytes += (int64_t)(state.size() + page_bytes);
     }
-    ram_bytes_ += state.capacity();
-    e->ram = std::move(state);
+    ram_bytes_ += state.capacity() + page_bytes;
+    e->ram = std::move(state), e->paged = std::move(paged);
     entries_.push_back(std::move(e));
     make_room_locked();
-    trash.swap(trash_);
+    hb.take(this);
     if (opt_.prefault) cv_.notify_one();  // the writer tops the spares up
     return true;
 }
@@ -759,35 +818,124 @@ bool PromptCache::disk_room_locked(uint64_t need, uint64_t last_used) {
         STRIX_CHECK(lru != nullptr, "PromptCache: ", disk_bytes_, " bytes on disk, ", need, " more wanted under a cap of ",
                     cap, ", and no entry left to evict (the evictable count said ", evictable, ")");
         ++stats_.evicted;
-        if (!lru->ram.empty() || lru->queued) unlink_locked(*lru), lru->no_room = true;  // RAM keeps it
+        if (lru->in_ram() || lru->queued) unlink_locked(*lru), lru->no_room = true;  // RAM keeps it
         else remove_locked((size_t)find_locked(lru));
     }
     return true;
 }
 
 uint64_t PromptCache::write_bytes_locked(const Entry &e) const {
-    uint64_t b = file_total(e.tokens.size(), e.ram.size());
-    if (e.base && e.base->path.empty() && !e.base->queued) b += file_total(e.base->tokens.size(), e.base->ram.size());
+    uint64_t b = file_total(e.tokens.size(), e.state_size());
+    if (e.base && e.base->path.empty() && !e.base->queued) b += file_total(e.base->tokens.size(), e.base->state_size());
     return b;
 }
 
 void PromptCache::enqueue_locked(const EntryPtr &e, Why why) {
     // A delta reaches the disk only with its base: the base's write goes first (the queue is FIFO).
     if (e->base && e->base->path.empty() && !e->base->queued) {
-        STRIX_CHECK(!e->base->ram.empty(), "PromptCache: a delta's base of ", e->base->tokens.size(),
+        STRIX_CHECK(e->base->in_ram(), "PromptCache: a delta's base of ", e->base->tokens.size(),
                     " tokens is neither on disk nor in RAM");
         enqueue_locked(e->base, why);
     }
     e->queued = true;
-    const uint64_t bytes = e->ram.size();
+    const uint64_t bytes = e->state_size();
     pending_bytes_ += bytes;
     queue_.push_back({e, why, bytes});
     cv_.notify_one();
 }
 
-bool PromptCache::make_room_for(uint64_t bytes) {
+PromptCache::Spill PromptCache::spill_parked(double max_seconds) {
+    STRIX_CHECK(max_seconds > 0 && max_seconds <= 3600, "PromptCache::spill_parked: max_seconds ", max_seconds,
+                ", expected (0, 3600]");
+    const double t0 = now_s();
+    Spill out;
+    Handback hb;
+    std::unique_lock<std::mutex> lock(mu_);
+    STRIX_CHECK(!shutting_down_ && !stop_, "PromptCache::spill_parked: the cache is shutting down");
+    std::vector<EntryPtr> todo;
+    for (const EntryPtr &e : entries_)
+        if (!e->paged.empty()) todo.push_back(e);
+    std::vector<EntryPtr> gone;  // one-shot entries: never written by design - they leave
+    std::vector<std::pair<EntryPtr, uint64_t>> sent;  // the ones queued, and their parked page bytes
+    for (const EntryPtr &e : todo) {
+        if (e->ram_only) {
+            gone.push_back(e);
+            continue;
+        }
+        sent.emplace_back(e, e->paged.bytes());
+        e->drop_ram = true;  // a refused write (no disk room) removes it rather than keep the pages
+        if (!e->queued && e->path.empty()) enqueue_locked(e, Why::Renew);
+    }
+    for (const EntryPtr &e : gone)
+        if (const int i = find_locked(e.get()); i >= 0) {
+            STRIX_CHECK(e->readers == 0, "PromptCache::spill_parked: a one-shot parked entry of ", e->tokens.size(),
+                        " tokens is being read - nothing should run during a K/V renewal");
+            remove_locked((size_t)i);
+            ++out.dropped;
+        }
+    cv_.notify_all();
+    const auto holds_pages = [&] {
+        for (const EntryPtr &e : entries_)
+            if (!e->paged.empty()) return true;
+        return false;
+    };
+    idle_cv_.wait_for(lock, std::chrono::duration<double>(max_seconds),
+                      [&] { return (queue_.empty() && !writing_) || !holds_pages(); });
+    // What is still paged now could not be written (refused for room, failed) or was still queued at the
+    // deadline: it leaves (a queued job finds it dead and skips it). One under a reader - its write running at
+    // the deadline - cannot: its pages are in use, and it is reported as left.
+    for (size_t i = 0; i < entries_.size();) {
+        const EntryPtr e = entries_[i];
+        if (e->paged.empty()) {
+            ++i;
+            continue;
+        }
+        if (e->readers > 0) {
+            ++out.left, ++i;
+            continue;
+        }
+        remove_locked(i);
+    }
+    for (const auto &[e, b] : sent) {
+        if (!e->dead && !e->path.empty()) ++out.written, out.bytes += b;
+        if (e->dead) ++out.dropped;  // refused for room, failed, or removed just above
+    }
+    out.seconds = now_s() - t0;
+    hb.take(this);
+    return out;
+}
+
+void PromptCache::set_retired_hook(std::function<void()> hook) {
+    std::lock_guard<std::mutex> lock(hook_mu_);
+    retired_hook_ = std::move(hook);
+}
+
+void PromptCache::poke_retired() {
+    bool any = false;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        any = !retired_.empty();
+    }
+    if (!any) return;
+    std::lock_guard<std::mutex> lock(hook_mu_);
+    if (!retired_hook_) return;
+    try {
+        retired_hook_();
+    } catch (const std::exception &e) {
+        slog(LogLevel::Error, "prompt cache: the retired-records hook threw: %s", e.what());
+    }
+}
+
+bool PromptCache::make_room_for(uint64_t bytes, const RetiredRelease &release_retired) {
     STRIX_CHECK(bytes < (1ull << 40), "PromptCache::make_room_for: ", bytes, " bytes, expected < 1 TiB");
     if (bytes == 0) return true;
+    // Parked records already retired go back first (their pages are RAM the reading below should see), then
+    // after every eviction pass. Off-lock: the releaser does HIP work.
+    const auto release_now = [&] {
+        if (!release_retired) return;
+        const std::vector<int64_t> ids = take_retired();
+        if (!ids.empty()) release_retired(ids);
+    };
     // Entries the RAM rule sends to disk give their RAM back only as the writer writes them (seconds), so the first
     // check after the rule often comes up short although the room is on its way - and a refused load re-prefills its
     // whole prompt. So while evicted entries are still being written, wait for them, up to room_wait_seconds; refuse
@@ -797,15 +945,17 @@ bool PromptCache::make_room_for(uint64_t bytes) {
     // tier full of entries free to leave.
     const double deadline = now_s() + opt_.room_wait_seconds;
     for (;;) {
-        const uint64_t avail = mem_available();
-        if (avail >= opt_.ram_margin + bytes) return true;
+        release_now();
+        const uint64_t avail = gov_.available();  // the one reading the rule and the shortfall both see
+        if (gov_.room(avail, bytes)) return true;
         {
-            std::vector<HostBuffer> trash;
+            Handback hb;
             std::lock_guard<std::mutex> lock(mu_);
             make_room_locked(bytes, avail);
-            trash.swap(trash_);
+            hb.take(this);
         }  // the evicted buffers are unmapped here, before MemAvailable is read again
-        if (mem_available() >= opt_.ram_margin + bytes) return true;
+        release_now();  // and the evicted parked records' pages given back
+        if (gov_.room_now(bytes)) return true;  // the evicted buffers were unmapped before this reading
         std::unique_lock<std::mutex> lock(mu_);
         const double left = deadline - now_s();
         if (leaving_bytes_locked() == 0 || left <= 0) {
@@ -822,8 +972,8 @@ std::string PromptCache::ram_summary() const {
     int64_t n = 0, in_use = 0, queued = 0, free_n = 0;
     uint64_t bytes = 0, in_use_b = 0, queued_b = 0, free_b = 0;
     for (const EntryPtr &e : entries_) {
-        if (e->ram.empty()) continue;
-        const uint64_t b = e->ram.capacity();
+        if (!e->in_ram()) continue;
+        const uint64_t b = e->ram_cost();
         ++n, bytes += b;
         if (e->queued) ++queued, queued_b += b;
         else if (e->readers > 0) ++in_use, in_use_b += b;
@@ -839,12 +989,13 @@ std::string PromptCache::ram_summary() const {
 uint64_t PromptCache::leaving_bytes_locked() const {
     uint64_t b = 0;
     for (const EntryPtr &e : entries_)
-        if (e->drop_ram && !e->ram.empty()) b += e->ram.capacity();
+        if (e->drop_ram && e->in_ram()) b += e->ram_cost();
     return b;
 }
 
 void PromptCache::make_room_locked(uint64_t extra, uint64_t avail_in) {
-    const uint64_t avail = avail_in != UINT64_MAX ? avail_in : mem_available(), target = opt_.ram_margin + extra;
+    const uint64_t avail = avail_in != UINT64_MAX ? avail_in : gov_.available();
+    const uint64_t target = gov_.floor() + extra;  // the RAM rule's other half: the governor owns the floor
     if (avail >= target && opt_.ram_tier) return;
     // No RAM tier: every entry that can leave does (need never reaches 0 below).
     uint64_t need = opt_.ram_tier ? target - avail : UINT64_MAX;
@@ -867,10 +1018,10 @@ void PromptCache::make_room_locked(uint64_t extra, uint64_t avail_in) {
         // tokens).
         Entry *lru = nullptr;
         for (const EntryPtr &e : entries_)
-            if (!e->ram.empty() && !e->drop_ram && (e->readers == 0 || e->queued) && (!lru || e->last_used < lru->last_used))
+            if (e->in_ram() && !e->drop_ram && (e->readers == 0 || e->queued) && (!lru || e->last_used < lru->last_used))
                 lru = e.get();
         if (!lru) break;  // the rest is in use or on its way out; the next put tries again
-        if (opt_.ram_tier) need -= std::min(need, (uint64_t)lru->ram.capacity());
+        if (opt_.ram_tier) need -= std::min(need, lru->ram_cost());
         ++stats_.ram_evicted;
         if (lru->queued) {  // written soon: out of RAM after that
             lru->drop_ram = true;
@@ -891,7 +1042,7 @@ void PromptCache::make_room_locked(uint64_t extra, uint64_t avail_in) {
         const uint64_t fs_cap = disk_bytes_ + (free > opt_.disk_free_margin ? free - opt_.disk_free_margin : 0);
         const uint64_t queue_cap = opt_.max_pending_bytes ? opt_.max_pending_bytes
                                                             : std::max(kMaxPendingBytes, 4 * prefault_bytes_);
-        const char *no = pending_bytes_ + lru->ram.size() > queue_cap ? "queue"
+        const char *no = pending_bytes_ + lru->state_size() > queue_cap ? "queue"
                          : total > std::min(max_bytes_, fs_cap)               ? "space"
                          : !spend_budget_locked(total)                        ? "budget"
                                                                               : nullptr;
@@ -909,11 +1060,11 @@ void PromptCache::make_room_locked(uint64_t extra, uint64_t avail_in) {
         const std::string by = lru->saved_by > 0 ? "saved by Request " + std::to_string(lru->saved_by) + ", " : "";
         const std::string deltas = lru->dependents > 0 ? " and its " + fmt_n((long long)lru->dependents) + " deltas" : "";
         slog(level, "prompt cache: dropped a %s entry of %s tokens%s, %s GB (%slast used %s ago)", kind_name(lru->kind),
-             fmt_n((long long)lru->tokens.size()).c_str(), deltas.c_str(), fmt_rate(lru->ram.size() / 1e9, 1).c_str(),
+             fmt_n((long long)lru->tokens.size()).c_str(), deltas.c_str(), fmt_rate(lru->state_size() / 1e9, 1).c_str(),
              by.c_str(), ago(idle).c_str());
         if (opt_.ram_tier)
             slog(level, "%sit had to leave RAM (MemAvailable %s GiB, below the %s GiB margin) and can't go to disk:", kCont,
-                 fmt_rate(avail / (double)(1ull << 30), 1).c_str(), fmt_rate(opt_.ram_margin / (double)(1ull << 30), 0).c_str());
+                 fmt_rate(avail / (double)(1ull << 30), 1).c_str(), fmt_rate(gov_.floor() / (double)(1ull << 30), 0).c_str());
         else
             slog(level, "%sit had to leave RAM (the RAM tier is off: low-memory adapt) and can't go to disk:", kCont);
         if (no[0] == 'q')
@@ -937,11 +1088,11 @@ void PromptCache::summary_locked(double now) {
     if (now - summary_at_ < kSummarySeconds || sig == summary_sig_) return;
     summary_at_ = now, summary_sig_ = sig;
     int64_t ram_n = 0, disk_n = 0;
-    for (const EntryPtr &e : entries_) ram_n += !e->ram.empty(), disk_n += !e->path.empty();
+    for (const EntryPtr &e : entries_) ram_n += e->in_ram(), disk_n += !e->path.empty();
     const double gib = (double)(1ull << 30);
     slog(LogLevel::Debug, "prompt cache: RAM %s entries, %s GB (+ %s GB spare buffers); MemAvailable %s GiB (margin %s)%s%s",
          fmt_n(ram_n).c_str(), fmt_rate(ram_bytes_ / 1e9, 1).c_str(), fmt_rate(spare_bytes_ / 1e9, 1).c_str(),
-         fmt_rate(mem_available() / gib, 1).c_str(), fmt_rate(opt_.ram_margin / gib, 0).c_str(),
+         fmt_rate(gov_.available() / gib, 1).c_str(), fmt_rate(gov_.floor() / gib, 0).c_str(),
          opt_.status_note.empty() ? "" : "; ", opt_.status_note.c_str());
     char budget[64] = "no write budget";
     if (opt_.write_gib_per_hour > 0)
@@ -958,9 +1109,13 @@ void PromptCache::summary_locked(double now) {
 void PromptCache::write_idle_locked(double now) {
     if (shutting_down_) return;
     for (const EntryPtr &e : entries_) {
-        if (e->ram.empty() || !e->path.empty() || e->queued || e->no_room || e->ram_only ||
+        if (!e->in_ram() || !e->path.empty() || e->queued || e->no_room || e->ram_only ||
             now - e->touched_s < opt_.idle_seconds)
             continue;
+        // A paged entry under a read is being RESUMED: the hand maps its parked pages into a slot and takes
+        // the parked mapping down, so a gather started now would read pages that are leaving the address
+        // space. (The RAM half of an ordinary pinned entry is immutable - a paged one is not.) Next scan.
+        if (!e->paged.empty() && e->readers > 0) continue;
         const uint64_t total = write_bytes_locked(*e);
         const uint64_t free = disk_free();
         const uint64_t fs_cap = disk_bytes_ + (free > opt_.disk_free_margin ? free - opt_.disk_free_margin : 0);
@@ -974,7 +1129,7 @@ uint64_t PromptCache::prefault_want_locked() const {
     int ready = 0;
     for (const HostBuffer &b : spares_) ready += b.capacity() >= prefault_bytes_;
     if (ready >= opt_.max_spares) return 0;
-    if (mem_available() < opt_.ram_margin + prefault_bytes_) return 0;  // never into memory pressure
+    if (!gov_.room_now(prefault_bytes_)) return 0;  // never into memory pressure
     return prefault_bytes_;
 }
 
@@ -992,7 +1147,7 @@ PromptCacheStats PromptCache::stats() const {
     std::lock_guard<std::mutex> lock(mu_);
     PromptCacheStats s = stats_;
     s.entries = (int64_t)entries_.size();
-    for (const EntryPtr &e : entries_) s.ram_entries += !e->ram.empty(), s.disk_entries += !e->path.empty();
+    for (const EntryPtr &e : entries_) s.ram_entries += e->in_ram(), s.disk_entries += !e->path.empty();
     s.ram_bytes = (int64_t)ram_bytes_, s.spare_bytes = (int64_t)spare_bytes_;
     s.bytes = (int64_t)disk_bytes_, s.max_bytes = (int64_t)max_bytes_;
     s.pending = (int64_t)queue_.size();
@@ -1027,10 +1182,10 @@ void PromptCache::writer() {
                     }
                     keep_spare_locked(std::move(b));
                     ++stats_.prefaulted;
-                    std::vector<HostBuffer> trash;
-                    trash.swap(trash_);
+                    Handback hb;
+                    hb.take(this);
                     lock.unlock();
-                    trash.clear();
+                    hb.trash.clear();
                     lock.lock();
                     continue;
                 }
@@ -1057,22 +1212,23 @@ void PromptCache::writer() {
             write_entry(job);
         } catch (const std::exception &e) {
             slog(LogLevel::Error, "prompt cache: write failed: %s", e.what());
-            std::vector<HostBuffer> trash;
+            Handback hb;
             std::lock_guard<std::mutex> lock(mu_);
             ++stats_.write_failures;
             // An eviction's entry can't stay in RAM (that's why it left) and has no file: it's gone.
             if (job.e->drop_ram && !job.e->dead)
                 if (const int i = find_locked(job.e.get()); i >= 0) remove_locked((size_t)i);
-            trash.swap(trash_);
+            hb.take(this);
         }
         {
-            std::vector<HostBuffer> trash;
+            Handback hb;
             std::lock_guard<std::mutex> lock(mu_);
             writing_ = false;
             job.e.reset();
-            trash.swap(trash_);
+            hb.take(this);
         }
         idle_cv_.notify_all();
+        poke_retired();  // an eviction write's record retired once its file was complete
     }
 }
 
@@ -1080,8 +1236,8 @@ void PromptCache::watch_margin(std::unique_lock<std::mutex> &lock) {
     STRIX_CHECK(lock.owns_lock(), "PromptCache::watch_margin: called without the cache's lock");
     // Off: no RAM tier keeps nothing to evict; shutting down, the shutdown rule writes RAM entries itself.
     if (!opt_.ram_tier || shutting_down_ || stop_) return;
-    const uint64_t avail = mem_available();
-    if (avail >= opt_.ram_margin) return;
+    const uint64_t avail = gov_.available();
+    if (gov_.room(avail, 0)) return;
     const int64_t before = stats_.ram_evicted;
     const uint64_t ram_before = ram_bytes_ + spare_bytes_;
     make_room_locked(opt_.ram_watch_headroom);
@@ -1093,13 +1249,114 @@ void PromptCache::watch_margin(std::unique_lock<std::mutex> &lock) {
     if (n > 0 || freed > 0)
         slog(LogLevel::Info, "prompt cache: MemAvailable %s GiB, below the %s GiB margin between saves (another "
              "process grew): %s entries leave RAM, %s GB freed now (queued writes free theirs once written)",
-             fmt_rate(avail / gib, 1).c_str(), fmt_rate(opt_.ram_margin / gib, 0).c_str(), fmt_n((long long)n).c_str(),
+             fmt_rate(avail / gib, 1).c_str(), fmt_rate(gov_.floor() / gib, 0).c_str(), fmt_n((long long)n).c_str(),
              fmt_rate(freed / 1e9, 1).c_str());
-    std::vector<HostBuffer> trash;
-    trash.swap(trash_);
+    Handback hb;
+    hb.take(this);
     lock.unlock();
-    trash.clear();  // unmapped outside the lock
+    hb.trash.clear();  // unmapped outside the lock
+    poke_retired();    // parked records this pass retired: an idle owner drains them now, not at its next request
     lock.lock();
+}
+
+bool PromptCache::with_paged(const std::vector<int32_t> &prompt, int64_t n,
+                             const std::function<void(const HostBuffer &, const PagedState &)> &use, bool consumed) {
+    STRIX_CHECK(n >= 1 && static_cast<size_t>(n) <= prompt.size(), "PromptCache::with_paged: ", n,
+                " tokens of a ", prompt.size(), "-token prompt");
+    STRIX_CHECK(static_cast<bool>(use), "PromptCache::with_paged: no consumer");
+    EntryPtr e;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (const int i = find_locked(prompt.data(), n); i >= 0) {
+            Entry &f = *entries_[(size_t)i];
+            // Pinned for the call: an eviction or a finishing write must not take the pages back from under a
+            // resume that is mapping them (the same reason a RAM read holds its readers count - strixite #14).
+            if (!f.paged.empty() && f.readers == 0 && !f.queued) {
+                f.last_used = ++clock_, f.touched_s = now_s(), f.no_room = false;
+                ++f.readers, e = entries_[(size_t)i];
+            }
+        }
+    }
+    if (!e) return false;  // no entry, on disk (its file has the whole state), or a write has it
+    try {
+        use(e->ram, e->paged);
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(mu_);
+        release_locked(*e);
+        throw;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    if (consumed) {
+        // The record is spent: `use` mapped its pages into a slot as that conversation's live K/V. The entry
+        // can hold neither half - the pages are not the cache's RAM any more and the small bytes alone are not
+        // a state - so what survives of it is its file, or nothing. No retired id: the record was spent by
+        // the resume, not left over for its owner to release (a second with_paged on the spent id would have
+        // failed the next request in resume_paged - this is what makes a parked entry good for one resume).
+        const uint64_t held = e->ram_cost();  // both halves leave the RAM tally right now (read before clearing)
+        e->paged = PagedState();
+        ram_bytes_ -= held;
+        if (e->ram.capacity() > 0) trash_.push_back(std::move(e->ram));  // unmapped off-lock
+        if (e->path.empty() && !e->dead && !e->queued) {
+            // No file yet: the state this entry described now lives only in the slot's pages - it goes (a
+            // miss later, never a half state; the next turn's save replaces it anyway).
+            if (const int i = find_locked(e.get()); i >= 0) remove_locked(static_cast<size_t>(i), false);
+        }
+    }
+    release_locked(*e);
+    return true;
+}
+
+std::vector<int64_t> PromptCache::take_retired() {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::vector<int64_t> out;
+    out.swap(retired_);
+    return out;
+}
+
+uint64_t PromptCache::write_paged_state(int fd, const Entry &e, uint64_t state_at, const std::string &path) const {
+    const PagedState &pg = e.paged;
+    STRIX_CHECK(!pg.chunks.empty() && pg.state_bytes >= 1, path, ": a paged entry with no ranges");
+    StrixHasher hash(pg.state_bytes);
+    constexpr size_t kPiece = 64ull << 10;  // a few syscalls per GB, a buffer that is not a second state
+    HostBuffer scratch(kPiece);
+    // The pack in order: whatever the next chunk does not cover comes from the small buffer. Both cursors only
+    // move forward, and every byte written is a byte of one of the two - so the sums at the end are the check
+    // that the two halves really tiled the state and nothing was read from a hole.
+    // A range may straddle a piece: inside one (state_off <= at < its end) the read continues at its offset.
+    for (size_t k = 0; k < pg.chunks.size(); ++k)
+        STRIX_CHECK(pg.chunks[k].bytes > 0 && pg.chunks[k].host != nullptr, path, ": paged range ", k, " of ",
+                    pg.chunks.size(), " at state byte ", pg.chunks[k].state_off, " has ", pg.chunks[k].bytes,
+                    " bytes", pg.chunks[k].host ? "" : " and no host address", " (expected bytes > 0 and an address)");
+    size_t at = 0, small_at = 0, ci = 0;
+    auto fill = [&](uint8_t *dst, size_t want) {
+        for (size_t got = 0; got < want;) {
+            const bool from_chunk = ci < pg.chunks.size() && at >= pg.chunks[ci].state_off;
+            const size_t upto = from_chunk ? pg.chunks[ci].state_off + pg.chunks[ci].bytes
+                                           : (ci < pg.chunks.size() ? pg.chunks[ci].state_off : pg.state_bytes);
+            STRIX_CHECK(at < upto, path, ": nothing covers state byte ", at, " of the paged entry");
+            const size_t take = std::min({upto - at, want - got, pg.state_bytes - at});
+            STRIX_CHECK(from_chunk || small_at + take <= e.ram.size(), path, ": state byte ", at, " wants small bytes [",
+                        small_at, ", +", take, "), the entry has ", e.ram.size());
+            const uint8_t *src = from_chunk ? pg.chunks[ci].host + (at - pg.chunks[ci].state_off) : e.ram.data() + small_at;
+            std::memcpy(dst + got, src, take);
+            got += take, at += take;
+            if (from_chunk) {
+                if (at == pg.chunks[ci].state_off + pg.chunks[ci].bytes) ++ci;  // that range is spent
+            } else small_at += take;
+        }
+    };
+    for (uint64_t off = 0; off < pg.state_bytes; off += scratch.capacity()) {
+        const size_t real = static_cast<size_t>(std::min<uint64_t>(scratch.capacity(), pg.state_bytes - off));
+        std::memset(scratch.data(), 0, scratch.capacity());  // past `real` is padding the truncate cuts away
+        fill(scratch.data(), real);
+        hash.update(scratch.data(), real);  // the padding is not part of the state, and is not hashed
+        write_all(fd, scratch.data(), align4k(real), state_at + off, path);
+    }
+    STRIX_CHECK(at == pg.state_bytes && ci == pg.chunks.size(), path, ": the paged state came to ", at,
+                " bytes over ", ci, " of ", pg.chunks.size(), " ranges");
+    STRIX_CHECK(small_at == e.ram.size(), path, ": the paged state used ", small_at, " small bytes, the entry has ",
+                e.ram.size());
+    return hash.final();
 }
 
 void PromptCache::write_entry(Job &job) {
@@ -1108,25 +1365,25 @@ void PromptCache::write_entry(Job &job) {
     uint64_t n = 0, total = 0, state_at = 0, state_bytes = 0, base_n = 0;
     bool releasing = false;  // set under the lock below: whether this write's source is being thrown away
     {
-        std::vector<HostBuffer> trash;
+        Handback hb;
         std::lock_guard<std::mutex> lock(mu_);
         e.queued = false;
-        if (e.dead || !e.path.empty() || e.ram.empty()) return;  // replaced / written / gone meanwhile
+        if (e.dead || !e.path.empty() || !e.in_ram()) return;  // replaced / written / gone meanwhile
         if (e.base && e.base->path.empty()) {  // its base's write failed or was refused: a delta file alone is useless
             ++stats_.rejected_space;
             e.no_room = true;
             if (e.drop_ram) remove_locked((size_t)find_locked(&e));
-            trash.swap(trash_);
+            hb.take(this);
             return;
         }
         base_n = e.base ? e.base->tokens.size() : 0;
-        n = e.tokens.size(), state_bytes = e.ram.size();
+        n = e.tokens.size(), state_bytes = e.state_size();
         state_at = align4k(kHeaderBytes + n * 4), total = state_at + state_bytes;
         if (!disk_room_locked(total, e.last_used)) {
             ++stats_.rejected_space;
             e.no_room = true;
             if (e.drop_ram) remove_locked((size_t)find_locked(&e));
-            trash.swap(trash_);
+            hb.take(this);
             return;
         }
         // An eviction: its RAM goes back as its bytes are written (not all at the end) - unless a reader holds it, and
@@ -1136,6 +1393,7 @@ void PromptCache::write_entry(Job &job) {
         ++e.readers;  // the RAM copy stays put while the file is written
         e.queued = true;
     }
+    const uint64_t parked_bytes = e.paged.bytes();  // for the log line: this write's whole point
     const uint64_t token_hash = strix_hash64(e.tokens.data(), n * 4);
     char name[64];
     std::snprintf(name, sizeof name, "%016llx-%llu.pcache", (unsigned long long)token_hash, (unsigned long long)n);
@@ -1156,12 +1414,16 @@ void PromptCache::write_entry(Job &job) {
         auto put = [&](size_t off, auto v) { std::memcpy(h + off, &v, sizeof(v)); };
         std::memcpy(h, kMagic, 8);
         put(8, kVersion), put(12, (uint32_t)e.kind), put(16, n), put(24, state_bytes), put(32, state_at);
-        put(40, token_hash), put(48, strix_hash64(e.ram.data(), state_bytes));
+        // The state's hash: the whole-buffer path has it before it writes. A paged entry's bytes are gathered as
+        // they go out, so its header - the one thing that must carry that hash - is written AFTER its state.
+        put(40, token_hash);
+        const bool paged = !e.paged.empty();
+        if (!paged) put(48, strix_hash64(e.ram.data(), state_bytes));
         std::memcpy(h + kFpAt, fingerprint_.data(), fingerprint_.size());
         put(kBaseAt, base_n);
         put(kHeaderHashAt, strix_hash64(h, kHeaderHashAt));
         std::memcpy(h + kHeaderBytes, e.tokens.data(), n * 4);
-        if (tail) std::memcpy(h + state_at, e.ram.data() + body, tail);
+        if (tail && !paged) std::memcpy(h + state_at, e.ram.data() + body, tail);
         const int fd = ::open(partial.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_DIRECT, 0644);
         STRIX_CHECK(fd >= 0, partial, ": create failed: ", std::strerror(errno));
         try {
@@ -1170,10 +1432,16 @@ void PromptCache::write_entry(Job &job) {
                 flags |= FS_NOCOMP_FL;
                 (void)::ioctl(fd, FS_IOC_SETFLAGS, &flags);
             }
-            write_all(fd, h, state_at, 0, partial);
-            if (releasing) released = write_all_releasing(fd, e.ram, body, state_at, partial);
-            else write_all(fd, e.ram.data(), body, state_at, partial);
-            if (tail) write_all(fd, h + state_at, 4096, state_at + body, partial);
+            if (!paged) {
+                write_all(fd, h, state_at, 0, partial);
+                if (releasing) released = write_all_releasing(fd, e.ram, body, state_at, partial);
+                else write_all(fd, e.ram.data(), body, state_at, partial);
+                if (tail) write_all(fd, h + state_at, 4096, state_at + body, partial);
+            } else {
+                put(48, write_paged_state(fd, e, state_at, partial));
+                put(kHeaderHashAt, strix_hash64(h, kHeaderHashAt));
+                write_all(fd, h, state_at, 0, partial);  // 4 KiB at 0: aligned, it lands in front of the state
+            }
             STRIX_CHECK(::ftruncate(fd, (off_t)total) == 0, partial, ": truncate to ", total, " bytes failed: ",
                         std::strerror(errno));
             STRIX_CHECK(::fsync(fd) == 0, partial, ": fsync failed: ", std::strerror(errno));
@@ -1191,17 +1459,31 @@ void PromptCache::write_entry(Job &job) {
         release_locked(e);
         throw;
     }
-    std::vector<HostBuffer> trash;
+    Handback hb;
     std::lock_guard<std::mutex> lock(mu_);
     e.queued = false, e.releasing = false;
     if (e.dead) {  // replaced while it was written: the file goes too
         std::error_code ec;
         fs::remove(path, ec);
     } else if (ok) {
+        if (!e.paged.empty()) {
+            // Its file has the state now, so holding the copy is pure cost: the pages go back to their owner and
+            // the small bytes with them (half a state is not a state - with_state would refuse it anyway). If a
+            // read took it meanwhile the drop defers to its last release, as a whole entry's eviction does
+            // (strixite #14) - the pages must not go while someone is mapping them into a slot.
+            e.drop_ram = true;
+            if (e.readers == 1) drop_ram_locked(e, true);
+        }
         e.path = path, e.file_bytes = total;
         disk_bytes_ += total;
         const std::string by = e.saved_by > 0 ? " (saved by Request " + std::to_string(e.saved_by) + ")" : "";
-        const std::string freeing = releasing && released > 0 ? ", " + fmt_rate(released / 1e9, 1) + " GB gave back RAM as it wrote" : "";
+        const std::string freeing =
+            releasing && released > 0
+                ? ", " + fmt_rate(released / 1e9, 1) + " GB gave back RAM as it wrote"
+                : parked_bytes > 0
+                      ? ", " + fmt_rate(parked_bytes / 1e9, 1) + " GB of parked pages given back (that parked "
+                        "generation's addresses are spent)"
+                      : "";
         slog(LogLevel::Debug, "prompt cache: wrote a %s entry of %s tokens%s to disk, %s MB in %s s%s", kind_name(e.kind),
              fmt_n((long long)n).c_str(), by.c_str(), fmt_rate(total / 1e6, 0).c_str(), fmt_rate(now_s() - t0, 2).c_str(),
              freeing.c_str());
@@ -1209,6 +1491,7 @@ void PromptCache::write_entry(Job &job) {
         slog(LogLevel::Debug, "%swhy: %s%s", kCont,
              job.why == Why::Idle    ? ("unused for " + ago(now_s() - e.touched_s)).c_str()
              : job.why == Why::Evict ? "leaving RAM (MemAvailable below the margin)"
+             : job.why == Why::Renew ? "the K/V budget renews (the parked pages go with the old session)"
                                      : "server shutdown",
              delta.c_str());
         if (e.drop_ram && e.readers > 1)
@@ -1217,8 +1500,11 @@ void PromptCache::write_entry(Job &job) {
     }
     release_locked(e);  // the last reader's release also finishes a deferred drop_ram (see release_locked)
     ++stats_.writes, stats_.bytes_written += (int64_t)total, stats_.write_seconds += now_s() - t0;
-    (job.why == Why::Evict ? stats_.writes_evict : job.why == Why::Idle ? stats_.writes_idle : stats_.writes_shutdown)++;
-    trash.swap(trash_);
+    (job.why == Why::Evict    ? stats_.writes_evict
+     : job.why == Why::Idle   ? stats_.writes_idle
+     : job.why == Why::Renew  ? stats_.writes_renew
+                              : stats_.writes_shutdown)++;
+    hb.take(this);
 }
 
 }  // namespace strix

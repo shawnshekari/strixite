@@ -79,6 +79,11 @@ void send_error(httplib::Response &res, int status, const std::string &msg, cons
     res.set_content(error_body(msg, type, param), "application/json");
 }
 
+// A request the engine failed: the spent K/V generation budget is 503 with its own error type (the server is up
+// and serves the conversation its slot holds; a restart reclaims the budget), anything else 500 server_error.
+int engine_error_status(const GenerationResult &r) { return r.error_type == kErrorKvBudget ? 503 : 500; }
+std::string engine_error_type(const GenerationResult &r) { return r.error_type.empty() ? "server_error" : r.error_type; }
+
 // A request answered with an error before reaching the engine (no block - one line): 4xx the client's (warning),
 // 5xx the server's (error).
 void log_error(int64_t id, const httplib::Request &req, int status, const std::string &msg) {
@@ -363,7 +368,8 @@ void HttpServer::routes() {
                     }
                 if (it.kind == QueueSink::Item::Kind::Done) break;
             }
-            if (it.result.finish_reason == "error") return send_error(res, 500, it.result.error, "server_error");
+            if (it.result.finish_reason == "error")
+                return send_error(res, engine_error_status(it.result), it.result.error, engine_error_type(it.result));
             res.set_content(completion_body(meta, reasoning, content, calls, it.result, clamped), "application/json");
             return;
         }
@@ -434,7 +440,7 @@ void HttpServer::routes() {
                 case QueueSink::Item::Kind::Done: {
                     const GenerationResult &r = it.result;
                     if (r.finish_reason == "error") {
-                        send(error_body(r.error, "server_error", ""));
+                        send(error_body(r.error, engine_error_type(r), ""));
                     } else if (r.finish_reason != "cancelled") {
                         send(chunk_body(meta, json::Value::object(), r.finish_reason.c_str()));
                         send(usage_chunk_body(meta, r, clamped));
@@ -514,7 +520,8 @@ void HttpServer::routes() {
                         if (e.is_text()) text += e.text;
                 if (it.kind == QueueSink::Item::Kind::Done) break;
             }
-            if (it.result.finish_reason == "error") return send_error(res, 500, it.result.error, "server_error");
+            if (it.result.finish_reason == "error")
+                return send_error(res, engine_error_status(it.result), it.result.error, engine_error_type(it.result));
             res.set_content(text_completion_body(meta, text, it.result, clamped), "application/json");
             return;
         }
@@ -550,7 +557,7 @@ void HttpServer::routes() {
                 case QueueSink::Item::Kind::Done: {
                     const GenerationResult &r = it.result;
                     if (r.finish_reason == "error") {
-                        frame("data: " + error_body(r.error, "server_error", "") + "\n\n");
+                        frame("data: " + error_body(r.error, engine_error_type(r), "") + "\n\n");
                     } else if (r.finish_reason != "cancelled") {
                         frame("data: " + text_chunk_body(meta, "", r.finish_reason.c_str()) + "\n\n");
                         frame("data: " + text_usage_chunk_body(meta, r, clamped) + "\n\n");
@@ -585,8 +592,55 @@ void HttpServer::routes() {
         json::Value b = json::Value::object();
         // After a GpuFatalError: 503 and the error, until the process exits (strix_server) or forever (no on_fatal).
         if (!fatal.empty()) res.status = 503;
-        b.set("status", json::Value::string(fatal.empty() ? "ok" : "error"));
+        // The K/V generation budget (kv-generations): what is left of it, and "degraded" (HTTP 200 - the server
+        // is up and serves what its slots hold) once a slot's next switch would be refused, the shared parked
+        // budget is spent (switches then save copies), or a request was refused. Only a restart reclaims; the
+        // gauges in /metrics say the same over time.
+        const BackendStats bs = engine_.backend_stats();
+        const std::string kv_refusal = engine_.kv_budget_refusal();
+        std::vector<std::string> kv_reasons;
+        json::Value kv = json::Value::object();
+        if (!bs.kv_generation_capacity.empty() && bs.kv_generation_capacity[0] > 1) {
+            json::Value left = json::Value::array();
+            for (size_t k = 0; k < bs.kv_generation_used.size() && k < bs.kv_generation_capacity.size(); ++k) {
+                const int64_t l = bs.kv_generation_capacity[k] - 1 - bs.kv_generation_used[k];
+                left.push(json::Value::integer(l));
+                if (l <= 0)
+                    kv_reasons.push_back(cat("slot ", k, " is at K/V generation ", bs.kv_generation_used[k], " of ",
+                                             bs.kv_generation_capacity[k], " (its last): it serves only the "
+                                             "conversation it holds"));
+            }
+            kv.set("generations_left", std::move(left));
+            kv.set("generations_capacity", json::Value::integer(bs.kv_generation_capacity[0]));
+            if (bs.parked_generation_capacity >= 0) {
+                const int64_t pl = bs.parked_generation_capacity - bs.parked_generation_used;
+                kv.set("parked_left", json::Value::integer(pl));
+                if (pl <= 0)
+                    kv_reasons.push_back(cat("the parked budget is spent (", bs.parked_generation_used, " of ",
+                                             bs.parked_generation_capacity, "): a switch saves a copy, not pages"));
+            }
+        }
+        if (!kv_refusal.empty()) kv_reasons.push_back("a request was refused: " + kv_refusal);
+        if (!kv.as_object("kv_budget").empty() || s.kv_renewals > 0 || s.kv_renew_failures > 0) {
+            kv.set("renewals", json::Value::integer(s.kv_renewals));  // soft K/V resets since startup
+            if (s.kv_renew_failures > 0) {
+                kv.set("renew_failures", json::Value::integer(s.kv_renew_failures));
+                kv_reasons.push_back("a soft K/V reset failed (the log says why): a restart reclaims the budget");
+            }
+        }
+        const bool kv_degraded = !kv_reasons.empty();
+        if (kv_degraded) {
+            json::Value why = json::Value::array();
+            for (const std::string &r : kv_reasons) why.push(json::Value::string(r));
+            kv.set("degraded", std::move(why));
+            kv.set("action", json::Value::string(engine_.kv_renew_available()
+                                                     ? "none: the session renews itself (the soft K/V reset) once the "
+                                                       "running requests finish"
+                                                     : "restart the server to reclaim the K/V generation budget"));
+        }
+        b.set("status", json::Value::string(!fatal.empty() ? "error" : kv_degraded ? "degraded" : "ok"));
         if (!fatal.empty()) b.set("error", json::Value::string(fatal));
+        if (!kv.as_object("kv_budget").empty()) b.set("kv_budget", std::move(kv));
         if (!engine_.degraded().empty()) b.set("degraded", json::Value::string(engine_.degraded()));
         b.set("model", json::Value::string(cfg_.model_id));
         b.set("backend", json::Value::string(engine_.backend().describe()));
@@ -742,16 +796,41 @@ void HttpServer::routes() {
         metric("strix_verify_batches_total", "counter", "Batched MTP verifies across slots.", (double)s.verify_batches);
         metric("strix_verify_batch_runs_total", "counter",
                "Slots' runs in those batched verifies (/ batches = runs per batched forward).", (double)s.verify_batch_runs);
-        metric("strix_verify_solo_mrope_total", "counter",
-               "Verifies that ran alone because the conversation carries mRoPE position state (it ran an image, "
-               "or resumed one): a multi-run forward takes scalar positions only, so that conversation never "
-               "shares a batch (issue #29).",
-               (double)s.verify_solo_mrope);
+        metric("strix_verify_alone_total", "counter",
+               "Verifies run alone because their conversation holds image rows (a shared forward takes scalar "
+               "positions only).", (double)s.verify_alone);
         metric("strix_idle_seconds", "gauge",
                "Seconds since the last request finished; 0 while one runs or waits. Batch clients: wait for a gap here.",
                s.idle_seconds);
         metric("strix_live_tokens", "gauge", "Tokens held across all slots.", (double)s.live_tokens);
-        metric("strix_context_length", "gauge", "Positions the session holds.", (double)engine_.capacity());
+        metric("strix_kv_generation_used", "gauge", "K/V generation each slot is mapped in (one spent per "
+               "conversation switch; capacity next to exhaustion, which refuses new conversations cleanly).",
+               bs.kv_generation_used.empty() ? 0.0 : (double)bs.kv_generation_used[0],
+               "{slot=\"0\"}");
+        for (size_t k = 1; k < bs.kv_generation_used.size(); ++k) {
+            const std::string l = "{slot=\"" + std::to_string(k) + "\"}";
+            sample("strix_kv_generation_used", l.c_str(), (double)bs.kv_generation_used[k]);
+        }
+        metric("strix_kv_generation_capacity", "gauge", "K/V generations the slot's reservation holds "
+               "(kv-generations; -1: the backend has no generation cursor).",
+               bs.kv_generation_capacity.empty() ? -1.0 : (double)bs.kv_generation_capacity[0],
+               "{slot=\"0\"}");
+         for (size_t k = 1; k < bs.kv_generation_capacity.size(); ++k) {
+             const std::string l = "{slot=\"" + std::to_string(k) + "\"}";
+             sample("strix_kv_generation_capacity", l.c_str(), (double)bs.kv_generation_capacity[k]);
+         }
+         metric("strix_parked_generation_used", "gauge", "Parked K/V generations taken (one shared budget across "
+                "slots, one per park; a resume or eviction never returns one - capacity next to exhaustion, which "
+                "refuses a park cleanly).", (double)bs.parked_generation_used);
+         metric("strix_parked_generation_capacity", "gauge", "Parked generations the reservation holds "
+                "(= kv-generations, the shared budget; -1: the backend has no parked budget).",
+                (double)bs.parked_generation_capacity);
+         metric("strix_kv_renewals_total", "counter", "Soft K/V resets: the session rebuilt on the loaded model "
+                "when the generation budget neared its end (kv-renew-margin); the generation gauges start over at "
+                "each.", (double)s.kv_renewals);
+         metric("strix_kv_renew_failures_total", "counter", "Soft K/V resets that failed (no further one runs in "
+                "this process; exhaustion then refuses until a restart).", (double)s.kv_renew_failures);
+         metric("strix_context_length", "gauge", "Positions the session holds.", (double)engine_.capacity());
         metric("strix_prompt_cache_disk_hits_total", "counter", "Requests resumed from the prompt cache (RAM or disk).", (double)s.disk_hits);
         metric("strix_prompt_cache_disk_tokens_total", "counter", "Prompt tokens restored from the prompt cache.", (double)s.disk_tokens);
         metric("strix_prompt_cache_export_seconds_total", "counter", "Time copying states out for the prompt cache.", s.export_seconds);

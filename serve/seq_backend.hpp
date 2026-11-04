@@ -70,30 +70,17 @@ public:
     struct Stats {
         int64_t verify_batches = 0, verify_runs = 0;  // batched verify forwards and the runs they carried
         int64_t max_runs = 0;                         // the most runs one batch carried
-        // Runs that went alone on a slot that can never share a forward, because its state carries mRoPE position
-        // state (an image in the conversation): the batching this build refuses to do, counted rather than
-        // inferred from batches and runs. What strix_verify_solo_mrope_total and the block's "batching" row read.
-        int64_t verify_solo_mrope = 0;
+        int64_t verify_alone = 0;  // verifies run alone because their seq isn't batchable (image rows: mRoPE)
     };
     Stats stats() const;
-
-    // One conversation's last decode window (its set_decoding(true) .. (false)): how its verifies ran. A request's
-    // block reads it once the window is closed.
-    struct VerifyWindow {
-        int64_t shared = 0;      // verifies that shared a forward with another slot's run
-        int64_t solo_mrope = 0;  // verifies that ran alone because the slot cannot share one (mRoPE)
-    };
-    VerifyWindow verify_window(int seq) const;
 
 private:
     struct Pending {
         LmBackend::VerifyRun run;
         bool cands = false;
         int64_t n_valid = 0;
-        // Asked of the backend as the run comes in (LmBackend::batchable): false when the slot's state carries
-        // mRoPE position state, which a multi-run forward refuses - this run then goes by itself.
-        bool batchable = true;
         double since = 0;
+        bool batchable = true;  // LmBackend::batchable(seq) when the verify arrived: false runs alone
         bool done = false;
         LogitRows rows;
         std::exception_ptr error;
@@ -127,8 +114,6 @@ private:
     // chain away) instead of timing out on it.
     std::multiset<int> drafts_waiting_;
     std::vector<int64_t> last_call_batch_;  // per seq: stats_.verify_batches when its last call ran
-    std::vector<VerifyWindow> window_;  // per seq: its last decode window, zeroed when the window opens
-    std::vector<char> solo_announced_;  // per seq: the exclusion has been logged (its reset lets it be logged again)
 };
 
 // One slot's view of the shared backend: LmBackend's single-conversation calls, mapped to seq's.
@@ -136,8 +121,6 @@ class SeqBackend : public LmBackend {
 public:
     SeqBackend(GpuArbiter &arb, int seq);
     int seq() const { return seq_; }
-    // This slot last decode window, for the batching row of its request block.
-    GpuArbiter::VerifyWindow verify_window() const { return arb_.verify_window(seq_); }
 
     int64_t capacity() const override { return be().capacity(); }
     int64_t max_chunk() const override { return be().max_chunk(); }
@@ -171,6 +154,14 @@ public:
     void export_snapshot(int slot, HostBuffer &out, int64_t from = 0) override;
     uint64_t snapshot_bytes(int slot, int64_t from = 0) const override;
     void import_state(const HostBuffer &state, int64_t n, int64_t from = 0) override;
+    // The paged seam, through the arbiter like any other GPU call (parking and releasing are HIP work on the
+    // session's reservation - they must not run beside another sequence's step).
+    bool paged_states() const override { return arb_.backend().paged_states(); }
+    PagedSnapshot park_snapshot(int slot) override;
+    void resume_paged(const HostBuffer &small, const PagedState &paged, int64_t n) override;
+    void release_parked(int64_t parked_id) override;
+    // A read, so a Hint: poisoned false = take the host-copy route (the safe default when the GPU is poisoned).
+    bool park_budget_left() const override;
     std::string state_fingerprint() const override { return be().state_fingerprint(); }
     std::string describe() const override { return be().describe() + ", seq " + std::to_string(seq_); }
 

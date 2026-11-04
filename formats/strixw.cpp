@@ -192,29 +192,59 @@ std::vector<StrixwComponent> strixw_components(const StrixwTensor &t) {
     return {};
 }
 
-uint64_t strix_hash64(const void *data, size_t n) {
-    const auto *p = static_cast<const uint8_t *>(data);
-    uint64_t h[4] = {n ^ kK1, n ^ kK2, ~n ^ kK1, ~n ^ kK2};
-    size_t i = 0;
-    for (; i + 32 <= n; i += 32) {
-        uint64_t w[4];
-        std::memcpy(w, p + i, 32);
-        h[0] = mix(h[0], w[0]), h[1] = mix(h[1], w[1]), h[2] = mix(h[2], w[2]), h[3] = mix(h[3], w[3]);
+StrixHasher::StrixHasher(size_t n) : total_(n) {
+    h_[0] = n ^ kK1, h_[1] = n ^ kK2, h_[2] = ~n ^ kK1, h_[3] = ~n ^ kK2;
+}
+
+void StrixHasher::consume_block(const uint8_t *p) {
+    uint64_t w[4];
+    std::memcpy(w, p, 32);
+    h_[0] = mix(h_[0], w[0]), h_[1] = mix(h_[1], w[1]), h_[2] = mix(h_[2], w[2]), h_[3] = mix(h_[3], w[3]);
+}
+
+void StrixHasher::update(const void *data, size_t len) {
+    STRIX_CHECK(fed_ + len <= total_, "StrixHasher: update of ", len, " bytes with ", fed_, " of ", total_,
+                " already fed - more than the length the hasher was made for");
+    const uint8_t *p = static_cast<const uint8_t *>(data);
+    if (len == 0) return;
+    if (!carry_.empty()) {  // top the partial block up, then consume the caller's whole blocks directly
+        const size_t take = std::min(len, (size_t)32 - carry_.size());
+        carry_.insert(carry_.end(), p, p + take);
+        p += take, len -= take, fed_ += take;
+        if (carry_.size() == 32) consume_block(carry_.data()), carry_.clear();
     }
-    for (int lane = 0; i + 8 <= n; i += 8, ++lane) {
+    while (len >= 32) consume_block(p), p += 32, len -= 32, fed_ += 32;
+    if (len > 0) carry_.insert(carry_.end(), p, p + len), fed_ += len;
+}
+
+uint64_t StrixHasher::final() {
+    STRIX_CHECK(fed_ == total_, "StrixHasher::final: ", fed_, " of ", total_, " bytes fed - the state is short");
+    STRIX_CHECK(carry_.size() < 32, "StrixHasher::final: ", carry_.size(), " bytes carried (a full block was "
+                "never consumed - an update bug)");
+    const uint8_t *p = carry_.data();
+    size_t i = 0;
+    for (int lane = 0; i + 8 <= carry_.size(); i += 8, ++lane) {
         uint64_t w;
         std::memcpy(&w, p + i, 8);
-        h[lane] = mix(h[lane], w);
+        h_[lane] = mix(h_[lane], w);
     }
-    if (i < n) {
+    if (i < carry_.size()) {
         uint64_t w = 0;
-        std::memcpy(&w, p + i, n - i);
-        h[0] = mix(h[0], w ^ ((uint64_t)(n - i) << 56));
+        std::memcpy(&w, p + i, carry_.size() - i);
+        h_[0] = mix(h_[0], w ^ ((uint64_t)(carry_.size() - i) << 56));
     }
-    uint64_t r = mix(mix(mix(h[0], h[1]), h[2]), h[3]);
+    uint64_t r = mix(mix(mix(h_[0], h_[1]), h_[2]), h_[3]);
     r ^= r >> 33;
     r *= kK1;
     return r ^ (r >> 29);
+}
+
+// One definition of the arithmetic: the one-shot hash is the streaming one over a single update, so a file
+// written in pieces and a file written at once can never disagree.
+uint64_t strix_hash64(const void *data, size_t n) {
+    StrixHasher h(n);
+    h.update(data, n);
+    return h.final();
 }
 
 // ---------------------------------------------------------------- writer

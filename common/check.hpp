@@ -30,6 +30,15 @@ public:
     using Error::Error;
 };
 
+// The K/V generation budget is spent (config kv-generations): the slot cannot take another conversation - nor map
+// a parked one back - until the process restarts. Thrown only by the refusals that run BEFORE anything is touched,
+// so the slot still holds what it held: the request fails with a named error, the conversation in the slot keeps
+// being served, and nothing needs a reset.
+class KvBudgetExhausted : public Error {
+public:
+    using Error::Error;
+};
+
 template <typename... Args>
 std::string cat(Args &&...args) {
     std::ostringstream os;
@@ -52,6 +61,11 @@ std::string list_str(const std::vector<T> &v) {
     throw Error(cat(func, " (", file, ":", line, "): check `", cond, "` failed: ", msg));
 }
 
+[[noreturn]] inline void kv_budget_check_failed(const char *file, int line, const char *func, const char *cond,
+                                                const std::string &msg) {
+    throw KvBudgetExhausted(cat(func, " (", file, ":", line, "): check `", cond, "` failed: ", msg));
+}
+
 [[noreturn]] inline void fail_at(const char *file, int line, const char *func, const std::string &msg) {
     throw Error(cat(func, " (", file, ":", line, "): ", msg));
 }
@@ -62,6 +76,14 @@ std::string list_str(const std::vector<T> &v) {
     do {                                                                                         \
         if (!(cond)) ::strix::check_failed(__FILE__, __LINE__, __func__, #cond,                  \
                                            ::strix::cat(__VA_ARGS__));                           \
+    } while (0)
+
+// STRIX_CHECK for a K/V generation budget refusal: throws KvBudgetExhausted. Use it only where the check runs
+// before anything has changed (the engine keeps the slot as it is on this error).
+#define STRIX_CHECK_KV_BUDGET(cond, ...)                                                         \
+    do {                                                                                         \
+        if (!(cond)) ::strix::kv_budget_check_failed(__FILE__, __LINE__, __func__, #cond,        \
+                                                     ::strix::cat(__VA_ARGS__));                 \
     } while (0)
 
 // Unconditional failure: "func (file:line): message".

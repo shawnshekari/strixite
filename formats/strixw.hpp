@@ -53,6 +53,25 @@ std::vector<StrixwComponent> strixw_components(const StrixwTensor &t);
 // 64-bit hash of a byte range (4 interleaved multiply-xorshift lanes; not a standard hash - defined here).
 uint64_t strix_hash64(const void *p, size_t n);
 
+// The same hash fed in pieces: n is the TOTAL length (the lanes are seeded by it), update() takes any split,
+// final() wants all of it. The prompt cache's writer needs this for a paged entry: its state bytes live in
+// two places (the entry's small-state buffer and the parked pages) and the file's
+// hash must be exactly the value strix_hash64 gives for those bytes assembled - strix_hash64 is this class
+// over one update, so the two can never disagree.
+class StrixHasher {
+public:
+    explicit StrixHasher(size_t n);
+    void update(const void *data, size_t len);
+    uint64_t final();  // throws unless every byte was fed
+    size_t bytes_fed() const { return fed_; }
+
+private:
+    void consume_block(const uint8_t *p);  // one 32-byte block, four lanes
+    size_t total_, fed_ = 0;
+    uint64_t h_[4] = {0, 0, 0, 0};
+    std::vector<uint8_t> carry_;  // < 32 bytes: the block boundaries are part of the hash
+};
+
 class StrixwWriter {
 public:
     // Plans the whole file: offsets for every component of every tensor (components are taken from

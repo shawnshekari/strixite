@@ -14,6 +14,7 @@
 // The model sits behind LmBackend, so the loop and the HTTP layer above it are testable without a GPU.
 
 #include "common/check.hpp"
+#include "runtime/paged_state.hpp"  // PagedState, in the paged-state calls below
 #include "serve/capture.hpp"
 #include "serve/output_parser.hpp"
 #include "serve/prompt_cache.hpp"
@@ -52,6 +53,16 @@ struct BackendStats {
     // counts they ran, and the time they took (the journal line's span: upload + tower + scatter).
     int64_t vision_images = 0, vision_patches = 0, vision_merged_tokens = 0;
     double vision_tower_seconds = 0, vision_tower_max_seconds = 0;
+    // K/V generations (runtime/qwen4exp.hpp Qwen4ExpSession::kv_generation, the kv-generations budget): per slot,
+    // the generation its K/V is mapped in (+1 per park, and per reset or resume of a used generation) and the reservation's capacity of them;
+    // -1 capacities from a backend without the generation cursor. /metrics' gauges.
+    std::vector<int64_t> kv_generation_used, kv_generation_capacity;
+    // The shared parked-generation budget (runtime/qwen4exp.hpp Qwen4ExpSession::parked_generations_used): parks
+    // taken across the session's life (a resume or eviction never returns one), of the capacity = kv-generations. -1 capacity from a backend without the parked budget.
+    int64_t parked_generation_used = 0, parked_generation_capacity = -1;
+    // Soft K/V resets (LmBackend::renew): sessions rebuilt on the loaded model since startup. The gauges above
+    // start over at each one.
+    int64_t kv_renewals = 0;
 };
 
 // One tower input for an image prefill (vision): the rows the tower runs over (FP32,
@@ -73,6 +84,15 @@ struct VisionPrefill {
 struct PrefillImage {
     VisionPrefill prefill;
     int64_t row_start = -1, rows = 0;
+};
+
+// A snapshot's state in its parked form (LmBackend::park_snapshot). The small half is an ordinary host buffer
+// - the mRoPE header, the n-gram history, the per-layer tails; the big half is the conversation's own K/V pages,
+// named by an id the session that parked them knows (runtime/paged_state.hpp).
+struct PagedSnapshot {
+    HostBuffer small;
+    PagedState paged;
+    int64_t n = -1;  // the position the parked conversation stands at
 };
 
 class LmBackend {
@@ -202,12 +222,12 @@ public:
         return {forward_verify_rows(runs[0].ids, (int64_t)runs[0].ids.size(), cands, n_valid, runs[0].masks)};
     }
     virtual int64_t max_verify_rows() const { return 16; }  // rows (and logits rows) of one verify_batch forward
-    // Can seq's next verify share a verify_batch with another conversation's? More than one run means scalar
-    // positions only (Qwen4ExpSession::forward_batch's contract), so a conversation whose state carries mRoPE
-    // position state - one that has run an image, or resumed one that did - runs alone, and the arbiter packs
-    // accordingly instead of letting the batch throw and take every run in it down (issue #29). A backend
-    // without that state batches everything.
-    virtual bool batchable(int seq) const { return true; }
+    // Whether seq's verify may share a verify_batch with other seqs' runs; false: it runs alone (GpuArbiter). A
+    // conversation with image rows carries mRoPE position state, and a multi-run forward takes scalar positions only.
+    virtual bool batchable(int seq) const {
+        check_seq(seq, "batchable");
+        return true;
+    }
     // Resolve seq's run of the pending verify_batch: keep its first `rows` rows (all of them: the whole verify).
     // carry: the token seq's next forward starts with (an MTP rejection's corrected sample; -1: none) - a backend
     // may check it there.
@@ -233,6 +253,13 @@ public:
         reset();
     }
     virtual bool failed() const { return false; }
+    // The soft K/V reset: rebuild the session on the
+    // loaded model, so the K/V generation budget starts over without a restart - every seq's state, snapshot,
+    // parked record and generation counter go, the weights stay. The caller holds every seq idle and has given
+    // back every parked record (renew refuses before anything changes while one is live). A throw after the old
+    // session went leaves failed() true. can_renew false (the default): renew is not offered.
+    virtual bool can_renew() const { return false; }
+    virtual void renew() { throw Error("LmBackend::renew: this backend cannot rebuild its session"); }
     virtual void save_snapshot(int seq, int slot) {
         check_seq(seq, "save_snapshot");
         save_snapshot(slot);
@@ -279,6 +306,55 @@ public:
     // The bytes export_snapshot(slot, out, from) will size out to (the prompt cache makes room for them first).
     virtual uint64_t snapshot_bytes(int slot, int64_t from = 0) const = 0;
     virtual void import_state(const HostBuffer &state, int64_t n, int64_t from = 0) = 0;
+    // The paged form of export_snapshot / import_state: take a snapshot's K/V
+    // out as the physical pages it already occupies - no host copy - plus the small state the pages do not
+    // cover. This is the whole point of the slice: the multi-GB export that a conversation switch used to pay
+    // in host memory becomes a handful of MB. A paged state is WHOLE (`from` = 0): a delta's rows [from, n) are
+    // not whole paged arrays. The record may cover MORE rows than the entry's pack describes (a conversation
+    // saved at a checkpoint is shorter than its slot's position) - the extra rows cost RAM while the entry
+    // lives and are simply overwritten on resume, which is what the file's smaller state can mean.
+    // Backends whose K/V is not paged answer paged_states() false and are never asked.
+    virtual bool paged_states() const { return false; }
+    // The snapshot's state in two halves: `small` the bytes that are not parked pages (in pack order, so the
+    // file's state region is `small` with the parked ranges stitched in) and `paged` the record + those ranges.
+    virtual PagedSnapshot park_snapshot(int slot) {
+        STRIX_CHECK(false, "LmBackend::park_snapshot: this backend (", describe(), ") has no paged states - "
+                    "paged_states() is false, so nothing here can park a conversation");
+    }
+    // ... and back: the pages mapped into the seq's next generation, the small half imported over them, pos() =
+    // n. Every other slot's snapshot is invalid afterwards, exactly as after an import_state.
+    virtual void resume_paged(const HostBuffer &small, const PagedState &paged, int64_t n) {
+        (void)small, (void)paged, (void)n;
+        STRIX_CHECK(false, "LmBackend::resume_paged: this backend (", describe(), ") has no paged states");
+    }
+    // Eviction of a paged entry: the pages go back to the pool they came from (RAM returns; that parked
+    // generation's addresses stay spent, like every released generation's).
+    virtual void release_parked(int64_t parked_id) {
+        (void)parked_id;
+        STRIX_CHECK(false, "LmBackend::release_parked: this backend (", describe(), ") has no paged states");
+    }
+    // Room for one more park: the shared parked budget has a generation left AND this slot has the next
+    // generation a park advances its cursor into. The save path asks to CHOOSE its route (park vs the host
+    // copy) - the exhaustion refusal inside park_snapshot is atomic but is an error, and an error message is
+    // not a control signal. False from backends without a paged seam, and past either budget.
+    virtual bool park_budget_left() const { return false; }
+    virtual bool park_budget_left(int seq) const {
+        check_seq(seq, "park_budget_left");
+        return park_budget_left();
+    }
+    // The seq-checked forms (how the engine's per-sequence view reaches them, as with the calls above).
+    virtual PagedSnapshot park_snapshot(int seq, int slot) {
+        check_seq(seq, "park_snapshot");
+        return park_snapshot(slot);
+    }
+    virtual void resume_paged(int seq, const HostBuffer &small, const PagedState &paged, int64_t n) {
+        check_seq(seq, "resume_paged");
+        resume_paged(small, paged, n);
+    }
+    virtual void release_parked(int seq, int64_t parked_id) {
+        check_seq(seq, "release_parked");
+        release_parked(parked_id);
+    }
     // What a saved state fits: model, weights, layout, activation dtype (PromptCache refuses others).
     virtual std::string state_fingerprint() const = 0;
     virtual std::string describe() const = 0;  // for /health and logs
@@ -349,14 +425,16 @@ constexpr const char *kThinkCloseBeforeCall = "</think>\n\n";
 
 constexpr int64_t kMtpMaxDraft = 4;  // rejection-point buckets: j = 0, 1, 2 and 3 or more accepted drafts
 
+// GenerationResult::error_type of a request the spent K/V generation budget refused (KvBudgetExhausted): the
+// HTTP layer answers 503 with this as the OpenAI error type.
+constexpr const char *kErrorKvBudget = "kv_budget_exhausted";
+
 struct GenerationResult {
     std::string finish_reason;  // stop | length | tool_calls | cancelled | error
     std::string error;          // finish_reason == error
+    std::string error_type;     // finish_reason == error: empty (a server error, HTTP 500) or kErrorKvBudget (503)
     int64_t prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0, reasoning_tokens = 0;
     int64_t mtp_drafted_tokens = 0, mtp_accepted_tokens = 0, mtp_rollbacks = 0;
-    // How this request verifies ran (its decode window in GpuArbiter): shared with another slot run, or ran
-    // alone because the conversation carries mRoPE position state and cannot share a forward.
-    int64_t verify_shared_runs = 0, verify_solo_mrope = 0;
     int64_t mtp_reject_at[kMtpMaxDraft] = {};  // rollbacks by drafts j accepted before the rejected one (last: j >= 3)
     double queue_ms = 0, prompt_ms = 0, decode_ms = 0;
     // From the submit to the end of the prefill (the first token's logits are ready) / to the response's end.
@@ -413,9 +491,7 @@ struct EngineStats {
     // Per slot: the request it runs (0: idle), the tokens its state holds and its snapshot's position (-1: none).
     std::vector<int64_t> slot_request, slot_live_tokens, slot_snapshot_pos;
     int64_t verify_batches = 0, verify_batch_runs = 0;  // batched MTP verifies (GpuArbiter) and their runs
-    // Of those, the runs that went alone on a conversation that can never share a forward (mRoPE position
-    // state, issue #29): the batching the arbiter refuses, stated instead of inferred from the other two.
-    int64_t verify_solo_mrope = 0;
+    int64_t verify_alone = 0;  // verifies run alone: their conversation holds image rows (GpuArbiter Stats)
     int64_t decoding_slots = 0;  // slots in their decode loop (GpuArbiter::decoding_count; 0 with one slot)
     // Seconds since the last request finished (or the engine started); 0 while one runs or waits. `busy` alone reads
     // 1 through a steady agent session, so a batch client sampling it saw a "stuck" flag; this lets it
@@ -426,6 +502,9 @@ struct EngineStats {
     // RAM tier (the disk gets them later, if at all).
     int64_t disk_hits = 0, disk_tokens = 0, ram_saves = 0, ram_hits = 0;
     double export_seconds = 0;
+    // Soft K/V resets (Engine::renew_kv): done, failed, and the last one's wall time (ms; 0 = none yet).
+    int64_t kv_renewals = 0, kv_renew_failures = 0;
+    double kv_renew_last_ms = 0;
 };
 
 class GpuArbiter;  // serve/seq_backend.hpp (it builds on LmBackend above)
@@ -469,6 +548,20 @@ public:
         // max chunk always). A chunk holds the GPU: at 16,384 tokens the other slots' decode stopped ~10 s a chunk.
         // Read per chunk, so a prefill alone runs full chunks again as soon as the others finish.
         int64_t shared_chunk = 2048;
+        // A held Turn whose whole state copies in at most this many bytes goes to the cache as a copy at the
+        // switch, not parked (Engine::save_state): a copy that small costs about what the park's own small-state
+        // copy does, holds less RAM than the pages (whole 2 MiB pages per array: 0.5 GB for a 40-token state), and
+        // spends no parked generation (the shared budget several slots draw on; the slot's own generation goes
+        // either way - the next conversation's resume or reset advances past it). 0: every held Turn parks (the
+        // tests that drive the park route on tiny states).
+        uint64_t park_min_bytes = 256ull << 20;
+        // The soft K/V reset (config kv-renew-margin; LmBackend::renew): once a slot has at most this many K/V
+        // generations left, or the shared parked budget this many parks, the engine starts no new request, waits
+        // for the running ones, writes every parked conversation to disk, and rebuilds the session on the loaded
+        // model - the budget starts over, the weights and the prompt cache stay. A request spends at most a few
+        // generations (a switch: one slot + one parked), so the default leaves room for the requests running when
+        // the margin is crossed. 0: off (exhaustion refuses, a restart reclaims).
+        int64_t kv_renew_margin = 16;
     };
 
     Engine(LmBackend &backend, const Tokenizer &tok, const Options &options);
@@ -492,6 +585,11 @@ public:
     // The GpuFatalError that stopped the engine (empty: none); submit refuses every request after it.
     std::string fatal_error() const;
     const std::string &degraded() const { return options_.degraded; }
+    // The first K/V generation budget refusal's text (empty: none yet). From then on the slot that refused serves
+    // only the conversation it holds; a restart reclaims the budget. /health reports it (status degraded).
+    std::string kv_budget_refusal() const;
+    // The soft K/V reset is on (kv-renew-margin > 0, the backend can renew) and has not failed in this process.
+    bool kv_renew_available() const;
 
 private:
     struct Job {
@@ -505,6 +603,13 @@ private:
     };
     // One conversation slot: its backend view (the backend itself with one slot, else a SeqBackend), the tokens its
     // state holds, its worker and the request it was given.
+    // A Turn save the park route held in its slot instead of parking it right away (Engine::save_state): the
+    // conversation stays live, and the park happens when another conversation needs the slot or at shutdown.
+    struct PendingTurn {
+        std::vector<int32_t> tokens;  // the entry's key, prompt[0, n); empty: nothing held
+        bool one_shot = false;
+        int64_t req_id = 0;
+    };
     struct Slot {
         int index = 0;
         LmBackend *be = nullptr;
@@ -520,6 +625,7 @@ private:
         std::string fatal_pending;    // set by run()'s handler (the slot's thread only)
         bool needs_reset = false;     // the worker's guard saw an error escape the request path: reset before the
                                       // next job (the slot's thread only) - an unclean state must not carry over
+        PendingTurn pending;          // a held Turn (the slot's thread only; ~Engine after the join)
     };
     void worker(Slot &sl);
     void run(Job &job, Slot &sl);
@@ -538,6 +644,29 @@ private:
     void capture(Slot &sl, const GenerationRequest &req, const std::vector<CaptureStep> &steps, const std::string &reason);
     void report_resume_loss(const std::vector<int32_t> &prompt, int64_t start, int64_t live_common, int64_t live_n,
                             int64_t id);
+    // Hand back the parked records the prompt cache has retired. Giving pages back is HIP work on the session
+    // that carved them, so the cache - host-only - only lists the ids (PromptCache::take_retired) and the
+    // engine drains them on a worker, through the arbiter like any other device work. At the start of a
+    // request (so its K/V growth can use that RAM) and again after its saves.
+    void drain_parked(Slot &sl);
+    // One prompt-cache save of the slot's snapshot `slot` at n (tokens[0, n) its key): the park route for a whole
+    // Turn, else the host copy. hold_turn: a Turn the park route would take is held in the slot instead
+    // (Slot::pending) - the request-end save; flush_pending_turn passes false. True when an entry was put.
+    bool save_state(Slot &sl, const int32_t *tokens, int slot, int64_t n, PromptCache::Kind kind, const char *what,
+                    bool one_shot, int64_t req_id, int &rows, bool hold_turn, bool allow_park = true);
+    // Parks the held Turn into the prompt cache (why: for the log) - before another conversation takes the slot,
+    // and at shutdown. A failure loses that entry and resets the slot; it never fails the caller's request.
+    // allow_park false: the copy route even where a park could go (the soft K/V reset - a park would only be
+    // written to disk again before the session goes).
+    void flush_pending_turn(Slot &sl, const char *why, bool allow_park = true);
+    // The soft K/V reset's trigger: the backend can renew, the margin is on, and a slot's generations or the
+    // parked budget are within it (BackendStats). Off the lock (reads the backend's stats).
+    bool renew_due() const;
+    // The soft K/V reset itself, on an idle slot's worker while every slot is idle and dispatch is held
+    // (renew_due_): held Turns to the cache as copies, parked entries to disk, their records back, the session
+    // rebuilt, every slot's bookkeeping cleared. A failure before the old session went is logged and leaves
+    // serving as it was (the refusal at exhaustion stays the last guard); one after it is fatal (restart).
+    void renew_kv();
 
     LmBackend &be_;
     const Tokenizer &tok_;
@@ -557,7 +686,13 @@ private:
     std::condition_variable cv_;
     std::deque<Job> queue_;
     bool stop_ = false;
+    bool drain_wanted_ = false;  // the prompt cache's retired hook fired: an idle worker drains (under mu_)
+    // The soft K/V reset (under mu_): due = dispatch holds new requests until the running ones finish, then one
+    // idle worker renews; renewing = it runs (other workers neither drain nor take jobs); off = a renewal failed
+    // before the session went - no more attempts in this process, the exhaustion refusal stays the guard.
+    bool renew_due_ = false, renewing_ = false, renew_off_ = false;
     std::string fatal_;  // the GpuFatalError's text once one was thrown; under mu_
+    std::string kv_refusal_;  // the first KvBudgetExhausted's text (kv_budget_refusal); under mu_
     EngineStats stats_;
     double idle_since_ = 0;  // when the last request finished (steady clock, s); under mu_
     int64_t held_logged_ = 0;  // the request whose wait for its conversation's busy slot was logged; under mu_

@@ -25,6 +25,12 @@
 // entries fit min(max_bytes, what's on disk + free space - disk_free_margin) - and a write only evicts entries used
 // less recently than its own (else it is refused for space), so RAM and disk never churn each other's entries.
 //
+// A RAM entry may also be held in parked form (put_paged): the state's big ranges are physical K/V pages the GPU
+// session handed over instead of a host copy, and the request path never touches those bytes - a conversation
+// switch copies ~10 MB, not gigabytes. The file it writes is the same file (write_paged_state gathers the halves
+// back into order). The cache is host-only and never makes the page release a HIP call: retired records wait in
+// a list the owner drains (take_retired), through the GPU arbiter.
+//
 // Kinds: System = the prefix up to the first message after the system prompt (shared by every conversation with
 // that system prompt); Turn = a conversation up to its last generation prompt; Checkpoint = a conversation up to
 // the start of its last user message (saved for prompts ending in the user's message, not tool results). A new
@@ -76,7 +82,9 @@
 #include <thread>
 #include <vector>
 
+#include "runtime/paged_state.hpp"  // PagedState: the host-only view of a parked conversation
 #include "serve/host_buffer.hpp"
+#include "serve/memory_governor.hpp"
 
 namespace strix {
 
@@ -90,7 +98,7 @@ struct PromptCacheStats {
     int64_t disk_entries = 0, bytes = 0, max_bytes = 0;  // disk
     int64_t ram_hits = 0, loads = 0, load_failures = 0;  // hits from RAM / loads from disk
     int64_t writes = 0, write_failures = 0, bytes_written = 0;
-    int64_t writes_evict = 0, writes_idle = 0, writes_shutdown = 0;  // writes by rule
+    int64_t writes_evict = 0, writes_idle = 0, writes_shutdown = 0, writes_renew = 0;  // writes by rule
     int64_t ram_evicted = 0;  // entries that left RAM for lack of memory (written, already on disk, or dropped)
     int64_t ram_evicted_watch = 0;  // of those, by the writer's margin watch (another process grew between saves)
     int64_t ram_only_dropped = 0;  // RAM-only entries that left RAM (never written, by design)
@@ -113,11 +121,11 @@ public:
     enum class Kind : uint32_t { System = 1, Turn = 2, Checkpoint = 3 };
 
     struct Options {
-        // Keep MemAvailable above this (RAM entries leave first; make_room_for holds it at every allocation). 4 GiB
-        // (was 24, set against direct compaction from MADV_HUGEPAGE buffers and buffered writes, both gone now): at
-        // 512k capacity / chunk 16384, two 264k conversations switching, n-gram table warm, MemAvailable bottomed at 5.5 GiB
-        // with 0 compaction stalls, RAM resumes 1.2-1.4 s.
-        uint64_t ram_margin = 4ull << 30;
+        // Keep MemAvailable above this (RAM entries leave first; make_room_for holds it at every allocation). 5 GiB
+        // (was 4, and 24 before that - 24 was set against direct compaction from MADV_HUGEPAGE buffers and buffered
+        // writes, both gone now): at 512k capacity / chunk 16384, two 264k conversations switching, n-gram table warm,
+        // MemAvailable bottomed at 5.5 GiB with 0 compaction stalls, RAM resumes 1.2-1.4 s.
+        uint64_t ram_margin = 5ull << 30;
         double idle_seconds = 3600;  // an entry idle in RAM this long is written (and kept in RAM)
         // The margin watch: the writer applies the RAM rule this often, so memory another process takes between saves
         // (a build or test an agent runs, a sidecar) is answered within seconds, not at the next save (it was held
@@ -198,6 +206,32 @@ public:
     // about the entry later (0: none).
     bool put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, bool ram_only = false, int64_t base_n = 0,
              int64_t saved_by = 0);
+    // The paged form: the state's big ranges are the parked pages `paged` describes
+    // and `small` is the rest of it - together exactly the bytes put() would have been handed as one buffer, so
+    // the entry's file is byte for byte the same (write_paged_state gathers them back into order). The point is
+    // the request path: those bytes never pass through a host buffer, so switching conversations copies ~10 MB
+    // per save instead of multiple GB. Same rules as put (a duplicate refreshes, turns are replaced, RAM is made
+    // room for); the record's bytes count in the RAM tier from this call until it is given back - through
+    // take_retired(), the only way a parked record ever leaves this cache: the cache is host-only and never
+    // touches the pages, its owner releases the ids it drains. Resume: with_paged, or the file once written.
+    bool put_paged(std::vector<int32_t> tokens, Kind kind, HostBuffer small, PagedState paged,
+                   bool ram_only = false, int64_t base_n = 0, int64_t saved_by = 0);
+    // The ids of parked records no entry holds anymore (written, evicted, dropped, or surplus in a duplicate
+    // put). Releasing one is HIP work on the session that carved the pages, so the cache never does it - the
+    // engine drains this list while it holds the GPU, through the arbiter like any other device work. The
+    // pages come back a moment late instead of never; a parked id must never outlive that session (the
+    // server's declaration order: backend before cache, the cache's writer flushed before the backend goes).
+    std::vector<int64_t> take_retired();
+    // Hands a paged entry that is IN RAM to `use` (its small bytes + the record's byte map), synchronously, on
+    // the caller's thread: the resume maps the parked pages into a slot's next generation and imports the
+    // small half. The entry is pinned (readers) for the call, so nothing evicts its pages mid-read. False =
+    // no entry, or it is on disk (its file holds the whole state - with_state reads that), or a write has it.
+    // `consumed` (default: yes): use mapped the record's pages into a slot - a parked record is handed back
+    // exactly once, so the entry gives up its paged half inside the same pin. What can remain of it is the
+    // file (which has the whole state); with no file yet, the entry is gone (a miss later, never a half
+    // state). A caller that only reads the byte map passes false.
+    bool with_paged(const std::vector<int32_t> &prompt, int64_t n,
+                    const std::function<void(const HostBuffer &, const PagedState &)> &use, bool consumed = true);
     // A spare buffer (the largest; empty if none) for an export or a load, resized by whoever fills it - and back.
     // Near the margin with no spare of the last saved state's size, the least recently used RAM entry already on
     // disk gives up its buffer instead (no fresh mapping under memory pressure).
@@ -216,15 +250,39 @@ public:
     // still isn't (an eviction write still queued holds its RAM until written): the caller then doesn't grow the
     // buffer - the save is skipped, the load refused - so the margin holds at every allocation, not only after a put
     // (a whole 7.4 GB export a request, checked only afterwards, once took the machine to 0.5 GB and hung it).
-    bool make_room_for(uint64_t bytes);
+    // release_retired: a caller that can give parked records back (it holds the GPU, or hands work to the arbiter)
+    // passes it, and the ids this call's evictions retire go back through it BEFORE MemAvailable is read again.
+    // Without it a parked entry's eviction frees nothing until the engine's next drain - the rule would count
+    // its pages as gone, read MemAvailable unchanged, and refuse (or evict the whole tier for nothing).
+    using RetiredRelease = std::function<void(const std::vector<int64_t> &)>;
+    bool make_room_for(uint64_t bytes, const RetiredRelease &release_retired = {});
+    // Called on the writer thread, off the cache's lock, when parked ids wait in the retired list after the
+    // writer's own work (a margin-watch eviction, a finished eviction write): the owner's cue to drain them while
+    // it is idle. The hook must not call back into this cache. Set {} to clear it - that waits for a call in
+    // progress, so the owner may go away right after.
+    void set_retired_hook(std::function<void()> hook);
     // What holds the RAM tier, for the line after a refusal: entries (in use by a reader or the writer / queued for a
     // write / free to leave), spares, bytes still leaving. Free-to-leave entries left after a refusal are a bug.
     std::string ram_summary() const;
     uint64_t mem_available_now() const { return mem_available(); }  // MemAvailable (or the test's probe), bytes
+    // The RAM budget owner (floor, the rule, one reading at a time): the governor every consumer of this memory
+    // answers to - K/V growth and the RAM tier decide on the same number through it, and parking will ask it too.
+    const MemoryGovernor &governor() const { return gov_; }
     uint64_t disk_free_now() const { return disk_free(); }          // free bytes on the directory's filesystem
     void give_back(HostBuffer b);
     // Queues the idle rule's writes now (the writer also does this on its own every few seconds).
     void write_idle();
+    // The soft K/V reset's first half (Engine::renew_kv): every entry whose state is parked pages is written to
+    // disk now - no budget, like the shutdown rule - and its record retired (take_retired), or, when it cannot be
+    // (a one-shot entry, no disk room, a failed write), it leaves the cache. Waits up to max_seconds for the
+    // writes. After a call with left == 0 no entry holds a parked record, which is what lets the session that
+    // owns the pages be destroyed; left > 0 (a write still running at the deadline) = do not destroy it.
+    struct Spill {
+        int64_t written = 0, dropped = 0, left = 0;
+        uint64_t bytes = 0;  // the parked page bytes of the entries now on disk
+        double seconds = 0;
+    };
+    Spill spill_parked(double max_seconds);
     void flush();  // waits until no write is queued or running (tests)
     PromptCacheStats stats() const;
     const std::string &dir() const { return dir_; }
@@ -236,13 +294,14 @@ public:
     static constexpr int kMaxSpares = 2;                        // a checkpoint and a turn exported per request
 
 private:
-    enum class Why { Evict, Idle, Shutdown };
+    enum class Why { Evict, Idle, Shutdown, Renew };
     struct Entry {
         std::vector<int32_t> tokens;
         Kind kind;
         uint64_t last_used = 0;  // LRU clock
         double touched_s = 0;    // put or last hit (the idle rule)
-        HostBuffer ram;          // empty: not in RAM
+        HostBuffer ram;          // empty: not in RAM (for a paged entry: the state's small bytes only)
+        PagedState paged;        // non-empty: the state's big ranges are parked pages, held until written
         std::string path;        // empty: not on disk
         uint64_t file_bytes = 0;
         int readers = 0;           // with_state / the writer using ram (it must stay put)
@@ -255,6 +314,12 @@ private:
         std::shared_ptr<Entry> base;  // a delta's base (a full entry, tokens[0, base->tokens.size())); null: whole
         int dependents = 0;           // deltas on this entry
         int64_t saved_by = 0;         // the request that put it (log lines; 0: none)
+        // What the rest of the cache asks about an entry's state. A paged entry's state is in two places -
+        // `ram` the small bytes, `paged` the parked pages - and NEITHER half alone is a state, so a paged entry
+        // whose record was given back is a DISK entry: both halves go empty together (write_entry, drop_ram).
+        size_t state_size() const { return paged.empty() ? ram.size() : paged.state_bytes; }  // 0: no RAM copy
+        uint64_t ram_cost() const { return ram.capacity() + paged.bytes(); }  // what ram_bytes_ counts
+        bool in_ram() const { return ram_cost() > 0; }
     };
     using EntryPtr = std::shared_ptr<Entry>;
     struct Job {
@@ -264,6 +329,13 @@ private:
     };
     void writer();
     void write_entry(Job &job);
+    bool put_impl(std::vector<int32_t> tokens, Kind kind, HostBuffer state, PagedState paged, bool ram_only,
+                  int64_t base_n, int64_t saved_by);  // put() and put_paged() both land here
+    // Gathers a paged entry's state to the file in whole 4 KiB blocks (O_DIRECT's requirement): the parked
+    // ranges and, in the gaps between them, the small buffer, in pack order - the bytes put() would have
+    // written from one buffer. Hashed on the way, and the value comes back for the header, which for a paged
+    // entry is therefore written AFTER its state (the whole-buffer path has its hash before it writes).
+    uint64_t write_paged_state(int fd, const Entry &e, uint64_t state_at, const std::string &path) const;
     // A state from disk: header, tokens (must equal prompt[0, n)) and checksum checked; throws.
     void load_file(const std::string &path, const std::vector<int32_t> &prompt, int64_t n, HostBuffer &state) const;
     // file_total of e, plus its base's if a write of e would have to write the base first.
@@ -300,12 +372,32 @@ private:
     std::string dir_, fingerprint_;
     uint64_t max_bytes_;
     Options opt_;
+    // The RAM budget: floor + one-reading rule (serve/memory_governor.hpp), built from the options, the probe the
+    // options' (or /proc/meminfo). Every margin decision of the cache answers through this one object.
+    MemoryGovernor gov_;
     mutable std::mutex mu_;
     std::condition_variable cv_, idle_cv_;
     std::vector<EntryPtr> entries_;
     std::deque<Job> queue_;
     std::vector<HostBuffer> spares_;
     std::vector<HostBuffer> trash_;  // unmapped after the lock is released (~20 ms for 5 GiB of huge pages)
+    // Parked ids whose record no entry holds anymore, waiting for the engine's take_retired(): releasing is
+    // HIP work the cache must not do (it runs on the writer thread), so the ids wait here - added under mu_
+    // (a vector swap is not the slow part; the hip calls are), taken whole off-lock.
+    std::vector<int64_t> retired_;
+    // The owner's drain cue (set_retired_hook) and its own lock: held across the call, so clearing the hook
+    // waits for a running call - never taken while mu_ is held.
+    std::mutex hook_mu_;
+    std::function<void()> retired_hook_;
+    void poke_retired();  // calls the hook if ids wait (takes mu_ briefly, then hook_mu_; call without mu_)
+    // What a method hands back when it lets RAM go: buffers the destructor unmaps outside the lock. (Parked
+    // records stay in retired_ - their owner takes them with take_retired(), never under mu_.)
+    // Declared before the lock_guard, as the trash idiom does, so it goes out of scope after the lock is gone.
+    struct Handback {
+        std::vector<HostBuffer> trash;
+        void take(PromptCache *c) { trash.swap(c->trash_); }
+        ~Handback() { trash.clear(); }
+    };
     uint64_t pending_bytes_ = 0, clock_ = 0;
     uint64_t ram_bytes_ = 0, spare_bytes_ = 0, disk_bytes_ = 0;
     uint64_t prefault_bytes_ = 0;  // the spare size to keep ready: the last saved state + prefault_headroom

@@ -207,10 +207,23 @@ int run(int argc, char **argv) {
              (long long)cfg.vision_preprocess_limit);
     }
     const int64_t total_slots = settings.integer("total-slots");
-    Qwen4ExpBackend backend(model, capacity, chunk, use_mtp, mtp_vocab, precision, kv_format, total_slots);
+    const int64_t kv_generations = settings.integer("kv-generations");  // 0: auto (Qwen4ExpSession)
+    STRIX_CHECK(kv_generations != 1, "strix_server: kv-generations 1 (the pages reused, unsafe on this GPU), "
+                "expected 0 (auto) or 2..4096");
+    Qwen4ExpBackend backend(model, capacity, chunk, use_mtp, mtp_vocab, precision, kv_format, total_slots,
+                            kv_generations);
     if (total_slots > 1)
         slog(LogLevel::Info, "startup: %lld slots: %lld conversations at once, each at the full capacity %s",
              (long long)total_slots, (long long)total_slots, fmt_n(capacity).c_str());
+    slog(LogLevel::Info, "startup: kv-generations %s: %lld K/V generations per slot (~%.1f TiB of address "
+         "space per slot, no RAM); %s",
+         kv_generations == kKvGenerationsAuto ? "auto" : std::to_string(kv_generations).c_str(),
+         (long long)backend.kv_layout().generations,
+         (double)backend.kv_layout().slot_region_bytes * 1.0 / (1ull << 40),
+         settings.integer("kv-renew-margin") > 0
+             ? cat("the session is rebuilt on the loaded model (the soft K/V reset) once a slot is within ",
+                   settings.integer("kv-renew-margin"), " generations of the last").c_str()
+             : "past the last a switch is refused cleanly, only a restart reclaims (kv-renew-margin 0)");
     slog(LogLevel::Info, "startup: precision %s%s", precision.describe().c_str(),
          precision.exact() ? "" : " (faster, less exact math than all-exact)");
     {
@@ -299,8 +312,14 @@ int run(int argc, char **argv) {
     // then RAM-tier entries leave (least recently used first) - and is refused only when that can't keep the margin.
     // Without a prompt cache the session's own floor check stands.
     if (cache)
-        backend.set_kv_budget([c = cache.get()](uint64_t bytes) {
-            STRIX_CHECK(c->make_room_for(bytes), "K/V growth of ", bytes >> 20, " MiB refused: the prompt cache can't ",
+        // The growth runs inside a session call (this thread holds the GPU), so parked records the room rule
+        // retires go back right here, straight on the backend - else their pages would stay held until the
+        // engine's next drain while this growth waits on that very RAM.
+        backend.set_kv_budget([c = cache.get(), &backend](uint64_t bytes) {
+            const auto release = [&backend](const std::vector<int64_t> &ids) {
+                for (const int64_t id : ids) backend.release_parked(id);
+            };
+            STRIX_CHECK(c->make_room_for(bytes, release), "K/V growth of ", bytes >> 20, " MiB refused: the prompt cache can't ",
                         "keep its RAM margin after it (MemAvailable ", c->mem_available_now() >> 20, " MiB) - every ",
                         "slot together holds more K/V than this machine has room for");
         });
@@ -316,6 +335,7 @@ int run(int argc, char **argv) {
     eng_opts.think_close_on_call = think_close_on_call;
     eng_opts.shared_chunk = chunk_shared;
     eng_opts.degraded = degraded;
+    eng_opts.kv_renew_margin = settings.integer("kv-renew-margin");
     slog(LogLevel::Info, "startup: think-block / tool-call guard %s, literal tags %s, think close before a call %s",
          think_end_guard ? "on" : "off", literal_tags ? "on" : "off", think_close_on_call ? "on" : "off");
     if (think_nudge)

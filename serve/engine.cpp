@@ -87,6 +87,16 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
     }
     stats_.slots = n, stats_.slot_request.assign((size_t)n, 0), stats_.slot_live_tokens.assign((size_t)n, 0);
     stats_.slot_snapshot_pos.assign((size_t)n, -1);
+    // The prompt cache's cue that parked records wait for their pages to go back (PromptCache::set_retired_hook):
+    // wakes an idle worker, which drains through the arbiter like any device work. Cleared first in ~Engine.
+    if (cache_ && be_.paged_states())
+        cache_->set_retired_hook([this] {
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                drain_wanted_ = true;
+            }
+            cv_.notify_all();
+        });
     for (auto &sl : slots_) sl->thread = std::thread([this, s = sl.get()] { worker(*s); });
 }
 
@@ -98,6 +108,7 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, PromptCache *cache, flo
       }()) {}
 
 Engine::~Engine() {
+    if (cache_) cache_->set_retired_hook({});  // first: waits out a running call; after it the writer never calls the engine
     {
         std::lock_guard<std::mutex> lock(mu_);
         stop_ = true;
@@ -110,6 +121,27 @@ Engine::~Engine() {
         r.finish_reason = "error", r.error = "server shutting down";
         deliver(j, r);  // never through a destructor, whatever the sink does
     }
+    // Held Turns go to the cache first (parked), so the shutdown flush writes them like any RAM entry - a held
+    // Turn is the newest state of its conversation. The workers are joined: this thread is the slots' only user.
+    if (cache_)
+        for (auto &sl : slots_)
+            try {
+                flush_pending_turn(*sl, "the server stops");
+            } catch (const std::exception &ex) {
+                slog(LogLevel::Error, "engine shutdown: slot %d's held Turn: %s", sl->index, ex.what());
+            }
+    // The last drain: the writer retires parked records at any time, and once the cache is gone nothing
+    // else will hand them back. The workers are joined (nothing contends) and the backend that owns the
+    // pages outlives the cache by the server's declaration order, so releasing here is sound. Never throw
+    // from a destructor: a refusal is a bug, and it is logged instead of propagating.
+    if (cache_ && be_.paged_states())
+        for (const int64_t id : cache_->take_retired())
+            try {
+                be_.release_parked(0, id);
+            } catch (const std::exception &ex) {
+                slog(LogLevel::Error, "engine shutdown: releasing parked record %lld failed: %s", (long long)id,
+                     ex.what());
+            }
 }
 
 void Engine::submit(GenerationRequest req, std::shared_ptr<GenerationSink> sink) {
@@ -145,7 +177,9 @@ void Engine::submit(GenerationRequest req, std::shared_ptr<GenerationSink> sink)
 }
 
 void Engine::dispatch_locked() {
-    while (!queue_.empty() && fatal_.empty()) {
+    // A soft K/V reset is due or running (renew_kv): nothing new starts until it is done - the running requests
+    // finish, then one idle worker rebuilds the session.
+    while (!queue_.empty() && fatal_.empty() && !renew_due_ && !renewing_) {
         const GenerationRequest &req = queue_.front().req;
         const std::vector<int32_t> &key = req.image_pos3.empty() ? req.prompt : req.cache_key;
         // The slot, among the idle ones (an image prompt: slot 0 only, image positions are slot 0's): the one whose
@@ -222,8 +256,7 @@ EngineStats Engine::stats() const {
     s.idle_seconds = s.busy || s.queued ? 0.0 : std::max(0.0, now_s() - idle_since_);
     if (arbiter_) {
         const GpuArbiter::Stats a = arbiter_->stats();
-        s.verify_batches = a.verify_batches, s.verify_batch_runs = a.verify_runs;
-        s.verify_solo_mrope = a.verify_solo_mrope;
+        s.verify_batches = a.verify_batches, s.verify_batch_runs = a.verify_runs, s.verify_alone = a.verify_alone;
         s.decoding_slots = arbiter_->decoding_count();
     }
     return s;
@@ -251,7 +284,37 @@ void Engine::worker(Slot &sl) {
         std::unique_ptr<Job> job;
         {
             std::unique_lock<std::mutex> lock(mu_);
-            cv_.wait(lock, [&] { return stop_ || sl.job != nullptr; });
+            const auto renew_now = [&] { return renew_due_ && !renewing_ && stats_.busy == 0 && fatal_.empty(); };
+            cv_.wait(lock, [&] {
+                return stop_ || sl.job != nullptr || (drain_wanted_ && !renewing_) || renew_now();
+            });
+            if (sl.job == nullptr && !stop_ && renew_now()) {
+                // Every slot is idle and dispatch is held: this worker renews (the others wait - no job, no drain).
+                renewing_ = true;
+                lock.unlock();
+                renew_kv();  // never throws: a failure is logged, or made fatal, inside
+                lock.lock();
+                renewing_ = false, renew_due_ = false;
+                dispatch_locked();
+                lock.unlock();
+                cv_.notify_all();
+                continue;
+            }
+            if (sl.job == nullptr && !stop_ && drain_wanted_ && !renewing_) {
+                // The prompt cache retired parked records while no request ran (its margin watch evicted them,
+                // or an eviction write finished): give their pages back now, not at the next request - another
+                // process wanting RAM is why the watch evicted.
+                drain_wanted_ = false;
+                lock.unlock();
+                try {
+                    drain_parked(sl);
+                } catch (const std::exception &ex) {
+                    slog(LogLevel::Error, "slot %d: releasing retired parked records while idle failed: %s - the "
+                         "slot resets before its next job", sl.index, ex.what());
+                    sl.needs_reset = true;
+                }
+                continue;
+            }
             if (sl.job == nullptr) return;  // stopping: an assigned job still runs
             job = std::move(sl.job);
         }
@@ -290,6 +353,7 @@ void Engine::worker(Slot &sl) {
                 ++stats_.requests_error;
             }
             sl.seq.clear();
+            sl.pending = PendingTurn();  // a suspect state is never saved
             sl.needs_reset = true;  // its state is suspect: reset before anything runs on it again
             release_slot(-1);        // no trustworthy snapshot position after an escape
             cv_.notify_all();
@@ -298,6 +362,7 @@ void Engine::worker(Slot &sl) {
             if (sl.needs_reset || (sl.proxy && sl.proxy->stale())) {  // another slot's call failed midway while this
                                                                        // one sat idle, or the guard escaped above
                 sl.needs_reset = false;
+                sl.pending = PendingTurn();
                 try {
                     sl.be->reset();
                 } catch (const std::exception &ex) {
@@ -328,6 +393,15 @@ void Engine::worker(Slot &sl) {
             }
             const int64_t snap = sl.be->snapshot_pos(LmBackend::kTurnSlot);  // -1 when poisoned (a Hint): turn_pos
                                                                              // "none", never a save against it
+            if (renew_due()) {  // before the slot goes idle: dispatch_locked in release_slot already holds
+                std::lock_guard<std::mutex> lock(mu_);
+                if (!renew_off_ && !renew_due_) {
+                    renew_due_ = true;
+                    slog(LogLevel::Info, "K/V budget: within the renewal margin (kv-renew-margin %lld) - new requests "
+                         "wait until the running ones finish and the session is rebuilt",
+                         (long long)options_.kv_renew_margin);
+                }
+            }
             release_slot(snap);
             cv_.notify_all();
         } catch (const std::exception &ex) {
@@ -343,9 +417,31 @@ std::string Engine::fatal_error() const {
     return fatal_;
 }
 
+bool Engine::kv_renew_available() const {
+    if (options_.kv_renew_margin <= 0 || !be_.can_renew()) return false;
+    std::lock_guard<std::mutex> lock(mu_);
+    return !renew_off_;
+}
+
+std::string Engine::kv_budget_refusal() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return kv_refusal_;
+}
+
 int64_t Engine::resume_point(Slot &sl, const std::vector<int32_t> &prompt, int64_t id, bool &from_disk, bool &from_ram) {
     from_disk = false, from_ram = false;
     const int64_t P = (int64_t)prompt.size();
+    // A Turn held in the slot (save_state): a prompt that extends it continues the conversation here - live, or
+    // from the Turn snapshot - and this request's own Turn replaces it, so it is dropped unsaved. Any other
+    // prompt is another conversation (or a rewrite of this one): the held Turn goes to the cache first, before
+    // anything below can reset the slot or restore over its rows.
+    if (!sl.pending.tokens.empty()) {
+        const std::vector<int32_t> &pt = sl.pending.tokens;
+        if (P > (int64_t)pt.size() && std::equal(pt.begin(), pt.end(), prompt.begin()))
+            sl.pending = PendingTurn();
+        else
+            flush_pending_turn(sl, "the slot takes another prompt");
+    }
     int64_t lcp = 0;
     while (lcp < (int64_t)sl.seq.size() && lcp < P && sl.seq[(size_t)lcp] == prompt[(size_t)lcp]) ++lcp;
     // In memory: the live state if the prompt extends it, else the better of the snapshots.
@@ -363,7 +459,22 @@ int64_t Engine::resume_point(Slot &sl, const std::vector<int32_t> &prompt, int64
             size_t bytes = 0;
             bool ram = false;
             int64_t delta_from = 0;
-            const bool loaded = cache_->with_state(prompt, dn, [&](const HostBuffer &state, int64_t from, int64_t to) {
+            // A parked entry in the cache's RAM comes back as pages, not bytes: the slot maps them into its
+            // next generation and imports only the small state over them (no multi-GB read, no copy - the point
+            // of the exercise). with_state would refuse it by name, so the paged form is asked first; a miss
+            // there means the entry is on disk (its file has the whole state, being written, or plain RAM -
+            // with_state waits for a write that is running). The resume SPENDS the record, so with_paged's
+            // default `consumed` applies: the entry gives up its paged half in the same pin (what is left is
+            // its file, or nothing) - no second request can hit a spent record.
+            bool paged = false;
+            if (cache_->with_paged(prompt, dn, [&](const HostBuffer &small, const PagedState &rec) {
+                    sl.be->resume_paged(small, rec, dn);
+                    bytes += small.size() + rec.bytes();
+                    paged = true;
+                }))
+                ram = true;
+            const bool loaded = paged || cache_->with_state(prompt, dn, [&](const HostBuffer &state, int64_t from,
+                                                                           int64_t to) {
                 sl.be->import_state(state, to, from);  // a delta entry: its base (0, base), then the delta (base, dn)
                 bytes += state.size();
                 if (from > 0) delta_from = from;
@@ -371,8 +482,10 @@ int64_t Engine::resume_point(Slot &sl, const std::vector<int32_t> &prompt, int64
             if (loaded) {
                 slog_row(LogLevel::Info, "resume", "%s of %s tokens from the prompt cache's %s", fmt_n(dn).c_str(),
                          fmt_n(P).c_str(), ram ? "RAM" : "disk");
-                const std::string what = delta_from > 0 ? "the entry of " + fmt_n(delta_from) + " tokens + a delta"
-                                                         : std::string("a whole entry");
+                const std::string what =
+                    paged                 ? "a parked conversation (its K/V pages mapped back)"
+                      : delta_from > 0    ? "the entry of " + fmt_n(delta_from) + " tokens + a delta"
+                                          : std::string("a whole entry");
                 slog_row(LogLevel::Info, "", "%s, %s MB loaded in %s ms", what.c_str(), fmt_rate(bytes / 1e6, 0).c_str(),
                          fmt_rate((now_s() - t0) * 1e3, 0).c_str());
                 from_ram = ram;
@@ -458,16 +571,287 @@ void Engine::report_resume_loss(const std::vector<int32_t> &prompt, int64_t star
     (void)id;
 }
 
+bool Engine::save_state(Slot &sl, const int32_t *tokens, int slot, int64_t n, PromptCache::Kind kind, const char *what,
+                        bool one_shot, int64_t req_id, int &rows, bool hold_turn, bool allow_park) {
+    STRIX_CHECK(cache_ != nullptr, "Engine::save_state: no prompt cache");
+    STRIX_CHECK(tokens != nullptr || n <= 0, "Engine::save_state: null tokens for a ", n, "-token ", what);
+    // Already cached first: a request resumed exactly at its turn entry has no snapshot there, and needs none.
+    const char *skip = n <= 0                                 ? "no such point in the prompt"
+                       : cache_->contains(tokens, n)          ? nullptr
+                       : sl.be->snapshot_pos(slot) != n       ? "no snapshot there"
+                       : !sl.be->can_restore_snapshot(slot)   ? "snapshot no longer valid"
+                                                              : "";
+    if (skip == nullptr) return false;  // already cached
+    if (*skip) {
+        slog_row(LogLevel::Debug, rows++ ? "" : "cache", "%s, %s tokens: not saved - %s (snapshot at %s)", what,
+                 fmt_n(n).c_str(), skip, fmt_n(sl.be->snapshot_pos(slot)).c_str());
+        return false;
+    }
+    const double t_e = now_s();
+    // A deep conversation's Turn goes as a delta on the whole entry it extends (PromptCache "Delta entries"); the
+    // same call picks the base a parked whole entry could not be.
+    const int64_t base_n = cache_->delta_base(tokens, n, kind);
+    // Park route: a Turn save on a backend with a parked budget that has room hands
+    // over the physical K/V pages the conversation already occupies - those bytes never pass through a host buffer,
+    // which is the multi-GB copy per conversation switch this removes from the request path. Turn only, and always
+    // whole: the record covers the slot's entire mapped K/V and is good for one hand-back, so the request's three
+    // saves cannot share it (a second park of the same slot finds no pages and refuses), and the shallower entries
+    // keep the copy route - which must run before this: a park takes the slot's conversation out, and the export of
+    // a snapshot whose K/V is gone is refused. park_budget_left() is the route question (the atomic refusal inside
+    // the park stays an error, not a control signal).
+    // A Turn a delta could cover (base_n > 0) is held and parked whole too: as a delta copy it came back as its
+    // base's whole state imported plus the delta - multi-GB through host memory on every switch back - where the
+    // parked one maps its pages back.
+    const bool parkable =
+        allow_park && kind == PromptCache::Kind::Turn && sl.be->paged_states() && sl.be->park_budget_left();
+    if (parkable && hold_turn) {
+        // Held, not parked yet: a park spends a K/V generation, and the next turn of the same conversation - the
+        // usual next request - would spend another mapping it back. So the Turn stays in the slot, live, and goes
+        // to the cache only when another conversation needs the slot (resume_point) or the server stops (~Engine).
+        // A continuing conversation spends no generation at all.
+        sl.pending.tokens.assign(tokens, tokens + n);
+        sl.pending.one_shot = one_shot, sl.pending.req_id = req_id;
+        slog_row(LogLevel::Debug, rows++ ? "" : "cache", "%s, %s tokens: held in the slot (to the prompt cache when "
+                 "another conversation needs the slot)", what, fmt_n(n).c_str());
+        return false;
+    }
+    // At the switch: a small state is copied (Options::park_min_bytes - no parked generation spent, less RAM than
+    // its pages), a deep one parked whole.
+    const uint64_t copy_bytes = parkable ? sl.be->snapshot_bytes(slot, 0) : 0;
+    if (parkable && copy_bytes <= options_.park_min_bytes)
+        slog_row(LogLevel::Debug, rows++ ? "" : "cache", "%s, %s tokens: copied, not parked (%s MB whole: a copy this "
+                 "small spends no parked generation and holds less RAM than the pages)", what, fmt_n(n).c_str(),
+                 fmt_rate(copy_bytes / 1e6, 0).c_str());
+    if (parkable && copy_bytes > options_.park_min_bytes) {
+        PagedSnapshot ps;
+        try {
+            ps = sl.be->park_snapshot(slot);  // parks the pages AND leaves the slot cold
+        } catch (const std::exception &ex) {
+            // Expected: the shared parked budget ran out between the route question and the park (another slot
+            // took the last generation) - park_kv refuses before touching anything, so the slot still holds the
+            // conversation and the copy below saves it. A park_snapshot that throws AFTER the park released its
+            // record itself and left the slot cold; the copy then finds no restorable snapshot and fails the
+            // request clean (no wrong state is ever saved).
+            slog_row(LogLevel::Warning, rows++ ? "" : "cache", "%s, %s tokens: not parked (%s) - saving the copy "
+                     "instead", what, fmt_n(n).c_str(), ex.what());
+        }
+        if (!ps.paged.empty()) {
+            // The slot is cold now - its conversation lives on only in the record - so the engine's own claim
+            // about it goes too (a stale sl.seq would make a later prompt look like a continuation of live state
+            // that is not there).
+            sl.seq.clear();
+            if (ps.n != n) {  // can't happen (nothing forwards between the save point and here) - but if it did,
+                              // the record describes another state than the key: give it back, never store it
+                const int64_t id = ps.paged.parked_id;
+                try {
+                    sl.be->release_parked(id);
+                } catch (const std::exception &ex) {
+                    slog(LogLevel::Error, "Engine::save_state: releasing parked record %lld failed: %s", (long long)id,
+                         ex.what());
+                }
+                STRIX_CHECK(false, "Engine::save_state: the ", what, " park left the snapshot at ", ps.n,
+                            " tokens, the save point is ", n, " - the record was released, nothing saved");
+            }
+            const double ms = (now_s() - t_e) * 1e3;
+            const LogLevel level = ms > 500 ? LogLevel::Warning : LogLevel::Debug;
+            slog_row(level, rows++ ? "" : "cache", "%s, %s tokens -> RAM (parked)%s", what, fmt_n(n).c_str(),
+                     one_shot ? " only (a one-shot request: never written to disk)" : "");
+            slog_row(level, "", "whole (parked), %s GB of K/V pages + %s MB small handed over, no copy, %s ms",
+                     fmt_rate(ps.paged.bytes() / 1e9, 1).c_str(), fmt_rate(ps.small.size() / 1e6, 0).c_str(),
+                     fmt_rate(ms, 0).c_str());
+            rows++;
+            return cache_->put_paged(std::vector<int32_t>(tokens, tokens + n), kind, std::move(ps.small),
+                                     std::move(ps.paged), one_shot, 0, req_id);
+        }
+    }
+    // The replaced turn's buffer first (grown by this turn's few MB), else a spare: a fresh multi-GB buffer costs
+    // ~100 ms per GB of page population on the request path.
+    HostBuffer state = kind == PromptCache::Kind::System ? HostBuffer() : cache_->take_replaced_buffer(tokens, n, base_n);
+    if (state.capacity() == 0) state = cache_->take_buffer();
+    // Room before the buffer grows (PromptCache::make_room_for): else no save - never past the margin. Parked
+    // records the room rule retires go back right here (this thread may hand the GPU work to the arbiter).
+    const uint64_t want = sl.be->snapshot_bytes(slot, base_n);
+    if (want > state.capacity() &&
+        !cache_->make_room_for(want - state.capacity(), [&](const std::vector<int64_t> &ids) {
+            for (const int64_t id : ids) sl.be->release_parked(id);
+        })) {
+        slog_row(LogLevel::Warning, rows++ ? "" : "cache",
+                 "%s, %s tokens: not saved - no room in RAM (needs %s GB more; MemAvailable %s GiB, margin %s GiB)",
+                 what, fmt_n(n).c_str(), fmt_rate((want - state.capacity()) / 1e9, 1).c_str(),
+                 fmt_rate(cache_->mem_available_now() / (double)(1ull << 30), 1).c_str(),
+                 fmt_rate(cache_->options().ram_margin / (double)(1ull << 30), 0).c_str());
+        slog_row(LogLevel::Warning, "", "%s", cache_->ram_summary().c_str());
+        cache_->give_back(std::move(state));
+        return false;
+    }
+    sl.be->export_snapshot(slot, state, base_n);
+    const double ms = (now_s() - t_e) * 1e3;  // > 0.5 s: the request path waited - worth seeing
+    const LogLevel level = ms > 500 ? LogLevel::Warning : LogLevel::Debug;
+    // To the RAM tier only: the disk gets an entry later (idle, RAM pressure, shutdown), if at all.
+    slog_row(level, rows++ ? "" : "cache", "%s, %s tokens -> RAM%s", what, fmt_n(n).c_str(),
+             one_shot ? " only (a one-shot request: never written to disk)" : "");
+    const std::string shape =
+        base_n > 0 ? "+" + fmt_n(n - base_n) + " tokens on the " + fmt_n(base_n) + "-token entry" : std::string("whole");
+    slog_row(level, "", "%s%s, %s MB, export %s ms", ms > 500 ? "WARNING: slow export - " : "", shape.c_str(),
+             fmt_rate(state.size() / 1e6, 0).c_str(), fmt_rate(ms, 0).c_str());
+    rows++;
+    return cache_->put(std::vector<int32_t>(tokens, tokens + n), kind, std::move(state), one_shot, base_n, req_id);
+}
+
+void Engine::flush_pending_turn(Slot &sl, const char *why, bool allow_park) {
+    if (sl.pending.tokens.empty()) return;
+    PendingTurn pt = std::move(sl.pending);
+    sl.pending = PendingTurn();
+    STRIX_CHECK(cache_ != nullptr, "Engine::flush_pending_turn: a held Turn without a prompt cache");
+    const int64_t n = (int64_t)pt.tokens.size();
+    int rows = 0;
+    bool saved = false;
+    slog_row(LogLevel::Debug, "cache", "the held Turn of %s tokens (Request %lld) goes to the prompt cache: %s",
+             fmt_n(n).c_str(), (long long)pt.req_id, why);
+    try {
+        saved = save_state(sl, pt.tokens.data(), LmBackend::kTurnSlot, n, PromptCache::Kind::Turn,
+                           "the held turn", pt.one_shot, pt.req_id, rows, /*hold_turn=*/false, allow_park);
+    } catch (const std::exception &ex) {
+        // The held conversation is lost to the cache (it re-prefills if it comes back); the slot must not carry
+        // a half-saved state into the next conversation, so it starts clean. A failed reset propagates.
+        slog_row(LogLevel::Error, "", "the held Turn could not be saved (%s) - that conversation re-prefills if it "
+                 "returns; the slot resets", ex.what());
+        sl.seq.clear();
+        sl.be->reset();
+    }
+    if (saved) {
+        std::lock_guard<std::mutex> lock(mu_);
+        ++stats_.ram_saves;
+    }
+}
+
+void Engine::drain_parked(Slot &sl) {
+    if (cache_ == nullptr) return;
+    // The parked ids the cache no longer holds go back to the session that carved them - HIP work, so it
+    // runs here on the slot's worker, through the arbiter like any other device work (release_parked).
+    // A refusal is a bug (a spent or foreign id - the session checks loudly), not a condition to route
+    // around: let it throw, the worker's guard fails this request clean and resets.
+    for (const int64_t id : cache_->take_retired()) sl.be->release_parked(id);
+}
+
+bool Engine::renew_due() const {
+    if (options_.kv_renew_margin <= 0 || !be_.can_renew()) return false;
+    const BackendStats b = be_.backend_stats();
+    for (size_t k = 0; k < b.kv_generation_used.size() && k < b.kv_generation_capacity.size(); ++k) {
+        const int64_t cap = b.kv_generation_capacity[k];
+        if (cap > 1 && cap - 1 - b.kv_generation_used[k] <= options_.kv_renew_margin) return true;
+    }
+    return b.parked_generation_capacity > 0 &&
+           b.parked_generation_capacity - b.parked_generation_used <= options_.kv_renew_margin;
+}
+
+void Engine::renew_kv() {
+    // How long the spill may wait for its writes: a parked conversation is at most a slot's K/V (~8 GB at 512k),
+    // written at disk speed - minutes would mean a stuck disk, and then the renewal is called off, not forced.
+    constexpr double kSpillSeconds = 300;
+    const double t0 = now_s();
+    const BackendStats b0 = be_.backend_stats();
+    std::string gens;
+    for (size_t k = 0; k < b0.kv_generation_used.size(); ++k)
+        gens += (k ? ", " : "") + std::to_string(b0.kv_generation_used[k]);
+    slog(LogLevel::Info, "%s", kLogRule);
+    slog_row(LogLevel::Info, "kv renew", "the soft K/V reset: slot generation%s %s of %s, parked %s of %s - the session "
+             "is rebuilt on the loaded model (weights, n-gram rows and the prompt cache stay)",
+             b0.kv_generation_used.size() > 1 ? "s" : "", gens.c_str(),
+             b0.kv_generation_capacity.empty() ? "-" : std::to_string(b0.kv_generation_capacity[0]).c_str(),
+             fmt_n(b0.parked_generation_used).c_str(), fmt_n(b0.parked_generation_capacity).c_str());
+    const char *stage = "the held Turns";
+    try {
+        // 1. Each slot's held Turn to the cache - as a copy: a park would only be written to disk again below.
+        if (cache_)
+            for (auto &s : slots_) flush_pending_turn(*s, "the K/V budget renews", /*allow_park=*/false);
+        // 2. Every parked conversation to disk: its pages go with the old session.
+        stage = "the parked entries";
+        PromptCache::Spill sp;
+        if (cache_ && be_.paged_states()) {
+            sp = cache_->spill_parked(kSpillSeconds);
+            STRIX_CHECK(sp.left == 0, "Engine::renew_kv: ", sp.left, " parked entries were still being written after ",
+                        fmt_rate(sp.seconds, 0), " s - the session keeps them");
+            slog_row(LogLevel::Info, "", "parked conversations: %s written to disk (%s GB of pages), %s dropped "
+                     "(one-shot, or no room), %s s", fmt_n(sp.written).c_str(), fmt_rate(sp.bytes / 1e9, 1).c_str(),
+                     fmt_n(sp.dropped).c_str(), fmt_rate(sp.seconds, 2).c_str());
+        }
+        // 3. Their records back to the session that carved them (renew refuses while one is live).
+        stage = "the parked records";
+        int64_t released = 0;
+        if (cache_ && be_.paged_states())
+            for (const int64_t id : cache_->take_retired()) be_.release_parked(0, id), ++released;
+        // 4. The new session: the old one's destructor frees its reservation, which is what makes even reused
+        // addresses read right again.
+        stage = "the session rebuild";
+        const double t_r = now_s();
+        be_.renew();
+        const double rebuild_ms = (now_s() - t_r) * 1e3;
+        // 5. Every slot starts empty: its conversation is in the prompt cache (or re-prefills).
+        for (auto &s : slots_) s->seq.clear(), s->pending = PendingTurn(), s->needs_reset = false;
+        const double ms = (now_s() - t0) * 1e3;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            for (auto &s : slots_) {
+                s->turn_pos = -1;
+                stats_.slot_live_tokens[(size_t)s->index] = 0, stats_.slot_snapshot_pos[(size_t)s->index] = -1;
+            }
+            stats_.live_tokens = 0;
+            kv_refusal_.clear();  // the budget is back: /health is no longer degraded by an old refusal
+            ++stats_.kv_renewals, stats_.kv_renew_last_ms = ms;
+        }
+        const BackendStats b1 = be_.backend_stats();
+        slog_row(LogLevel::Info, "", "%s parked records given back, session rebuilt in %s ms; generation %s of %s "
+                 "again", fmt_n(released).c_str(), fmt_rate(rebuild_ms, 0).c_str(),
+                 b1.kv_generation_used.empty() ? "-" : std::to_string(b1.kv_generation_used[0]).c_str(),
+                 b1.kv_generation_capacity.empty() ? "-" : std::to_string(b1.kv_generation_capacity[0]).c_str());
+        slog_row(LogLevel::Info, "done", "%9s s total, renewal %lld of this process", fmt_rate(ms / 1e3, 2).c_str(),
+                 (long long)b1.kv_renewals);
+        slog(LogLevel::Info, "%s", kLogRule);
+    } catch (const std::exception &ex) {
+        const bool lost = dynamic_cast<const GpuFatalError *>(&ex) != nullptr || be_.failed();
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            ++stats_.kv_renew_failures;
+            renew_off_ = true;  // no retry loop: the exhaustion refusal stays the guard, a restart reclaims
+        }
+        for (auto &s : slots_) s->seq.clear(), s->pending = PendingTurn();
+        if (!lost) {
+            // Nothing is half-done that matters: every step before the rebuild only moved conversations into the
+            // prompt cache. The slots start clean (their next request resets them).
+            for (auto &s : slots_) s->needs_reset = true;
+            slog_row(LogLevel::Error, "error", "the soft K/V reset failed at %s: %s", stage, ex.what());
+            slog_row(LogLevel::Error, "", "serving goes on in this session; no further renewal in this process - at "
+                     "exhaustion requests are refused (HTTP 503 kv_budget_exhausted) until a restart");
+            slog(LogLevel::Info, "%s", kLogRule);
+            return;
+        }
+        // The old session is gone and no new one stands: nothing can run. As a lost GPU context: fail the
+        // queue, refuse new requests, and let the supervisor restart the server.
+        const std::string what = std::string("the soft K/V reset failed at ") + stage + ": " + ex.what();
+        slog_row(LogLevel::Error, "error", "FATAL: %s", what.c_str());
+        slog_row(LogLevel::Error, "", "FATAL: no session to serve on: failing the queued requests%s",
+                 options_.on_fatal ? ", the server exits for its supervisor to restart it" : "");
+        slog(LogLevel::Info, "%s", kLogRule);
+        std::deque<Job> failed;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            fatal_ = what;
+            failed.swap(queue_);
+            stats_.queued = 0;
+        }
+        for (Job &j : failed) {
+            GenerationResult r;
+            r.finish_reason = "error", r.error = what + "; the server is restarting";
+            deliver(j, r);
+        }
+        if (options_.on_fatal) options_.on_fatal(what);
+    }
+}
+
 namespace {
 // A finished request's detail rows, before its cache saves: MTP and PLE (debug), a dropped tool call.
 void log_detail(const GenerationResult &r) {
-    // Only when it happens: a conversation that lost batching to its own history is worth a line, one that
-    // never did is not. This is why a slot verifies never show up in a batch, in the block that pays for it.
-    if (r.verify_solo_mrope > 0)
-        slog_row(LogLevel::Info, "batching",
-                 "alone %s (mRoPE position state: an image in this conversation - a multi-run forward takes scalar "
-                 "positions only), shared %s",
-                 fmt_n(r.verify_solo_mrope).c_str(), fmt_n(r.verify_shared_runs).c_str());
     if (r.mtp_drafted_tokens > 0) {
         char per_forward[48] = "";
         if (r.decode_forwards > 0)
@@ -589,8 +973,25 @@ void Engine::run(Job &job, Slot &sl) {
         job.result_sent = true;  // the worker's guard leaves the one-delivery duty to this call
         sink.on_done(res);       // sinks must not throw (GenerationSink's contract, serve/engine.hpp)
     };
+    // A failed forward leaves the session unusable until reset: start clean for the next request.
+    const auto fail_clean = [&](const std::exception &e) {
+        slog_row(LogLevel::Error, "error", "ERROR: %s", e.what());
+        sl.pending = PendingTurn();  // whatever it held is gone with the state
+        try {
+            sl.be->reset();
+        } catch (const std::exception &e2) {
+            slog_row(LogLevel::Error, "", "ERROR: the reset after it failed too: %s", e2.what());
+        }
+        sl.seq.clear();
+        res.error = e.what();
+        finish("error");
+    };
     try {
         sink.on_start();
+        // Parked records retired since the last drain go back now, before this request's K/V growth asks
+        // the prompt cache for RAM those pages still hold (they are not cache entries any more - only a
+        // drain can free them).
+        drain_parked(sl);
         // Image prompt (vision, Phase D): resume / cache matching and sl.seq run on the key stream (image_pad
         // runs replaced by content-derived pseudo ids, serve/vision_request.cpp), the forwards on the real
         // ids. Text prompts: both are req.prompt - the path is bit-identical and allocation-free.
@@ -1117,10 +1518,6 @@ void Engine::run(Job &job, Slot &sl) {
             step(0, 0, 1);
         }
         decoding.end();
-        if (sl.proxy) {  // the window closed with the decode: these numbers are this request own
-            const GpuArbiter::VerifyWindow vw = sl.proxy->verify_window();
-            res.verify_shared_runs = vw.shared, res.verify_solo_mrope = vw.solo_mrope;
-        }
         parser.finish(events);
         if (!events.empty()) sink.on_events(events);
         res.reasoning_tokens = parser.reasoning_tokens();
@@ -1153,54 +1550,8 @@ void Engine::run(Job &job, Slot &sl) {
             const double t0 = now_s();
             int saved = 0, rows = 0;  // rows: the first gets the "cache" label
             const auto save = [&](int slot, int64_t n, PromptCache::Kind kind, const char *what) {
-                // Already cached first: a request resumed exactly at its turn entry has no snapshot there, and needs none.
-                const char *skip = n <= 0                                ? "no such point in the prompt"
-                                   : cache_->contains(prompt.data(), n) ? nullptr
-                                   : sl.be->snapshot_pos(slot) != n         ? "no snapshot there"
-                                   : !sl.be->can_restore_snapshot(slot)     ? "snapshot no longer valid"
-                                                                         : "";
-                if (skip == nullptr) return;  // already cached
-                if (*skip) {
-                    slog_row(LogLevel::Debug, rows++ ? "" : "cache", "%s, %s tokens: not saved - %s (snapshot at %s)",
-                             what, fmt_n(n).c_str(), skip, fmt_n(sl.be->snapshot_pos(slot)).c_str());
-                    return;
-                }
-                const double t_e = now_s();
-                // The replaced turn's buffer first (grown by this turn's few MB), else a spare: a fresh multi-GB buffer
-                // costs ~100 ms per GB of page population on the request path.
-                // A Turn of a deep conversation goes as a delta on the whole entry it extends (PromptCache "Delta entries").
-                const int64_t base_n = cache_->delta_base(prompt.data(), n, kind);
-                HostBuffer state = kind == PromptCache::Kind::System ? HostBuffer()
-                                                                      : cache_->take_replaced_buffer(prompt.data(), n, base_n);
-                if (state.capacity() == 0) state = cache_->take_buffer();
-                // Room before the buffer grows (PromptCache::make_room_for): else no save - never past the margin.
-                const uint64_t want = sl.be->snapshot_bytes(slot, base_n);
-                if (want > state.capacity() && !cache_->make_room_for(want - state.capacity())) {
-                    slog_row(LogLevel::Warning, rows++ ? "" : "cache",
-                             "%s, %s tokens: not saved - no room in RAM (needs %s GB more; MemAvailable %s GiB, margin %s "
-                             "GiB)", what, fmt_n(n).c_str(), fmt_rate((want - state.capacity()) / 1e9, 1).c_str(),
-                             fmt_rate(cache_->mem_available_now() / (double)(1ull << 30), 1).c_str(),
-                             fmt_rate(cache_->options().ram_margin / (double)(1ull << 30), 0).c_str());
-                    slog_row(LogLevel::Warning, "", "%s", cache_->ram_summary().c_str());
-                    cache_->give_back(std::move(state));
-                    return;
-                }
-                sl.be->export_snapshot(slot, state, base_n);
-                const double ms = (now_s() - t_e) * 1e3;  // > 0.5 s: the request path waited - worth seeing
-                const LogLevel level = ms > 500 ? LogLevel::Warning : LogLevel::Debug;
-                // To the RAM tier only: the disk gets an entry later (idle, RAM pressure, shutdown), if at all.
-                slog_row(level, rows++ ? "" : "cache", "%s, %s tokens -> RAM%s", what, fmt_n(n).c_str(),
-                         req.one_shot ? " only (a one-shot request: never written to disk)" : "");
-                const std::string shape = base_n > 0 ? "+" + fmt_n(n - base_n) + " tokens on the " +
-                                                            fmt_n(base_n) + "-token entry"
-                                                     : std::string("whole");
-                slog_row(level, "", "%s%s, %s MB, export %s ms", ms > 500 ? "WARNING: slow export - " : "", shape.c_str(),
-                         fmt_rate(state.size() / 1e6, 0).c_str(), fmt_rate(ms, 0).c_str());
-                rows++;
-                if (!cache_->put(std::vector<int32_t>(prompt.begin(), prompt.begin() + n), kind, std::move(state),
-                                 req.one_shot, base_n, req.id))
-                    return;
-                ++saved;
+                if (save_state(sl, prompt.data(), slot, n, kind, what, req.one_shot, req.id, rows, /*hold_turn=*/true))
+                    ++saved;
             };
             if (save_sys) save(LmBackend::kSystemSlot, sys, PromptCache::Kind::System, "the system prompt's end");
             // The checkpoint is the start of the user message, not its end: clients rewrite the latest user message
@@ -1208,6 +1559,10 @@ void Engine::run(Job &job, Slot &sl) {
             // includes it never matches again. The turn itself is a plain Turn, replaced by the tool loop's next.
             if (ust >= 0) save(LmBackend::kUserSlot, ust, PromptCache::Kind::Checkpoint, "the last user message's start");
             save(LmBackend::kTurnSlot, cut, PromptCache::Kind::Turn, "the reply's start");
+            // Hand back the records this request's saves made redundant (the Turn entry a new Turn replaced,
+            // a consumed one a write finished) now, not at the next request: their pages are RAM this
+            // machine wants back.
+            drain_parked(sl);
             std::lock_guard<std::mutex> lock(mu_);
             stats_.ram_saves += saved, stats_.export_seconds += now_s() - t0;
         }
@@ -1219,19 +1574,44 @@ void Engine::run(Job &job, Slot &sl) {
                  "new ones%s", options_.on_fatal ? ", the server exits for its supervisor to restart it" : "");
         sl.fatal_pending = e.what();
         sl.seq.clear();
+        sl.pending = PendingTurn();
         res.error = e.what();
         finish("error");
-    } catch (const std::exception &e) {
-        // A failed forward leaves the session unusable until reset: start clean for the next request.
-        slog_row(LogLevel::Error, "error", "ERROR: %s", e.what());
-        try {
-            sl.be->reset();
-        } catch (const std::exception &e2) {
-            slog_row(LogLevel::Error, "", "ERROR: the reset after it failed too: %s", e2.what());
+    } catch (const KvBudgetExhausted &e) {
+        // The K/V generation budget is spent (the policy: refuse cleanly, only a restart reclaims). Every such
+        // refusal runs before anything changes (STRIX_CHECK_KV_BUDGET), so the slot still holds its conversation
+        // and sl.seq still names it: no reset - a reset would need the very generation that is missing - and that
+        // conversation keeps being served live. Any other prompt on this slot gets this same named refusal until
+        // the restart.
+        if (sl.be->failed()) {  // can't happen (the refusals touch nothing) - but a broken session is never served on
+            fail_clean(e);
+        } else {
+            bool first = false;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                if (kv_refusal_.empty()) kv_refusal_ = e.what(), first = true;
+            }
+            slog_row(LogLevel::Error, "error", "REFUSED: the K/V generation budget is spent - %s", e.what());
+            const bool renews = kv_renew_available();
+            if (renews)
+                slog_row(LogLevel::Error, "", "the soft K/V reset rebuilds the session as soon as the running requests "
+                         "finish (kv-renew-margin); /health says degraded until then");
+            else
+                slog_row(LogLevel::Error, "", "this slot serves only the conversation it holds until the server restarts "
+                         "(a restart reclaims the budget: kv-generations); /health says degraded%s",
+                         first ? " from now on" : "");
+            res.error = renews ? std::string("the K/V generation budget is spent (kv-generations): the session renews "
+                                             "itself as soon as the running requests finish - retry in a few seconds (") +
+                                     e.what() + ")"
+                               : std::string("the K/V generation budget is spent (kv-generations): until the server "
+                                             "restarts it serves only the conversation its slot holds, and refuses to "
+                                             "start or switch to another - a restart reclaims the budget (") +
+                                     e.what() + ")";
+            res.error_type = kErrorKvBudget;
+            finish("error");
         }
-        sl.seq.clear();
-        res.error = e.what();
-        finish("error");
+    } catch (const std::exception &e) {
+        fail_clean(e);
     }
 }
 
