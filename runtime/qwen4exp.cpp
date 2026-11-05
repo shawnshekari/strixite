@@ -543,6 +543,7 @@ Qwen4ExpSeqState::Qwen4ExpSeqState(const Qwen4ExpModel &model, int64_t capacity,
     }
 }
 
+
 // /proc/meminfo's MemAvailable in bytes (the slot allocation guard); 0 if it can't be read (the guard then refuses
 // any slot past the first rather than guess).
 uint64_t Qwen4ExpSession::mem_available_bytes() {
@@ -597,9 +598,36 @@ void Qwen4ExpSession::for_paged(Qwen4ExpSeqState &sq, int64_t end, const std::fu
 }
 
 void Qwen4ExpSession::ensure_rows(Qwen4ExpSeqState &sq, int64_t end) {
+    if (total_capacity_ > 0) {
+        int64_t total_tokens = 0;
+        for (const auto &s : seqs_) {
+            total_tokens += (s.get() == &sq ? end : s->ensured_rows);
+        }
+        if (total_tokens > total_capacity_) {
+            // Evict/reclaim memory only from IDLE slots (!slot_busy_[k])
+            for (size_t k = 0; k < seqs_.size(); ++k) {
+                if (seqs_[k].get() != &sq && (k >= slot_busy_.size() || !slot_busy_[k]) &&
+                    seqs_[k]->ensured_rows > precommitted_rows_) {
+                    reset_seq_state(*seqs_[k]);
+                    if (on_slot_evicted_) on_slot_evicted_((int)k);
+                    total_tokens = 0;
+                    for (const auto &s : seqs_) {
+                        total_tokens += (s.get() == &sq ? end : s->ensured_rows);
+                    }
+                    if (total_tokens <= total_capacity_) break;
+                }
+            }
+        }
+        STRIX_CHECK(total_tokens <= total_capacity_,
+                    "Qwen4ExpSession: total tokens across all active slots would reach ", total_tokens,
+                    ", exceeding total-capacity ", total_capacity_);
+    }
     uint64_t missing = 0;
     for_paged(sq, end, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &r) { missing += b.missing_bytes(r); });
-    if (missing == 0) return;
+    if (missing == 0) {
+        sq.ensured_rows = std::max(sq.ensured_rows, end);
+        return;
+    }
     if (kv_budget_) {
         kv_budget_(missing);  // throws to refuse (nothing mapped yet)
     } else {
@@ -609,6 +637,14 @@ void Qwen4ExpSession::ensure_rows(Qwen4ExpSeqState &sq, int64_t end) {
                     kSlotFloorBytes >> 30, " GiB floor");
     }
     for_paged(sq, end, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &r) { b.ensure(r); });
+    sq.ensured_rows = std::max(sq.ensured_rows, end);
+}
+
+void Qwen4ExpSession::precommit() {
+    for (size_t k = 0; k < seqs_.size(); ++k) {
+        ensure_rows(*seqs_[k], capacity_);
+    }
+    precommitted_rows_ = capacity_;
 }
 
 uint64_t Qwen4ExpSession::kv_full_bytes() const {
@@ -1061,10 +1097,11 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
         }
     }
     if (qsa) {
-        qsa_scores_ = DeviceBuffer<float>((size_t)(M * cap_blocks_), "QSA block scores");
+        const int64_t qsa_tile = std::min<int64_t>(M, 1024);
+        qsa_scores_ = DeviceBuffer<float>((size_t)(qsa_tile * cap_blocks_), "QSA block scores");
         qsa_sel_ = DeviceBuffer<int32_t>((size_t)(M * qsa_k), "QSA kept blocks");
         qsa_nsel_ = DeviceBuffer<int32_t>((size_t)M, "QSA kept block counts");
-        qsa_topk_ws_bytes_ = kernels::qsa_topk_workspace_bytes(M);
+        qsa_topk_ws_bytes_ = kernels::qsa_topk_workspace_bytes(qsa_tile);
         qsa_topk_ws_ = DeviceBuffer<uint8_t>(qsa_topk_ws_bytes_, "QSA top-k workspace");
         STRIX_HIP_CHECK(hipMemset(qsa_topk_ws_.get(), 0, qsa_topk_ws_bytes_), "zero the QSA top-k workspace");
     }
@@ -1122,6 +1159,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
         seqs_.push_back(std::make_unique<Qwen4ExpSeqState>(m_, capacity, max_tokens, mtp, kv, *kv_res_, kv_layout_,
                                                             /*slot=*/k));
     }
+    slot_busy_.assign(seqs_.size(), 0);
     reset();
 }
 
@@ -1604,7 +1642,7 @@ void Qwen4ExpSession::reset_seq_state(Qwen4ExpSeqState &s) {
     });
     const int slot = seq_index(s);
     kv_budget_for_reset(s);  // the budget refusal first, before any buffer steps (the per-buffer check is a drift guard)
-    if (kv_layout_.generations > 1 && !fresh) {
+    if (!is_precommitted() && kv_layout_.generations > 1 && !fresh) {
         uint32_t gen_now = 0, gen_cap = 0;  // every buffer of the slot advances together; the log names the slot
         auto advance = [&](PagedDeviceBuffer &b) {
             if (b.capacity() == 0) return;  // the other layer kind's default-constructed buffer
@@ -1626,6 +1664,7 @@ void Qwen4ExpSession::reset_seq_state(Qwen4ExpSeqState &s) {
              "(one-use addresses; reaching %u refuses the next switch - only a restart reclaims)",
              slot, gen_now, gen_cap, gen_cap);
     }
+    s.ensured_rows = precommitted_rows_;
     {
         s.pos = 0, s.tail_cur = 0, s.mtp_tail_cur = 0, s.mtp_chain_step = -1, s.verify_pending = false;  // GDN states reset on the first call (reset_state); KV overwritten
         s.verify_rows = 0, s.verify_carry = 0, s.verify_row_base = 0, s.verify_ple_wbase = 0;
@@ -3098,13 +3137,18 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                     // blocks, gathered attention. Queries that still see every key keep all their blocks -
                     // the dense set. Scores / selection are row-indexed: each run gets its slice.
                     const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
-                    void *iq = at(proj_, r.base * D.astride + D.idx_col);  // normed + roped by the jobs above
-                    kernels::qsa_scores(iq, D.astride, D.idx_d, r.Tr, r.p, D.idx_h, D.idx_d,
-                                        sq.block_keys[(size_t)i].get(), cap_blocks_,
-                                        qsa_scores_.get() + (size_t)(r.base * cap_blocks_), cap_blocks_, act, stream_);
-                    kernels::qsa_topk(qsa_scores_.get() + (size_t)(r.base * cap_blocks_), cap_blocks_, r.Tr, r.p, qsa_k,
-                                      qsa_sel_.get() + (size_t)(r.base * qsa_k), qsa_nsel_.get() + r.base,
-                                      qsa_topk_ws_.get(), qsa_topk_ws_bytes_, stream_);
+                    const int64_t qsa_tile = std::min<int64_t>(max_tokens_, 1024);
+                    for (int64_t off = 0; off < r.Tr; off += qsa_tile) {
+                        const int64_t tile_t = std::min<int64_t>(r.Tr - off, qsa_tile);
+                        void *tile_q = at(proj_, (r.base + off) * D.astride + D.idx_col);
+                        kernels::qsa_scores(tile_q, D.astride, D.idx_d, tile_t, r.p + off, D.idx_h, D.idx_d,
+                                            sq.block_keys[(size_t)i].get(), cap_blocks_,
+                                            qsa_scores_.get(), cap_blocks_, act, stream_);
+                        kernels::qsa_topk(qsa_scores_.get(), cap_blocks_, tile_t, r.p + off, qsa_k,
+                                          qsa_sel_.get() + (size_t)((r.base + off) * qsa_k),
+                                          qsa_nsel_.get() + r.base + off,
+                                          qsa_topk_ws_.get(), qsa_topk_ws_bytes_, stream_);
+                    }
                     show(L + "qsa_sel", qsa_sel_.get() + (size_t)(r.base * qsa_k), qsa_k, ProbeType::I32);
                     show(L + "qsa_nsel", qsa_nsel_.get() + r.base, 1, ProbeType::I32);
                     stage_kv8(std::min<int64_t>(D.qsa_budget, r.p + r.Tr));

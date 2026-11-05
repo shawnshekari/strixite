@@ -78,6 +78,16 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
     const int n = be_.n_seqs();
     STRIX_CHECK(n >= 1 && n <= 8, "Engine: the backend holds ", n, " conversations, expected 1..8");
     if (n > 1) arbiter_ = std::make_unique<GpuArbiter>(be_);
+    be_.set_on_slot_evicted([this](int k) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (k >= 0 && (size_t)k < slots_.size()) {
+            slots_[(size_t)k]->seq.clear();
+            slots_[(size_t)k]->turn_pos = 0;
+            stats_.slot_live_tokens[(size_t)k] = 0;
+            stats_.live_tokens = 0;
+            for (int64_t v : stats_.slot_live_tokens) stats_.live_tokens += v;
+        }
+    });
     for (int k = 0; k < n; ++k) {
         auto sl = std::make_unique<Slot>();
         sl->index = k;
@@ -170,7 +180,7 @@ void Engine::submit(GenerationRequest req, std::shared_ptr<GenerationSink> sink)
             slog(LogLevel::Info, "Request %lld queued: %s ahead of it (Request%s %s running)", (long long)req.id,
                  fmt_n((long long)queue_.size() + stats_.busy).c_str(), stats_.busy > 1 ? "s" : "", running.c_str());
         }
-        queue_.push_back({std::move(req), std::move(sink), now_s()});
+        queue_.push_back({std::move(req), std::move(sink), now_s(), ""});
         ++stats_.queued;
         dispatch_locked();
     }
@@ -276,6 +286,7 @@ void Engine::dispatch_locked() {
         queue_.pop_front();
         best->job->slot_why = std::move(why);
         best->busy = true, best->running_id = best->job->req.id, best->last_used = now_s();
+        be_.set_slot_busy(best->index, true);
         --stats_.queued, ++stats_.busy;
         stats_.slot_request[(size_t)best->index] = best->running_id;
     }
@@ -356,6 +367,7 @@ void Engine::worker(Slot &sl) {
             released = true;
             std::lock_guard<std::mutex> lock(mu_);
             sl.busy = false, sl.running_id = 0, sl.running_key.clear(), --stats_.busy;
+            be_.set_slot_busy(sl.index, false);
             idle_since_ = now_s();
             sl.turn_pos = snap;
             stats_.slot_request[(size_t)sl.index] = 0,
@@ -411,6 +423,7 @@ void Engine::worker(Slot &sl) {
                     failed.swap(queue_);
                     stats_.queued = 0, --stats_.busy;
                     sl.busy = false, sl.running_id = 0, sl.running_key.clear(), stats_.slot_request[(size_t)sl.index] = 0;
+                    be_.set_slot_busy(sl.index, false);
                 }
                 released = true;  // that was this slot's idle bookkeeping; the guard must not redo it
                 for (Job &j : failed) {

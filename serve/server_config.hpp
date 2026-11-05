@@ -32,6 +32,7 @@ struct ConfigOption {
     double lo = 0, hi = 0;  // Int / Number only
     std::string default_value;  // in the file / flag syntax; validated like any other value
     std::string help;           // one line for the usage text
+    std::string alias_for = ""; // canonical option name if this option is an alias, else ""
 };
 
 // One option's effective value and where it came from: "default", "file:LINE" or "flag".
