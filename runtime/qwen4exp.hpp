@@ -520,9 +520,6 @@ struct Qwen4ExpSeqState {
     // Current ensured positions across all paged arrays of this slot.
     int64_t ensured_rows = 0;
 
-    // Releases mapped physical K/V pages back to the system by recreating the paged buffers
-    // with fresh zero-mapped virtual address reservations.
-    void reclaim_paged(const Qwen4ExpModel &model, int64_t capacity, KvFormat kv);
 
     // The MTP head's state exists with mtp (Qwen4ExpSession::forward's MTP catch-up and the draft check this).
     bool mtp = false;
@@ -571,7 +568,7 @@ public:
     void set_total_capacity(int64_t tokens) { total_capacity_ = tokens; }
     int64_t total_capacity() const { return total_capacity_; }
     void set_slot_busy(int seq, bool busy) {
-        if (seq >= 0 && (size_t)seq < slot_busy_.size()) slot_busy_[(size_t)seq] = busy;
+        if (seq >= 0 && (size_t)seq < slot_busy_.size()) slot_busy_[(size_t)seq] = busy ? 1 : 0;
     }
     void set_on_slot_evicted(std::function<void(int seq)> f) { on_slot_evicted_ = std::move(f); }
     void set_kv_budget(std::function<void(uint64_t bytes)> f) { kv_budget_ = std::move(f); }
@@ -943,7 +940,7 @@ private:
     PrecisionOptions precision_;
     int64_t precommitted_rows_ = 0;
     int64_t total_capacity_ = 0;
-    std::vector<bool> slot_busy_;
+    std::vector<uint8_t> slot_busy_;
     std::function<void(int seq)> on_slot_evicted_;
     hipStream_t stream_ = nullptr;
     // KvFormat::Q8 (the states' k_cache / v_cache empty then): kv_new_ [max_tokens][2W] the forward's new

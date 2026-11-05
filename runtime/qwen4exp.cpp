@@ -543,33 +543,6 @@ Qwen4ExpSeqState::Qwen4ExpSeqState(const Qwen4ExpModel &model, int64_t capacity,
     }
 }
 
-void Qwen4ExpSeqState::reclaim_paged(const Qwen4ExpModel &model, int64_t capacity, KvFormat kv) {
-    const Qwen4ExpDims &D = model.dims();
-    const size_t e = es(model.act());
-    const int64_t cap_blocks = capacity / kernels::kQsaBlock + 1;
-    const int64_t kv8_cap = (capacity + kernels::kKv8Group - 1) / kernels::kKv8Group * kernels::kKv8Group;
-    const int64_t W = D.hkv * D.hd;
-    const bool q8 = kv == KvFormat::Q8;
-    for (int64_t i = 0; i < D.layers; ++i) {
-        const std::string tag = "layer " + std::to_string(i);
-        const bool attn = D.is_attention[(size_t)i];
-        if (attn && !q8) {
-            k_cache[(size_t)i] = PagedDeviceBuffer((size_t)(capacity * W) * e, kPageBytes, "K cache " + tag);
-            v_cache[(size_t)i] = PagedDeviceBuffer((size_t)(capacity * W) * e, kPageBytes, "V cache " + tag);
-        }
-        if (attn && q8) {
-            kv8_store[(size_t)i] = PagedDeviceBuffer(kernels::kv8_bytes(kv8_cap, W), kPageBytes, "8-bit K/V " + tag);
-        }
-        if (attn) {
-            block_keys[(size_t)i] = PagedDeviceBuffer((size_t)(cap_blocks * D.idx_d) * e, kPageBytes, "block keys " + tag);
-        }
-    }
-    if (mtp) {
-        k_cache_mtp = PagedDeviceBuffer((size_t)(capacity * D.hkv * D.hd) * e, kPageBytes, "MTP K cache");
-        v_cache_mtp = PagedDeviceBuffer((size_t)(capacity * D.hkv * D.hd) * e, kPageBytes, "MTP V cache");
-        block_keys_mtp = PagedDeviceBuffer((size_t)(cap_blocks * D.idx_d) * e, kPageBytes, "MTP block keys");
-    }
-}
 
 // /proc/meminfo's MemAvailable in bytes (the slot allocation guard); 0 if it can't be read (the guard then refuses
 // any slot past the first rather than guess).
@@ -1186,7 +1159,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
         seqs_.push_back(std::make_unique<Qwen4ExpSeqState>(m_, capacity, max_tokens, mtp, kv, *kv_res_, kv_layout_,
                                                             /*slot=*/k));
     }
-    slot_busy_.assign(seqs_.size(), false);
+    slot_busy_.assign(seqs_.size(), 0);
     reset();
 }
 

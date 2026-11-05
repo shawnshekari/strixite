@@ -180,7 +180,7 @@ void Engine::submit(GenerationRequest req, std::shared_ptr<GenerationSink> sink)
             slog(LogLevel::Info, "Request %lld queued: %s ahead of it (Request%s %s running)", (long long)req.id,
                  fmt_n((long long)queue_.size() + stats_.busy).c_str(), stats_.busy > 1 ? "s" : "", running.c_str());
         }
-        queue_.push_back({std::move(req), std::move(sink), now_s()});
+        queue_.push_back({std::move(req), std::move(sink), now_s(), ""});
         ++stats_.queued;
         dispatch_locked();
     }
