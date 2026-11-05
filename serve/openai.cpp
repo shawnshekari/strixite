@@ -2,6 +2,7 @@
 
 #include "common/check.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 namespace strix {
@@ -157,8 +158,28 @@ template <typename R> void parse_common(const json::Value &body, R &r, bool lega
     for (const char *pen : {"presence_penalty", "frequency_penalty", "repetition_penalty"})
         if (const json::Value *v = field(body, pen); v && get_number(*v, pen) != (std::string(pen) == "repetition_penalty" ? 1.0 : 0.0))
             bad(pen, std::string("'") + pen + "' is not supported");
-    if (const json::Value *v = field(body, "logit_bias"); v && !(v->is_object() && v->as_object("logit_bias").empty()))
-        bad("logit_bias", "'logit_bias' is not supported");
+    if (const json::Value *v = field(body, "logit_bias"); v && !v->is_null()) {
+        if (!v->is_object()) bad("logit_bias", "'logit_bias' must be an object mapping token ids to biases");
+        std::vector<std::pair<int32_t, float>> entries;
+        for (const auto &[key, value] : v->as_object("logit_bias")) {
+            // A token id in plain decimal: "5", not "05", "+5", "5.0" or " 5" - so two keys never name one token.
+            const bool digits = !key.empty() && key.size() <= 9 &&
+                                std::all_of(key.begin(), key.end(), [](char c) { return c >= '0' && c <= '9'; }) &&
+                                (key.size() == 1 || key[0] != '0');
+            if (!digits)
+                bad("logit_bias", "'logit_bias' keys must be token ids in decimal (\"1234\"), got \"" +
+                                      key.substr(0, 32) + (key.size() > 32 ? "..." : "") + "\"");
+            const double b = get_number(value, "logit_bias");
+            if (!(std::isfinite(b) && b >= -LogitBias::kMax && b <= LogitBias::kMax))
+                bad("logit_bias", "'logit_bias' of token " + key + " must be in [-100, 100]");
+            if (b != 0) entries.push_back({(int32_t)std::stol(key), (float)b});
+        }
+        std::sort(entries.begin(), entries.end());
+        auto bias = std::make_shared<LogitBias>();
+        for (const auto &[id, b] : entries) bias->id.push_back(id), bias->v.push_back(b);
+        if (!bias->empty()) r.logit_bias = std::move(bias);
+        r.sampling_asked.push_back("logit_bias");
+    }
 }
 
 }  // namespace

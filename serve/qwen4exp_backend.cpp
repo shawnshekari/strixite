@@ -6,6 +6,7 @@
 #include "runtime/ngram_table.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cstdio>
 
 namespace strix {
@@ -258,6 +259,33 @@ std::string Qwen4ExpBackend::describe() const {
            }();
 }
 
+namespace {
+
+// A request's logit bias as kernel entries over rows [row0, row0 + rows) of a forward's logits (none if masks has none).
+void append_bias(std::vector<kernels::LogitBiasEntry> &out, const LogitMasks *masks, int64_t row0, int64_t rows) {
+    if (masks == nullptr || !masks->has_bias()) return;
+    STRIX_CHECK(row0 >= 0 && rows >= 1 && row0 + rows <= INT32_MAX, "Qwen4ExpBackend: logit bias rows ", row0, "+",
+                rows, ", expected inside 0..", INT32_MAX);
+    const LogitBias &b = *masks->bias;
+    out.reserve(out.size() + b.id.size());
+    for (size_t i = 0; i < b.id.size(); ++i) out.push_back({(int32_t)row0, (int32_t)rows, b.id[i], b.v[i]});
+}
+
+}  // namespace
+
+void Qwen4ExpBackend::want_candidates(int64_t n_valid, const LogitMasks *masks,
+                                      const std::vector<kernels::LogitBiasEntry> &bias) {
+    const bool bits = masks != nullptr && masks->has_bits();
+    session_->want_candidates(n_valid, bits ? masks->bits.data() : nullptr, bits ? masks->rows : 0,
+                              bits ? masks->words : 0, bias.empty() ? nullptr : bias.data(), (int64_t)bias.size());
+}
+
+void Qwen4ExpBackend::want_candidates(int64_t n_valid, const LogitMasks *masks, int64_t n_logits) {
+    std::vector<kernels::LogitBiasEntry> bias;
+    append_bias(bias, masks, 0, n_logits);
+    want_candidates(n_valid, masks, bias);
+}
+
 LogitRows Qwen4ExpBackend::rows_of(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid,
                                    const LogitMasks *masks, bool verify) {
     if (masks != nullptr) masks->check(n_logits, logits_row(), "Qwen4ExpBackend::forward_rows");
@@ -267,8 +295,7 @@ LogitRows Qwen4ExpBackend::rows_of(const std::vector<int32_t> &ids, int64_t n_lo
         if (masks != nullptr) apply_masks(l, *masks);
         return l;
     }
-    if (masks != nullptr) session_->want_candidates(n_valid, masks->bits.data(), masks->rows, masks->words);
-    else session_->want_candidates(n_valid);
+    want_candidates(n_valid, masks, n_logits);
     if (verify) session_->forward_verify(ids, n_logits);
     else session_->forward(ids, n_logits);
     return candidate_rows(n_logits);
@@ -292,8 +319,7 @@ LogitRows Qwen4ExpBackend::forward_image_prefill(const std::vector<int32_t> &ids
         if (masks != nullptr) apply_masks(l, *masks);
         return l;
     }
-    if (masks != nullptr) session_->want_candidates(n_valid, masks->bits.data(), masks->rows, masks->words);
-    else session_->want_candidates(n_valid);
+    want_candidates(n_valid, masks, n_logits);
     session_->forward(ids, n_logits, &in);
     return candidate_rows(n_logits);
 }
@@ -324,25 +350,30 @@ LogitRows Qwen4ExpBackend::forward_rows(int seq, const std::vector<int32_t> &ids
         if (masks != nullptr) apply_masks(l, *masks);
         return l;
     }
-    if (masks != nullptr) session_->want_candidates(n_valid, masks->bits.data(), masks->rows, masks->words);
-    else session_->want_candidates(n_valid);
+    want_candidates(n_valid, masks, n_logits);
     session_->forward_batch(run);
     return candidate_rows(n_logits);
 }
 
-LogitMasks Qwen4ExpBackend::batch_masks(const std::vector<VerifyRun> &runs) const {
+LogitMasks Qwen4ExpBackend::batch_masks(const std::vector<VerifyRun> &runs,
+                                        std::vector<kernels::LogitBiasEntry> &bias_out) const {
     LogitMasks m;
-    for (const VerifyRun &r : runs)
+    bias_out.clear();
+    int64_t row0 = 0;
+    for (const VerifyRun &r : runs) {
         if (r.masks != nullptr) {
             r.masks->check((int64_t)r.ids.size(), logits_row(), "Qwen4ExpBackend::verify_batch");
-            m.words = std::max(m.words, r.masks->words);
+            if (r.masks->has_bits()) m.words = std::max(m.words, r.masks->words);
+            append_bias(bias_out, r.masks, row0, (int64_t)r.ids.size());
         }
+        row0 += (int64_t)r.ids.size();
+    }
     if (m.words == 0) return m;
     for (const VerifyRun &r : runs) m.rows += (int64_t)r.ids.size();
     m.bits.assign((size_t)(m.rows * m.words), ~0u);  // runs without masks: every id allowed
     int64_t at = 0;
     for (const VerifyRun &r : runs) {
-        if (r.masks != nullptr)
+        if (r.masks != nullptr && r.masks->has_bits())
             for (int64_t i = 0; i < (int64_t)r.ids.size(); ++i)
                 std::copy(r.masks->row(i), r.masks->row(i) + r.masks->words, m.bits.begin() + (size_t)((at + i) * m.words));
         at += (int64_t)r.ids.size();
@@ -360,7 +391,8 @@ std::vector<LogitRows> Qwen4ExpBackend::verify_batch(const std::vector<VerifyRun
         batch.push_back({r.seq, r.ids, (int64_t)r.ids.size()});
         rows += (int64_t)r.ids.size();
     }
-    const LogitMasks masks = batch_masks(runs);
+    std::vector<kernels::LogitBiasEntry> bias;
+    const LogitMasks masks = batch_masks(runs, bias);
     std::vector<LogitRows> out;
     if (!cands) {
         const LogitRows all = LogitRows::from_full(session_->forward_batch_verify(batch), logits_row());
@@ -377,8 +409,7 @@ std::vector<LogitRows> Qwen4ExpBackend::verify_batch(const std::vector<VerifyRun
         }
         return out;
     }
-    if (!masks.empty()) session_->want_candidates(n_valid, masks.bits.data(), masks.rows, masks.words);
-    else session_->want_candidates(n_valid);
+    want_candidates(n_valid, &masks, bias);
     session_->forward_batch_verify(batch);
     const LogitRows all = candidate_rows(rows);
     int64_t at = 0;

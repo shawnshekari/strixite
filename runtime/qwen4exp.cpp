@@ -1132,6 +1132,7 @@ Qwen4ExpSession::~Qwen4ExpSession() {
         (void)hipStreamDestroy(stream_);
     }
     if (mask_uploaded_) (void)hipEventDestroy(mask_uploaded_);
+    if (bias_uploaded_) (void)hipEventDestroy(bias_uploaded_);
 }
 
 Qwen4ExpSession::PleWorker::PleWorker() : thread_([this] { loop(); }) {}
@@ -2412,7 +2413,8 @@ std::vector<float> Qwen4ExpSession::read_back(size_t n_floats, const char *what,
     return std::vector<float>(l, l + n_floats);
 }
 
-void Qwen4ExpSession::want_candidates(int64_t n_valid, const uint32_t *masks, int64_t mask_rows, int64_t mask_words) {
+void Qwen4ExpSession::want_candidates(int64_t n_valid, const uint32_t *masks, int64_t mask_rows, int64_t mask_words,
+                                      const kernels::LogitBiasEntry *bias, int64_t bias_n) {
     const char *fn = "Qwen4ExpSession::want_candidates";
     const int64_t vocab = m_.dims().vocab;
     STRIX_CHECK(n_valid >= 1 && n_valid <= vocab, fn, ": n_valid = ", n_valid, ", expected 1..", vocab);
@@ -2439,8 +2441,47 @@ void Qwen4ExpSession::want_candidates(int64_t n_valid, const uint32_t *masks, in
         if (mask_upload_recorded_) STRIX_HIP_CHECK(hipEventSynchronize(mask_uploaded_), fn, ": last mask upload");
         std::memcpy(mask_host_.get(), masks, bytes);
     }
+    int64_t rows_end = 0;
+    if (bias == nullptr) {
+        STRIX_CHECK(bias_n == 0, fn, ": bias_n = ", bias_n, " without bias entries (pass 0)");
+    } else {
+        STRIX_CHECK(bias_n >= 1 && bias_n <= kMaxLogits * vocab, fn, ": bias_n = ", bias_n, ", expected 1..",
+                    kMaxLogits * vocab);
+        // The order the kernel's race-freedom rests on (no two entries on one logit), checked in one pass.
+        for (int64_t i = 0; i < bias_n; ++i) {
+            const kernels::LogitBiasEntry &e = bias[i];
+            STRIX_CHECK(e.row0 >= 0 && e.rows >= 1 && (int64_t)e.row0 + e.rows <= kMaxLogits && e.id >= 0 &&
+                            e.id < vocab && std::isfinite(e.v),
+                        fn, ": logit bias entry ", i, " (rows ", e.row0, "+", e.rows, ", id ", e.id, ", bias ", e.v,
+                        "), expected rows inside 0..", kMaxLogits, ", id 0..", vocab - 1, ", a finite bias");
+            if (i > 0) {
+                const kernels::LogitBiasEntry &p = bias[i - 1];
+                const bool same_run = e.row0 == p.row0 && e.rows == p.rows;
+                STRIX_CHECK(same_run ? e.id > p.id : e.row0 >= p.row0 + p.rows, fn, ": logit bias entry ", i, " (rows ",
+                            e.row0, "+", e.rows, ", id ", e.id, ") after (rows ", p.row0, "+", p.rows, ", id ", p.id,
+                            "): expected a higher id in the same run, or a run starting past the last one's rows");
+            }
+            rows_end = std::max<int64_t>(rows_end, (int64_t)e.row0 + e.rows);
+        }
+        const size_t bytes = (size_t)bias_n * sizeof(kernels::LogitBiasEntry);
+        if (bias_host_.size() < bytes) {
+            STRIX_CHECK(!bias_upload_recorded_ || hipEventSynchronize(bias_uploaded_) == hipSuccess, fn,
+                        ": waiting for the last logit bias upload before replacing its buffer");
+            bias_upload_recorded_ = false;
+            const size_t capacity = std::max(bytes, 2 * bias_host_.size());
+            bias_host_ = PinnedHostBuffer(capacity, "logit bias (host)");
+            bias_dev_ = DeviceBuffer<kernels::LogitBiasEntry>(capacity / sizeof(kernels::LogitBiasEntry), "logit bias");
+            if (bias_uploaded_ == nullptr)
+                STRIX_HIP_CHECK(hipEventCreateWithFlags(&bias_uploaded_, hipEventDisableTiming), fn,
+                                ": logit bias upload event");
+        }
+        if (bias_upload_recorded_) STRIX_HIP_CHECK(hipEventSynchronize(bias_uploaded_), fn, ": last logit bias upload");
+        std::memcpy(bias_host_.get(), bias, bytes);
+    }
     mask_rows_ = masks == nullptr ? 0 : mask_rows;
     mask_words_ = masks == nullptr ? 0 : mask_words;
+    bias_n_ = bias == nullptr ? 0 : bias_n;
+    bias_rows_end_ = rows_end;
     cand_n_valid_ = n_valid;
 }
 
@@ -2636,9 +2677,12 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
     }
     const int64_t cand_n_valid = cand_n_valid_;  // want_candidates() covers this one forward, whatever happens
     const int64_t mask_rows = mask_rows_, mask_words = mask_words_;
-    cand_n_valid_ = 0, mask_rows_ = 0, mask_words_ = 0;
+    const int64_t bias_n = bias_n_, bias_rows_end = bias_rows_end_;
+    cand_n_valid_ = 0, mask_rows_ = 0, mask_words_ = 0, bias_n_ = 0, bias_rows_end_ = 0;
     STRIX_CHECK(mask_rows == 0 || (cand_n_valid > 0 && mask_rows == nL_total), "Qwen4ExpSession::forward: ",
                 mask_rows, " structured-output mask rows for a forward of ", nL_total, " logits rows");
+    STRIX_CHECK(bias_n == 0 || (cand_n_valid > 0 && bias_rows_end <= nL_total), "Qwen4ExpSession::forward: ",
+                "logit bias rows up to ", bias_rows_end, " for a forward of ", nL_total, " logits rows");
     STRIX_TRACE_RANGE(std::string(batch.size() == 1 && runs[0].sq->gdn_to_spare ? "verify"
                                 : T == 1 ? "decode" : "prefill") + " T=" + std::to_string(T) +
                       " runs=" + std::to_string(batch.size()));
@@ -3209,6 +3253,15 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                             "Qwen4ExpSession::forward: structured-output masks upload");
             STRIX_HIP_CHECK(hipEventRecord(mask_uploaded_, stream_), "Qwen4ExpSession::forward: mask upload event");
             mask_upload_recorded_ = true;
+        }
+        if (bias_n > 0) {
+            STRIX_HIP_CHECK(hipMemcpyAsync(bias_dev_.get(), bias_host_.get(),
+                                           (size_t)bias_n * sizeof(kernels::LogitBiasEntry), hipMemcpyHostToDevice,
+                                           stream_),
+                            "Qwen4ExpSession::forward: logit bias upload");
+            STRIX_HIP_CHECK(hipEventRecord(bias_uploaded_, stream_), "Qwen4ExpSession::forward: logit bias upload event");
+            bias_upload_recorded_ = true;
+            kernels::logits_bias(logits_.get(), n_logits, D.vocab, bias_dev_.get(), bias_n, stream_);
         }
         kernels::logits_topk(logits_.get(), n_logits, D.vocab, cand_n_valid, cd,
                              reinterpret_cast<uint32_t *>(cd + n_logits * kernels::kLogitCands), cand_ws_.get(),

@@ -123,6 +123,37 @@ std::string sampling_text(const SamplingParams &s, bool seeded, const std::vecto
     return out + " (asked: " + names + ")";
 }
 
+// logit_bias against the tokenizer (the API layer can't know its size): an id past it is a 400 naming it.
+std::shared_ptr<const LogitBias> checked_logit_bias(const std::shared_ptr<const LogitBias> &b, int64_t n_valid) {
+    if (b == nullptr || b->empty()) return nullptr;
+    for (int32_t id : b->id)
+        if (id >= n_valid)
+            throw ApiError(400, "'logit_bias' token id " + std::to_string(id) + " is outside the vocabulary (ids 0.." +
+                                    std::to_string(n_valid - 1) + ")",
+                           "logit_bias");
+    return b;
+}
+
+// The logit_bias row: how many tokens, how many pushed down / up and the strongest of each ("3 tokens: 2 down (to
+// -100), 1 up (to +5)"; a direction with none is left out).
+std::string logit_bias_text(const LogitBias &b) {
+    int64_t down = 0, up = 0;
+    float lowest = 0, highest = 0;
+    for (float v : b.v) {
+        if (v < 0) ++down, lowest = std::min(lowest, v);
+        else ++up, highest = std::max(highest, v);
+    }
+    auto part = [](int64_t n, const char *dir, float extreme) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, " %s (to %+g)", dir, extreme);
+        return fmt_n((long long)n) + buf;
+    };
+    std::string out = fmt_n((long long)b.id.size()) + " tokens:";
+    if (down > 0) out += " " + part(down, "down", lowest);
+    if (up > 0) out += std::string(down > 0 ? "," : "") + " " + part(up, "up", highest);
+    return out;
+}
+
 }  // namespace
 
 HttpServer::HttpServer(Engine &engine, const Tokenizer &tok, ServerConfig cfg)
@@ -176,6 +207,7 @@ void HttpServer::routes() {
                 throw ApiError(400, std::string("request body: ") + e.what());
             }
             cr = parse_chat_request(body, cfg_.defaults, /*vision_enabled=*/cfg_.vision != nullptr);
+            gen.logit_bias = checked_logit_bias(cr.logit_bias, tok_.size());
             // The server's thinking default (config `thinking`) for a request that doesn't say either way.
             if (!cfg_.thinking_default && !cr.template_options.enable_thinking.has_value() && !thinking_requested(cr)) {
                 cr.template_options.enable_thinking = false;
@@ -320,6 +352,7 @@ void HttpServer::routes() {
                                                                               : "off"));
             gen.log_header.emplace_back("max_tokens", max_tokens_text(cr.max_tokens, gen.max_tokens));
             gen.log_header.emplace_back("sampling", sampling_text(cr.sampling, cr.seeded, cr.sampling_asked));
+            if (gen.logit_bias) gen.log_header.emplace_back("logit_bias", logit_bias_text(*gen.logit_bias));
             if (!format_row.empty()) gen.log_header.emplace_back("format", format_row);
             if (!vision_note.empty()) gen.log_header.emplace_back("vision", vision_note);
         }
@@ -470,6 +503,7 @@ void HttpServer::routes() {
                 throw ApiError(400, std::string("request body: ") + e.what());
             }
             cr = parse_completion_request(body, cfg_.defaults);
+            gen.logit_bias = checked_logit_bias(cr.logit_bias, tok_.size());
             try {
                 gen.prompt = tok_.encode(cr.prompt);
             } catch (const Error &e) {
@@ -487,6 +521,7 @@ void HttpServer::routes() {
         gen.log_header.emplace_back("prompt", fmt_n((long long)gen.prompt.size()) + " tokens, raw completion (no chat template)");
         gen.log_header.emplace_back("max_tokens", max_tokens_text(cr.max_tokens, gen.max_tokens));
         gen.log_header.emplace_back("sampling", sampling_text(cr.sampling, cr.seeded, cr.sampling_asked));
+        if (gen.logit_bias) gen.log_header.emplace_back("logit_bias", logit_bias_text(*gen.logit_bias));
         gen.id = id, gen.stream = cr.stream;
         gen.one_shot = true;  // a raw prompt: its cache entries stay in RAM (benchmarks send many unique ones)
         if (!cr.seeded) cr.sampling.seed = std::random_device{}();

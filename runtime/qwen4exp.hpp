@@ -24,6 +24,7 @@
 
 #include "kernels/embedding.hpp"
 #include "kernels/logits_topk.hpp"
+#include "kernels/logits_bias.hpp"
 #include "kernels/attention.hpp"  // AttnPrecision
 #include "kernels/gdn.hpp"        // DrPrecision
 #include "kernels/norm.hpp"  // Act
@@ -759,7 +760,11 @@ public:
     // masks (structured output): null, or [mask_rows, mask_words] host words - one allowed-token mask per logits
     // row of that forward (mask_rows must equal its n_logits; mask_words >= ceil(vocab / 32)), copied here into a
     // pinned buffer and uploaded by the forward ahead of logits_topk, which leaves disallowed ids out.
-    void want_candidates(int64_t n_valid, const uint32_t *masks = nullptr, int64_t mask_rows = 0, int64_t mask_words = 0);
+    // bias (a request's logit_bias): null, or bias_n entries (kernels/logits_bias) the forward adds to its logits rows
+    // ahead of logits_topk - in runs' order: row0 ascending, a run's ids ascending, runs' row ranges disjoint, every
+    // row range inside that forward's n_logits (checked there); copied here into a pinned buffer like the masks.
+    void want_candidates(int64_t n_valid, const uint32_t *masks = nullptr, int64_t mask_rows = 0, int64_t mask_words = 0,
+                         const kernels::LogitBiasEntry *bias = nullptr, int64_t bias_n = 0);
     struct Candidates {
         int64_t rows = 0;
         std::vector<kernels::LogitCand> cand;  // [rows, kernels::kLogitCands]
@@ -1042,6 +1047,13 @@ private:
     DeviceBuffer<uint32_t> mask_dev_;
     hipEvent_t mask_uploaded_ = nullptr;
     bool mask_upload_recorded_ = false;
+    // A request's logit bias for the next forward (want_candidates): bias_n_ entries in bias_host_ (pinned), rows up to
+    // bias_rows_end_, uploaded into bias_dev_ and added to the logits by that forward - gated like the masks.
+    int64_t bias_n_ = 0, bias_rows_end_ = 0;
+    PinnedHostBuffer bias_host_;
+    DeviceBuffer<kernels::LogitBiasEntry> bias_dev_;
+    hipEvent_t bias_uploaded_ = nullptr;
+    bool bias_upload_recorded_ = false;
     DeviceBuffer<uint8_t> cand_dev_, cand_ws_;
     size_t cand_ws_bytes_ = 0;
     Candidates cand_host_;

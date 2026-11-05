@@ -135,8 +135,9 @@ public:
     // each row's top Sampler::kCandidates candidates over ids [0, n_valid) instead of the full row (the engine asks
     // only when Sampler::takes_candidates() - the sampled tokens are the same either way). The default returns full
     // rows; Qwen4ExpBackend reduces them on the GPU (kernels/logits_topk).
-    // masks (structured output): null, or one allowed-token mask per returned row (LogitMasks; masks->rows ==
-    // n_logits) - the rows then hold allowed ids only (candidates from those alone, or full rows with the rest -inf).
+    // masks (structured output, logit_bias): null, or one allowed-token mask per returned row (LogitMasks; masks->rows
+    // == n_logits) - the rows then hold allowed ids only (candidates from those alone, or full rows with the rest
+    // -inf) - and/or a logit bias added to every returned row first (candidates from the biased rows).
     virtual LogitRows forward_rows(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid,
                                    const LogitMasks *masks = nullptr) {
         (void)cands, (void)n_valid;
@@ -435,6 +436,9 @@ struct GenerationRequest {
     // the answer must follow, or null. Shared by requests with the same schema; several slots' workers drive one
     // concurrently (GrammarAutomaton is internally synchronized - serve/grammar.hpp, review item 2).
     std::shared_ptr<grammar::GrammarAutomaton> grammar;
+    // logit_bias (OpenAI): added to every logits row the request samples from (serve/sampler.hpp, LogitBias), thinking
+    // and answer alike; null = none. Ids below the tokenizer's size (submit checks).
+    std::shared_ptr<const LogitBias> logit_bias;
     int64_t id = 0;       // the HTTP layer's request id, for log lines ("Request <id>"); 0 = none given
     bool stream = false;  // for the log only (the HTTP layer streams or not)
     // The HTTP layer's rows for the top of the request's log block (label, text; an empty label goes on the row

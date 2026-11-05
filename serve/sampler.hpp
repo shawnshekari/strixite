@@ -7,6 +7,7 @@
 // padding row must never be sampled.
 
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <vector>
 
@@ -42,18 +43,40 @@ struct LogitRows {
     LogitRows row_of(int64_t r) const;                                  // one row, either kind
 };
 
-// Per-row allowed-token masks for a forward's logits rows (structured output, response_format):
-// bit (id % 32) of word (id / 32) of row r set = id allowed. A backend gives back only allowed ids - candidates from
-// the allowed ids alone (kernels/logits_topk's mask), full rows with every disallowed logit set to -inf.
+// A request's logit_bias (OpenAI's request field: token id -> bias in [-100, 100]), added to every logits row the
+// request samples from, before anything else looks at the row - top-k, the structured-output mask, temperature. It is
+// an addition, as OpenAI defines it: -100 makes a token all but impossible (e^-100 against the rest), +100 all but
+// certain; a structured-output mask still wins (a disallowed id stays out whatever its bias, and a row whose allowed
+// ids are all biased down still samples among them). MTP drafts come from the unbiased head: a draft the biased row
+// would not pick is rejected at the verify, so the output is the biased model's either way.
+struct LogitBias {
+    static constexpr double kMax = 100;  // |bias| bound (OpenAI's)
+    std::vector<int32_t> id;  // ascending, unique
+    std::vector<float> v;     // [id.size()]: finite, non-zero, |v| <= kMax
+    bool empty() const { return id.empty(); }
+    // ids below n_valid (the tokenizer's size) and the rest of the contract above; throws naming where and the entry.
+    void check(int64_t n_valid, const char *where) const;
+};
+
+// What a backend applies to a forward's logits rows before it hands them back: a request's logit bias (every row) and
+// per-row allowed-token masks (structured output, response_format): bit (id % 32) of word (id / 32) of row r set = id
+// allowed. A backend gives back only allowed ids - candidates from the allowed ids alone (kernels/logits_topk's mask),
+// full rows with every disallowed logit set to -inf - and every biased logit with its bias added (kernels/logits_bias
+// before the top-k; on the host for full rows). rows == 0: no masks, only the bias.
 struct LogitMasks {
     int64_t rows = 0, words = 0;  // words per row: >= ceil(logits row / 32)
     std::vector<uint32_t> bits;   // [rows, words]
-    bool empty() const { return rows == 0; }
+    std::shared_ptr<const LogitBias> bias;  // null or empty: none
+    bool has_bits() const { return rows > 0; }
+    bool has_bias() const { return bias != nullptr && !bias->empty(); }
+    bool empty() const { return !has_bits() && !has_bias(); }
     const uint32_t *row(int64_t r) const;  // checked
-    void check(int64_t want_rows, int64_t logits_row, const char *where) const;  // rows and width fit the forward
+    // Masks (when has_bits()): rows and width fit the forward (want_rows logits rows of logits_row ids); the bias
+    // (already checked whole at submit): its ids inside the row.
+    void check(int64_t want_rows, int64_t logits_row, const char *where) const;
 };
-// Full rows: every logit whose id the row's mask disallows becomes -inf (candidate rows: refused - their backend
-// applies the mask before reducing).
+// Full rows: every biased logit gets its bias, then every logit whose id the row's mask disallows becomes -inf
+// (candidate rows: refused - their backend applies both before reducing).
 void apply_masks(LogitRows &rows, const LogitMasks &masks);
 // Takes ids out of row r after the forward (the think-block guard, Engine::Options::think_end_guard): full rows get
 // -inf there; candidate rows drop them and end in padding (-inf, INT32_MAX) - top-k then draws from one fewer

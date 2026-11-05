@@ -156,6 +156,7 @@ void Engine::submit(GenerationRequest req, std::shared_ptr<GenerationSink> sink)
                 capacity_, " (the API layer clamps)");
     for (int32_t id : req.prompt)
         STRIX_CHECK(id >= 0 && id < tok_.size(), "Engine::submit: prompt token ", id, " outside [0, ", tok_.size(), ")");
+    if (req.logit_bias) req.logit_bias->check(tok_.size(), "Engine::submit");
     {
         std::lock_guard<std::mutex> lock(mu_);
         STRIX_CHECK(!stop_, "Engine::submit: shutting down");
@@ -1195,9 +1196,12 @@ void Engine::run(Job &job, Slot &sl) {
             so = std::make_unique<StructuredOutput>(req.grammar, masker_, tok_, think_end_, std::vector<int32_t>{im_end_, eot_},
                                                     !req.parser.thinking);
         LogitMasks row_masks;  // the masks of the forward being made (kept alive across the call)
+        // The request's logit bias rides along on every sampled forward (LogitMasks::bias), with or without masks.
+        const bool biased = req.logit_bias != nullptr && !req.logit_bias->empty();
         const auto masks_for = [&](const std::vector<int32_t> &pending) -> const LogitMasks * {
-            if (!so) return nullptr;
-            row_masks = so->masks_for(pending);
+            if (!so && !biased) return nullptr;
+            row_masks = so ? so->masks_for(pending) : LogitMasks{};
+            if (biased) row_masks.bias = req.logit_bias;
             return &row_masks;
         };
         // A chunk ends at the backend's max chunk, and at the turn / user-start / system snapshot points.

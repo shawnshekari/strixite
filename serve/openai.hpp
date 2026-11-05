@@ -9,6 +9,7 @@
 #include "serve/json.hpp"
 #include "serve/vision_request.hpp"
 
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -39,6 +40,9 @@ struct ChatRequest {
     bool seeded = false;
     std::vector<std::string> sampling_asked;  // the sampling fields the request set, in order (logged; the rest are defaults)
     std::vector<std::string> stop;
+    // logit_bias: token id -> bias in [-100, 100], ids ascending, zero biases dropped; null when absent or all zero.
+    // Ids are checked against the tokenizer by the HTTP layer (this parser doesn't know its size).
+    std::shared_ptr<const LogitBias> logit_bias;
     ChatTemplateOptions template_options;
     std::optional<int64_t> thinking_budget;  // explicit, from any of the four budget fields
     // response_format: text, json_object (any JSON object), or json_schema with
@@ -63,6 +67,9 @@ struct CompletionRequest {
     bool seeded = false;
     std::vector<std::string> sampling_asked;  // the sampling fields the request set, in order (logged; the rest are defaults)
     std::vector<std::string> stop;
+    // logit_bias: token id -> bias in [-100, 100], ids ascending, zero biases dropped; null when absent or all zero.
+    // Ids are checked against the tokenizer by the HTTP layer (this parser doesn't know its size).
+    std::shared_ptr<const LogitBias> logit_bias;
 };
 CompletionRequest parse_completion_request(const json::Value &body, const SamplingParams &defaults);
 

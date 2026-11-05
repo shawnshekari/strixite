@@ -181,7 +181,7 @@ add_library(strix_kernels STATIC)
 strix_hip_sources(strix_kernels kernels/norm.hip kernels/embedding.hip kernels/linear.hip kernels/linear_q4.hip kernels/linear_q56.hip kernels/linear_q8.hip
     kernels/swiglu.hip kernels/rope.hip kernels/attention.hip kernels/gdn.hip
     kernels/residual.hip kernels/moe_router.hip kernels/moe_grouped.hip kernels/wmma.hip kernels/linear_wmma.hip kernels/hc_wmma.hip kernels/hc.hip kernels/ple.hip kernels/qsa.hip
-    kernels/mtp_pick.hip kernels/logits_topk.hip kernels/vision.hip kernels/kv8.hip)
+    kernels/mtp_pick.hip kernels/logits_topk.hip kernels/logits_bias.hip kernels/vision.hip kernels/kv8.hip)
 target_include_directories(strix_kernels PUBLIC "${CMAKE_SOURCE_DIR}")
 target_link_libraries(strix_kernels PUBLIC strix_rocm strix_formats)
 

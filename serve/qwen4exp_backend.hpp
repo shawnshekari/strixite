@@ -152,9 +152,13 @@ public:
 
 private:
     LogitRows candidate_rows(int64_t rows) const;  // session_->candidates() of the last forward, checked
-    // A batch's per-run masks as one [rows, words] set for want_candidates (runs without masks: every id allowed);
-    // empty when no run has any.
-    LogitMasks batch_masks(const std::vector<VerifyRun> &runs) const;
+    // A batch's per-run masks as one [rows, words] set for want_candidates (runs without masks: every id allowed),
+    // no bits when no run has any; and every run's logit bias as kernel entries over its rows (bias_out).
+    LogitMasks batch_masks(const std::vector<VerifyRun> &runs, std::vector<kernels::LogitBiasEntry> &bias_out) const;
+    // session_->want_candidates with masks' bits (if any) and bias entries (empty: none).
+    void want_candidates(int64_t n_valid, const LogitMasks *masks, const std::vector<kernels::LogitBiasEntry> &bias);
+    // The same for a one-run forward of n_logits rows: masks' bias (if any) over all of them.
+    void want_candidates(int64_t n_valid, const LogitMasks *masks, int64_t n_logits);
     LogitRows rows_of(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid,
                       const LogitMasks *masks, bool verify);
     void build_session();  // session_ + snapshots_ from the settings below (the constructor and renew)

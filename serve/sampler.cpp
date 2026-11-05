@@ -35,12 +35,32 @@ const uint32_t *LogitMasks::row(int64_t r) const {
     return bits.data() + r * words;
 }
 
+void LogitBias::check(int64_t n_valid, const char *where) const {
+    STRIX_CHECK(v.size() == id.size(), where, ": logit bias of ", id.size(), " ids and ", v.size(), " values");
+    for (size_t i = 0; i < id.size(); ++i) {
+        STRIX_CHECK(id[i] >= 0 && id[i] < n_valid, where, ": logit bias entry ", i, " is token id ", id[i],
+                    ", expected 0..", n_valid - 1);
+        STRIX_CHECK(i == 0 || id[i] > id[i - 1], where, ": logit bias ids not ascending and unique at entry ", i, " (",
+                    id[i - 1], " then ", id[i], ")");
+        STRIX_CHECK(std::isfinite(v[i]) && v[i] != 0 && std::fabs(v[i]) <= kMax, where, ": logit bias of token ", id[i],
+                    " is ", v[i], ", expected a non-zero value in [-", kMax, ", ", kMax, "]");
+    }
+}
+
 void LogitMasks::check(int64_t want_rows, int64_t logits_row, const char *where) const {
-    STRIX_CHECK(rows == want_rows, where, ": ", rows, " mask rows for ", want_rows, " logits rows");
-    STRIX_CHECK(words * 32 >= logits_row, where, ": mask rows of ", words, " words cover ", words * 32,
-                " ids, the logits row has ", logits_row);
-    STRIX_CHECK(bits.size() == (size_t)(rows * words), where, ": ", bits.size(), " mask words for ", rows, " rows of ",
-                words);
+    if (rows != 0 || words != 0 || !bits.empty()) {  // any mask data: it must be whole
+        STRIX_CHECK(rows == want_rows, where, ": ", rows, " mask rows for ", want_rows, " logits rows");
+        STRIX_CHECK(words * 32 >= logits_row, where, ": mask rows of ", words, " words cover ", words * 32,
+                    " ids, the logits row has ", logits_row);
+        STRIX_CHECK(bits.size() == (size_t)(rows * words), where, ": ", bits.size(), " mask words for ", rows,
+                    " rows of ", words);
+    }
+    // The bias was checked whole at submit (LogitBias::check) and is immutable; per forward only that it fits the row
+    // (ids ascending: the last is the largest) - this runs on every sampled forward.
+    if (has_bias())
+        STRIX_CHECK(bias->v.size() == bias->id.size() && bias->id.back() < logits_row, where, ": logit bias of ",
+                    bias->id.size(), " ids / ", bias->v.size(), " values, largest id ", bias->id.back(),
+                    ", the logits row has ", logits_row);
 }
 
 void apply_masks(LogitRows &l, const LogitMasks &masks) {
@@ -49,6 +69,12 @@ void apply_masks(LogitRows &l, const LogitMasks &masks) {
     masks.check(l.rows, l.row, "apply_masks");
     STRIX_CHECK(l.full.size() == (size_t)(l.rows * l.row), "apply_masks: ", l.full.size(), " floats for ", l.rows,
                 " rows of ", l.row);
+    if (masks.has_bias())
+        for (int64_t r = 0; r < l.rows; ++r) {
+            float *x = l.full.data() + r * l.row;
+            for (size_t i = 0; i < masks.bias->id.size(); ++i) x[masks.bias->id[i]] += masks.bias->v[i];
+        }
+    if (!masks.has_bits()) return;
     for (int64_t r = 0; r < l.rows; ++r) {
         const uint32_t *m = masks.row(r);
         float *x = l.full.data() + r * l.row;
