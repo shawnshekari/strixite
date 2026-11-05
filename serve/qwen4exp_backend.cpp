@@ -91,6 +91,13 @@ const Qwen4ExpSnapshot &Qwen4ExpBackend::snap(int seq, int slot) const {
     return snapshots_[(size_t)seq][(size_t)slot];
 }
 
+// The n-gram table's counters exist only for rows read from a table file: a model with no rows at all (no PLE layer,
+// so ngram_rows() would throw) and a checkpoint-shard source have none (strixite PR #35).
+const NgramTableRows *Qwen4ExpBackend::ngram_table() const {
+    if (!model_.has_ngram_rows()) return nullptr;
+    return dynamic_cast<const NgramTableRows *>(&model_.ngram_rows());
+}
+
 BackendStats Qwen4ExpBackend::backend_stats() const {
     std::lock_guard<std::mutex> lock(stats_mu_);  // renew() swaps the session under it
     BackendStats s;
@@ -100,7 +107,7 @@ BackendStats Qwen4ExpBackend::backend_stats() const {
     s.ple_gather_seconds = p.gather_seconds, s.ple_wait_seconds = p.wait_seconds;
     s.ple_wait_max_seconds = p.wait_max_seconds;
     s.ple_prefetches = p.prefetches, s.ple_prefetch_skipped = p.prefetch_skipped, s.ple_prefetch_seconds = p.prefetch_seconds;
-    if (const auto *t = dynamic_cast<const NgramTableRows *>(&model_.ngram_rows())) {  // the checkpoint source keeps none
+    if (const NgramTableRows *t = ngram_table()) {
         const NgramTableRows::Stats n = t->stats();
         s.ngram_rows_requested = (int64_t)n.requested, s.ngram_rows_unique = (int64_t)n.unique;
         s.ngram_rows_cached = (int64_t)n.hits, s.ngram_rows_read = (int64_t)n.reads;
@@ -189,6 +196,31 @@ void Qwen4ExpBackend::resume_paged(int seq, const HostBuffer &small, const Paged
     session_->import_small_state(seq, small.data(), small.size(), n);  // and the rest of the state over them
 }
 
+uint64_t Qwen4ExpBackend::small_snapshot_bytes(int seq, int slot) const {
+    const Qwen4ExpSnapshot &s = snap(seq, slot);
+    STRIX_CHECK(s.pos() >= 1, "Qwen4ExpBackend::small_snapshot_bytes: slot ", slot, " of seq ", seq, " was never saved");
+    return (uint64_t)session_->small_state_bytes(s.pos());
+}
+
+void Qwen4ExpBackend::export_small_snapshot(int seq, int slot, HostBuffer &out) {
+    const Qwen4ExpSnapshot &s = snap(seq, slot);
+    STRIX_CHECK(s.pos() >= 1, "Qwen4ExpBackend::export_small_snapshot: slot ", slot, " of seq ", seq, " was never saved");
+    out.resize(session_->small_state_bytes(s.pos()));
+    session_->export_small_state(seq, s, out.data(), out.size());  // refuses a snapshot whose K/V is gone
+}
+
+// The small half over the K/V the seq holds: the same import a parked resume does after mapping its pages
+// (import_small_state), with the rows already in place. Rows at and past n are another state's and are
+// overwritten as the prompt goes on, exactly as a parked record's rows past a checkpoint are.
+void Qwen4ExpBackend::resume_small(int seq, const HostBuffer &small, int64_t n) {
+    STRIX_CHECK(n >= 1 && n <= session_->pos(seq), "Qwen4ExpBackend::resume_small: point at ", n, ", seq ", seq,
+                " holds ", session_->pos(seq), " positions - a point resumes over K/V that covers it");
+    const size_t want = session_->small_state_bytes(n);
+    STRIX_CHECK(small.size() == want, "Qwen4ExpBackend::resume_small: ", small.size(), " small bytes, position ", n,
+                " wants ", want);
+    session_->import_small_state(seq, small.data(), small.size(), n);
+}
+
 std::string Qwen4ExpBackend::state_fingerprint() const {
     const StrixwFile &f = model_.weights().file();
     // The layout string is long; its hash keeps the fingerprint short (the header holds < 192 chars).
@@ -221,7 +253,7 @@ std::string Qwen4ExpBackend::describe() const {
            kv_format_name(session_->kv_format()) +
            (has_mtp() ? ", mtp (draft vocabulary " + std::to_string(session_->mtp_vocab()) + ")" : "") +
            (model_.has_vision() ? ", vision tower on" : "") + [&] {
-               const auto *t = dynamic_cast<const NgramTableRows *>(&model_.ngram_rows());
+               const NgramTableRows *t = ngram_table();
                return t ? ", n-gram row cache " + std::to_string(t->cache_rows()) + " rows" : std::string();
            }();
 }

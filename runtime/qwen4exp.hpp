@@ -407,6 +407,13 @@ struct ParkedKv {
 // loader uses it; so does the hand-off check, which needs the real layout without uploading 68 GB.
 Qwen4ExpDims qwen4exp_dims_from_file(const StrixwFile &f);
 
+// The routed experts per layer, from layer 0's gate|up stack ([slots x 2*inter, d]; slots = the routed experts, plus
+// the shared one as the last slot unless shared_separate). Qwen4ExpDims::experts (512) is only the default: a
+// checkpoint converted from an expert subset carries fewer (strixite PR #35). The count the converter records
+// (StrixwTensor::experts; 0 in older files) must agree, and the count must cover top_k. Throws naming `where`.
+int64_t qwen4exp_routed_experts(const StrixwTensor *gate_up, const Qwen4ExpDims &D, bool shared_separate,
+                                const std::string &where);
+
 // ---------------------------------------------------------------------------
 // The state of one conversation (feat/multi-sequence): everything a Qwen4ExpSession
 // carried across forwards for one sequence - the buffers one serving slot owns. A session holds one SeqState per

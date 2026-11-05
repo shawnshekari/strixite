@@ -691,6 +691,12 @@ void HttpServer::routes() {
             disk.set("ram_hits", json::Value::integer(d.ram_hits));
             disk.set("ram_evicted", json::Value::integer(d.ram_evicted));
             disk.set("ram_only_dropped", json::Value::integer(d.ram_only_dropped));
+            json::Value pts = json::Value::object();
+            pts.set("held", json::Value::integer(d.points)), pts.set("bytes", json::Value::integer(d.point_bytes));
+            pts.set("saved", json::Value::integer(d.point_puts)), pts.set("hits", json::Value::integer(d.point_hits));
+            pts.set("dropped", json::Value::integer(d.points_dropped));
+            pts.set("evicted", json::Value::integer(d.points_evicted));
+            disk.set("resume_points", std::move(pts));
             disk.set("room_refused", json::Value::integer(d.room_refused));
             disk.set("room_waits", json::Value::integer(d.room_waits));
             disk.set("turn_buffers_reused", json::Value::integer(d.turn_buffers_reused));
@@ -845,6 +851,10 @@ void HttpServer::routes() {
             metric("strix_prompt_cache_ram_evicted_total", "counter", "Entries that left RAM for lack of memory.", (double)d.ram_evicted);
             metric("strix_prompt_cache_ram_only_dropped_total", "counter",
                    "One-shot requests' entries that left RAM (never written to disk, by design).", (double)d.ram_only_dropped);
+            metric("strix_prompt_cache_points", "gauge", "Resume points held in RAM (message boundaries, small state only).",
+                   (double)d.points);
+            metric("strix_prompt_cache_point_hits_total", "counter",
+                   "Requests resumed from a resume point (a client edited an older message).", (double)d.point_hits);
             metric("strix_prompt_cache_room_refused_total", "counter",
                    "Saves skipped or disk loads refused: no room in RAM above the margin.", (double)d.room_refused);
             metric("strix_prompt_cache_room_waits_total", "counter",

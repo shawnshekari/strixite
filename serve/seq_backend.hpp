@@ -162,6 +162,10 @@ public:
     void release_parked(int64_t parked_id) override;
     // A read, so a Hint: poisoned false = take the host-copy route (the safe default when the GPU is poisoned).
     bool park_budget_left() const override;
+    bool small_states() const override { return arb_.backend().small_states(); }
+    uint64_t small_snapshot_bytes(int slot) const override;
+    void export_small_snapshot(int slot, HostBuffer &out) override;
+    void resume_small(const HostBuffer &small, int64_t n) override;
     std::string state_fingerprint() const override { return be().state_fingerprint(); }
     std::string describe() const override { return be().describe() + ", seq " + std::to_string(seq_); }
 

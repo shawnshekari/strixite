@@ -327,6 +327,41 @@ public:
         (void)small, (void)paged, (void)n;
         STRIX_CHECK(false, "LmBackend::resume_paged: this backend (", describe(), ") has no paged states");
     }
+    // Resume points (strixite #32 / #33): a snapshot's small half alone - the per-step state (GDN, conv and
+    // indexer tails, PLE, MTP streams, the mRoPE header) without a single K/V row, ~0.11 GB however deep. The K/V
+    // rows below a point are the same for every state that starts with the same tokens, so a point resumes over
+    // any K/V that holds them: the live slot, or a longer entry of the same conversation loaded first. That is
+    // what lets a client edit an old message and resume just before the edit, not at the system prompt.
+    // small_states() false (the default): the backend has none and is never asked.
+    virtual bool small_states() const { return false; }
+    // The bytes export_small_snapshot(slot, out) sizes out to.
+    virtual uint64_t small_snapshot_bytes(int slot) const {
+        (void)slot;
+        STRIX_CHECK(false, "LmBackend::small_snapshot_bytes: this backend (", describe(), ") has no small states");
+    }
+    virtual void export_small_snapshot(int slot, HostBuffer &out) {  // resizes out
+        (void)slot, (void)out;
+        STRIX_CHECK(false, "LmBackend::export_small_snapshot: this backend (", describe(), ") has no small states");
+    }
+    // A point's small half over the K/V this seq holds now: pos() >= n and its rows [0, n) are the point's - the
+    // CALLER guarantees that (the same tokens: Engine::resume_point checks them; the backend cannot). pos() = n
+    // after, every snapshot invalid, as after an import_state.
+    virtual void resume_small(const HostBuffer &small, int64_t n) {
+        (void)small, (void)n;
+        STRIX_CHECK(false, "LmBackend::resume_small: this backend (", describe(), ") has no small states");
+    }
+    virtual uint64_t small_snapshot_bytes(int seq, int slot) const {
+        check_seq(seq, "small_snapshot_bytes");
+        return small_snapshot_bytes(slot);
+    }
+    virtual void export_small_snapshot(int seq, int slot, HostBuffer &out) {
+        check_seq(seq, "export_small_snapshot");
+        export_small_snapshot(slot, out);
+    }
+    virtual void resume_small(int seq, const HostBuffer &small, int64_t n) {
+        check_seq(seq, "resume_small");
+        resume_small(small, n);
+    }
     // Eviction of a paged entry: the pages go back to the pool they came from (RAM returns; that parked
     // generation's addresses stay spent, like every released generation's).
     virtual void release_parked(int64_t parked_id) {
@@ -654,6 +689,11 @@ private:
     // (Slot::pending) - the request-end save; flush_pending_turn passes false. True when an entry was put.
     bool save_state(Slot &sl, const int32_t *tokens, int slot, int64_t n, PromptCache::Kind kind, const char *what,
                     bool one_shot, int64_t req_id, int &rows, bool hold_turn, bool allow_park = true);
+    // Resume points (PromptCache "Resume points"): on when the cache keeps them and the backend has small states.
+    bool points_on(const Slot &sl) const;
+    // One resume point: the small half of the slot's snapshot `slot` at n (tokens[0, n) its key) into the cache.
+    // Skipped (logged) when the snapshot is not there or no longer valid, or the RAM rule has no room. True if put.
+    bool save_point(Slot &sl, const int32_t *tokens, int slot, int64_t n, const char *what, int64_t req_id, int &rows);
     // Parks the held Turn into the prompt cache (why: for the log) - before another conversation takes the slot,
     // and at shutdown. A failure loses that entry and resets the slot; it never fails the caller's request.
     // allow_park false: the copy route even where a park could go (the soft K/V reset - a park would only be

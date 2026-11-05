@@ -195,6 +195,7 @@ PromptCache::PromptCache(std::string dir, uint64_t max_bytes, std::string finger
                 opt_.shutdown_seconds, ", expected >= 0");
     STRIX_CHECK(opt_.checkpoints_per_chain >= 1, "PromptCache: checkpoints_per_chain ", opt_.checkpoints_per_chain,
                 ", expected >= 1");
+    STRIX_CHECK(opt_.max_points >= 0, "PromptCache: max_points ", opt_.max_points, ", expected >= 0 (0 = no points)");
     STRIX_CHECK(opt_.max_spares >= 0 && opt_.max_spares <= kMaxSpares, "PromptCache: max_spares ", opt_.max_spares,
                 ", expected 0..", kMaxSpares);
     fs::create_directories(dir_);
@@ -1010,6 +1011,15 @@ void PromptCache::make_room_locked(uint64_t extra, uint64_t avail_in) {
         trash_.push_back(std::move(spares_.back()));
         spares_.pop_back();
     }
+    // Then resume points: the least lost (a point only helps a client that edits old history), and small.
+    while (need > 0 && !points_.empty()) {
+        size_t lru = 0;
+        for (size_t i = 1; i < points_.size(); ++i)
+            if (points_[i].last_used < points_[lru].last_used) lru = i;
+        need -= std::min(need, (uint64_t)points_[lru].small->capacity());
+        drop_point_locked();
+        ++stats_.points_evicted;
+    }
     while (need > 0) {
         // Candidates: every RAM entry not being imported and not already leaving. One queued for a write (idle, or
         // being written) counts too - it leaves RAM once written, its last read releasing it if one holds it - so the
@@ -1143,6 +1153,92 @@ void PromptCache::flush() {
     idle_cv_.wait(lock, [&] { return queue_.empty() && !writing_; });
 }
 
+bool PromptCache::drop_point_locked() {
+    if (points_.empty()) return false;
+    size_t lru = 0;
+    for (size_t i = 1; i < points_.size(); ++i)
+        if (points_[i].last_used < points_[lru].last_used) lru = i;
+    Point &p = points_[lru];
+    ram_bytes_ -= std::min<uint64_t>(ram_bytes_, p.small->capacity());
+    points_[lru] = std::move(points_.back());
+    points_.pop_back();
+    return true;
+}
+
+bool PromptCache::put_point(std::vector<int32_t> tokens, HostBuffer small, int64_t saved_by) {
+    STRIX_CHECK(!tokens.empty() && !small.empty(), "PromptCache::put_point: ", tokens.size(), " tokens, ", small.size(),
+                " small-state bytes (expected both > 0)");
+    STRIX_CHECK(saved_by >= 0, "PromptCache::put_point: saved_by request id ", saved_by, ", expected >= 0");
+    // No RAM tier (low-memory adapt): nothing stays in RAM, so a point would only be dropped again.
+    if (opt_.max_points <= 0 || !opt_.ram_tier) return false;
+    Handback hb;
+    std::lock_guard<std::mutex> lock(mu_);
+    for (Point &p : points_)
+        if (p.tokens.size() == tokens.size() && std::memcmp(p.tokens.data(), tokens.data(), tokens.size() * 4) == 0) {
+            p.last_used = ++clock_;  // held already: this copy is surplus
+            trash_.push_back(std::move(small));
+            hb.take(this);
+            return true;
+        }
+    ram_bytes_ += small.capacity();
+    Point p;
+    p.tokens = std::move(tokens), p.last_used = ++clock_, p.saved_by = saved_by;
+    p.small = std::make_shared<const HostBuffer>(std::move(small));
+    points_.push_back(std::move(p));
+    ++stats_.point_puts;
+    while ((int64_t)points_.size() > opt_.max_points && drop_point_locked()) ++stats_.points_dropped;
+    make_room_locked();
+    hb.take(this);
+    return true;
+}
+
+int64_t PromptCache::best_point(const std::vector<int32_t> &prompt, int64_t max_n) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    int64_t best = 0;
+    for (const Point &p : points_) {
+        const int64_t n = (int64_t)p.tokens.size();
+        if (n <= best || n > max_n || n > (int64_t)prompt.size()) continue;
+        if (std::memcmp(p.tokens.data(), prompt.data(), (size_t)n * 4) == 0) best = n;
+    }
+    return best;
+}
+
+bool PromptCache::with_point(const std::vector<int32_t> &prompt, int64_t n,
+                             const std::function<void(const HostBuffer &)> &use) {
+    STRIX_CHECK(n >= 1 && n <= (int64_t)prompt.size(), "PromptCache::with_point: n = ", n, ", the prompt has ",
+                prompt.size(), " tokens");
+    std::shared_ptr<const HostBuffer> small;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        for (Point &p : points_)
+            if ((int64_t)p.tokens.size() == n && std::memcmp(p.tokens.data(), prompt.data(), (size_t)n * 4) == 0) {
+                p.last_used = ++clock_;
+                small = p.small;
+                ++stats_.point_hits;
+                break;
+            }
+    }
+    if (!small) return false;
+    use(*small);
+    return true;
+}
+
+std::vector<int32_t> PromptCache::donor(const std::vector<int32_t> &prompt, int64_t n) const {
+    STRIX_CHECK(n >= 1 && n <= (int64_t)prompt.size(), "PromptCache::donor: n = ", n, ", the prompt has ",
+                prompt.size(), " tokens");
+    std::lock_guard<std::mutex> lock(mu_);
+    const Entry *best = nullptr;
+    int best_rank = 3;
+    for (const EntryPtr &e : entries_) {
+        if (e->dead || e->releasing || (int64_t)e->tokens.size() < n) continue;
+        if (std::memcmp(e->tokens.data(), prompt.data(), (size_t)n * 4) != 0) continue;
+        const int rank = !e->paged.empty() ? 0 : e->in_ram() ? 1 : !e->path.empty() ? 2 : 3;
+        if (rank == 3) continue;  // neither in RAM nor on disk (being made): nothing to load
+        if (rank < best_rank || (rank == best_rank && e->tokens.size() < best->tokens.size())) best = e.get(), best_rank = rank;
+    }
+    return best ? best->tokens : std::vector<int32_t>();
+}
+
 PromptCacheStats PromptCache::stats() const {
     std::lock_guard<std::mutex> lock(mu_);
     PromptCacheStats s = stats_;
@@ -1151,6 +1247,8 @@ PromptCacheStats PromptCache::stats() const {
     s.ram_bytes = (int64_t)ram_bytes_, s.spare_bytes = (int64_t)spare_bytes_;
     s.bytes = (int64_t)disk_bytes_, s.max_bytes = (int64_t)max_bytes_;
     s.pending = (int64_t)queue_.size();
+    s.points = (int64_t)points_.size();
+    for (const Point &p : points_) s.point_bytes += (int64_t)p.small->capacity();
     return s;
 }
 

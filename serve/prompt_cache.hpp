@@ -114,6 +114,9 @@ struct PromptCacheStats {
     int64_t deltas_dropped = 0;               // deltas removed with their base (or whose base file was missing)
     double load_seconds = 0, write_seconds = 0;
     int64_t pending = 0;  // queued writes
+    // Resume points (PromptCache "Resume points"): held now and their bytes; saved, resumed from, dropped over the
+    // cap (Options::max_points), and left RAM for the margin (they go before any entry).
+    int64_t points = 0, point_bytes = 0, point_puts = 0, point_hits = 0, points_dropped = 0, points_evicted = 0;
 };
 
 class PromptCache {
@@ -140,6 +143,9 @@ public:
         uint64_t disk_free_margin = 32ull << 30;  // a write never leaves less free space on the cache's filesystem
         double shutdown_seconds = 40;       // the destructor's flush stops after this long
         int checkpoints_per_chain = 2;      // Checkpoints kept per conversation (>= 1)
+        // Resume points kept (put_point; 0 = none saved): ~0.11 GB each. 16 is ~1.8 GiB at most, and the RAM rule
+        // drops them before any entry. See "Resume points" below.
+        int max_points = 16;
         // Delta entries: a Turn is a delta on its base while it adds at most this many tokens (and at most a quarter of
         // the base's); 0 = every entry whole. 65536 (was 32768): below a 262k base the quarter rule
         // decides - a delta of <= ~1.4 GB (27 KiB a token + ~0.12 GB) instead of a whole rebase every 32k tokens.
@@ -232,6 +238,28 @@ public:
     // state). A caller that only reads the byte map passes false.
     bool with_paged(const std::vector<int32_t> &prompt, int64_t n,
                     const std::function<void(const HostBuffer &, const PagedState &)> &use, bool consumed = true);
+    // Resume points (strixite #32 / #33). A client that edits a message it sent long ago (an agent pruning old tool
+    // output, a front-end dropping old screenshots, an edited message) leaves no entry that matches past the edit
+    // but the system prompt's: the recurrent state can only resume where it was saved. A point is a saved state's
+    // small half alone (LmBackend::small_states - no K/V rows, ~0.11 GB at any depth) at a message boundary of a
+    // conversation; the K/V below it is the same in every state that starts with those tokens, so the engine lays
+    // a point over K/V that holds them - the slot's live state, or a longer entry of the same conversation it
+    // loads first (donor()). The resume then starts at the last point before the edit.
+    // Points live in RAM only: never written, not entries (best(), contains(), nearest() and delta_base() don't
+    // see them), at most Options::max_points, least recently used dropped first; under the RAM rule they leave
+    // before any entry (they are the cheapest thing to lose). A duplicate refreshes the one held. False (nothing
+    // kept): max_points 0, or no RAM tier.
+    bool put_point(std::vector<int32_t> tokens, HostBuffer small, int64_t saved_by = 0);
+    // The point covering the longest prefix of prompt with at most max_n tokens; 0 if none.
+    int64_t best_point(const std::vector<int32_t> &prompt, int64_t max_n) const;
+    // use(small) with the point of prompt[0, n), off the cache's lock (the point stays alive for the call even if
+    // it is dropped meanwhile); false if there is none. Counts a hit.
+    bool with_point(const std::vector<int32_t> &prompt, int64_t n, const std::function<void(const HostBuffer &)> &use);
+    // The K/V a point at prompt[0, n) can lie on: the tokens of an entry at least n long that starts with
+    // prompt[0, n) - parked in RAM first (its pages map back), then a RAM copy, then a disk file; the shortest of
+    // a kind (the least to load). Empty: none. The caller loads it with with_paged / with_state, passing these
+    // tokens as the prompt.
+    std::vector<int32_t> donor(const std::vector<int32_t> &prompt, int64_t n) const;
     // A spare buffer (the largest; empty if none) for an export or a load, resized by whoever fills it - and back.
     // Near the margin with no spare of the last saved state's size, the least recently used RAM entry already on
     // disk gives up its buffer instead (no fresh mapping under memory pressure).
@@ -322,6 +350,16 @@ private:
         bool in_ram() const { return ram_cost() > 0; }
     };
     using EntryPtr = std::shared_ptr<Entry>;
+    struct Point {  // a resume point (put_point): tokens [0, n) and the state's small half at n
+        std::vector<int32_t> tokens;
+        std::shared_ptr<const HostBuffer> small;
+        uint64_t last_used = 0;
+        int64_t saved_by = 0;
+    };
+    // Drops the least recently used point (its bytes off ram_bytes_; the buffer is unmapped when its last holder
+    // lets go - here, under the lock (~0.11 GB, a millisecond or two), unless a with_point call still reads it).
+    // False if there is none.
+    bool drop_point_locked();
     struct Job {
         EntryPtr e;
         Why why;
@@ -378,6 +416,7 @@ private:
     mutable std::mutex mu_;
     std::condition_variable cv_, idle_cv_;
     std::vector<EntryPtr> entries_;
+    std::vector<Point> points_;  // resume points, unordered (LRU by last_used)
     std::deque<Job> queue_;
     std::vector<HostBuffer> spares_;
     std::vector<HostBuffer> trash_;  // unmapped after the lock is released (~20 ms for 5 GiB of huge pages)

@@ -124,6 +124,13 @@ public:
     // next generation of this slot's cursor - a park advances it like a reset does. The save path's route
     // question; both counters are the gauges' own (strix_parked_generation_used, the per-slot kv gauges).
     bool park_budget_left() const override { return park_budget_left(0); }
+    bool small_states() const override { return true; }
+    uint64_t small_snapshot_bytes(int slot) const override { return small_snapshot_bytes(0, slot); }
+    void export_small_snapshot(int slot, HostBuffer &out) override { export_small_snapshot(0, slot, out); }
+    void resume_small(const HostBuffer &small, int64_t n) override { resume_small(0, small, n); }
+    uint64_t small_snapshot_bytes(int seq, int slot) const override;
+    void export_small_snapshot(int seq, int slot, HostBuffer &out) override;
+    void resume_small(int seq, const HostBuffer &small, int64_t n) override;
     bool park_budget_left(int seq) const override {
         return paged_states() && session_->parked_generations_used() < session_->parked_generation_capacity() &&
                session_->kv_generation(seq) + 1 < session_->kv_layout().generations;
@@ -151,6 +158,7 @@ private:
     LogitRows rows_of(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid,
                       const LogitMasks *masks, bool verify);
     void build_session();  // session_ + snapshots_ from the settings below (the constructor and renew)
+    const NgramTableRows *ngram_table() const;  // nullptr: no n-gram rows, or not from a table file
     const Qwen4ExpModel &model_;
     // The session's settings, kept so renew() builds the same one again.
     const int64_t capacity_, chunk_;

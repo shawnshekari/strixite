@@ -69,19 +69,21 @@ void check_tools(const json::Value &tools) {
 }
 
 // Several leading system messages (opencode sends two) become one, their texts joined by a blank line - the
-// template accepts a single system message, first. Content may be a string or text parts. OpenAI-style agent
-// harnesses (dsh) send their instructions with role "developer"; that role normalizes to "system" here.
+// template accepts a single system message, first. Content may be a string or text parts. OpenAI's newer clients
+// send the instructions as role "developer" (its name for system with reasoning models): a leading developer
+// message is a system message here, so even a lone one is rewritten (strixite PR #28).
 json::Value merge_leading_system(const json::Value &messages) {
     const auto &ms = messages.as_array("messages");
     size_t n = 0;
-    bool has_developer = false;
-    while (n < ms.size() && ms[n].is_object() && ms[n].find("role") && ms[n].find("role")->is_string()) {
-        const std::string &role = ms[n].find("role")->as_string("role");
-        if (role == "developer") has_developer = true;
-        if (role != "system" && role != "developer") break;
-        ++n;
+    bool developer = false;
+    for (; n < ms.size(); ++n) {
+        const json::Value *role = ms[n].is_object() ? ms[n].find("role") : nullptr;
+        if (!role || !role->is_string()) break;
+        const std::string &r = role->as_string("role");
+        if (r != "system" && r != "developer") break;
+        developer = developer || r == "developer";
     }
-    if (n < 2 && !has_developer) return messages;  // a lone "developer" message still rewrites to system below
+    if (n < 2 && !developer) return messages;
     std::string text;
     for (size_t k = 0; k < n; ++k) {
         const json::Value *c = ms[k].find("content");

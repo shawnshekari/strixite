@@ -98,6 +98,9 @@ Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngra
         STRIX_CHECK(f.meta("shared_expert") == (shared_separate_ ? "separate" : "stacked"), "Qwen4ExpModel: '", weights,
                     "' has shared_expert metadata '", f.meta("shared_expert"), "' but layer 0's shared expert is ",
                     shared_separate_ ? "separate" : "stacked");
+    // How many routed experts per layer: the tensors decide (strixite PR #35), like the shared expert's placement.
+    D.experts = qwen4exp_routed_experts(f.find(kLm + "layers.0.mlp.experts_gate_up"), D, shared_separate_,
+                                        "Qwen4ExpModel: '" + weights + "' " + kLm + "layers.0.mlp.experts_gate_up");
     const int64_t n4 = D.H * D.d, Estack = D.experts + (shared_separate_ ? 0 : 1);
     const auto &emb_info = f.get(kLm + "embed_tokens.weight");
     if (emb_info.encoding == StrixwEncoding::Q8RowMajor) {
@@ -436,6 +439,24 @@ int64_t kv_generations_that_fit(const Qwen4ExpDims &D, size_t act_bytes, int64_t
     while (g >= 1 && kv_reservation_layout(D, act_bytes, capacity, mtp, kv, slots, page_bytes, g, g).total_bytes > ceiling)
         --g;
     return std::max<int64_t>(g, 0);
+}
+
+int64_t qwen4exp_routed_experts(const StrixwTensor *gate_up, const Qwen4ExpDims &D, bool shared_separate,
+                                const std::string &where) {
+    STRIX_CHECK(D.inter >= 1 && D.d >= 1 && D.top_k >= 1, where, ": dims inter ", D.inter, ", d ", D.d, ", top_k ",
+                D.top_k, ", expected each >= 1");
+    STRIX_CHECK(gate_up != nullptr, where, ": missing (layer 0's routed experts, needed for the expert count)");
+    const auto &sh = gate_up->shape;
+    STRIX_CHECK(sh.size() == 2 && sh[1] == D.d && sh[0] > 0 && sh[0] % (2 * D.inter) == 0, where, ": shape [",
+                sh.size() > 0 ? sh[0] : -1, ", ", sh.size() > 1 ? sh[1] : -1, "] (rank ", sh.size(),
+                "), expected [expert slots x ", 2 * D.inter, ", ", D.d, "]");
+    const int64_t slots = sh[0] / (2 * D.inter);
+    STRIX_CHECK(gate_up->experts == 0 || gate_up->experts == slots, where, ": records ", gate_up->experts,
+                " experts, but its ", sh[0], " rows hold ", slots);
+    const int64_t routed = slots - (shared_separate ? 0 : 1);  // a stacked shared expert is the stack's last slot
+    STRIX_CHECK(routed >= D.top_k, where, ": ", routed, " routed experts (", slots, " slots, shared expert ",
+                shared_separate ? "separate" : "stacked", "), fewer than the ", D.top_k, " each token selects");
+    return routed;
 }
 
 Qwen4ExpDims qwen4exp_dims_from_file(const StrixwFile &f) {

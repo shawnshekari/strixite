@@ -289,6 +289,9 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
          "a cache write never leaves less than this many GiB free on the cache's filesystem"},
         {"prompt-cache-checkpoints", K::Int, 1, 1000, std::to_string(cache.checkpoints_per_chain),
          "prompt cache checkpoints kept per conversation"},
+        {"prompt-cache-points", K::Int, 0, 1000, std::to_string(cache.max_points),
+         "resume points kept in RAM (~0.11 GB each): a client that edits an old message resumes at the last message "
+         "boundary before the edit; 0 = none"},
         {"prompt-cache-delta-max-tokens", K::Int, 0, 1 << 24, std::to_string(cache.delta_max_tokens),
          "a turn is saved as a delta on the whole entry it extends while it adds at most this many tokens (and a "
          "quarter of the base); 0 = every entry whole"},

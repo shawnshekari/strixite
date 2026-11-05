@@ -110,6 +110,7 @@ int run(int argc, char **argv) {
     cache_opts.idle_seconds = settings.number("prompt-cache-idle-s");
     cache_opts.write_gib_per_hour = settings.number("prompt-cache-write-gib-per-hour");
     cache_opts.checkpoints_per_chain = (int)settings.integer("prompt-cache-checkpoints");
+    cache_opts.max_points = (int)settings.integer("prompt-cache-points");
     cache_opts.delta_max_tokens = settings.integer("prompt-cache-delta-max-tokens");
     cache_opts.disk_free_margin = (uint64_t)settings.integer("prompt-cache-disk-free-gib") << 30;
     PrecisionOptions precision;

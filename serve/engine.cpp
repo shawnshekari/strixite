@@ -190,25 +190,51 @@ void Engine::dispatch_locked() {
         // A prompt that continues a busy slot's running request (its whole prompt a prefix: the client's next turn,
         // sent as soon as the reply streamed while the slot still saves its cache) waits for that slot - on another
         // slot it would re-prefill from the prompt cache at best.
+        // A rewrite of an old message (PromptCache "Resume points"): the slot still holding the conversation's
+        // previous version resumes at the last point before the edit over its own K/V - on any other slot the
+        // point needs that state loaded first, or finds nothing. Only past what the cache's entries give anyway.
+        const int64_t cache_best =
+            cache_ && cache_->options().max_points > 0 ? cache_->best(key, (int64_t)key.size() - 1) : 0;
+        // The point a slot's state (its tokens) would give this prompt, past cache_best; 0 = none.
+        const auto point_on = [&](const Slot &sl, const std::vector<int32_t> &held) -> int64_t {
+            if (!points_on(sl) || held.empty()) return 0;
+            int64_t c = 0;
+            while (c < (int64_t)held.size() && c < (int64_t)key.size() && held[(size_t)c] == key[(size_t)c]) ++c;
+            const int64_t k = c > 0 ? cache_->best_point(key, std::min(c, (int64_t)key.size() - 1)) : 0;
+            return k > cache_best ? k : 0;
+        };
         if (slots_.size() > 1) {
             const Slot *mine = nullptr;
+            int64_t mine_point = 0;
             for (const auto &sl : slots_) {
                 const std::vector<int32_t> &rk = sl->running_key;
                 if (sl->busy && !rk.empty() && rk.size() < key.size() && std::equal(rk.begin(), rk.end(), key.begin()))
-                    mine = sl.get();
+                    mine = sl.get(), mine_point = 0;
             }
+            // The same for a rewrite: the busy slot running this conversation's previous version (a client sends
+            // the edited history right after the reply, while that slot still saves its states) holds the K/V a
+            // point lies on - elsewhere the point needs an entry loaded, or finds none (a held Turn stays live).
+            if (mine == nullptr)
+                for (const auto &sl : slots_)
+                    if (sl->busy && !sl->running_key.empty())
+                        if (const int64_t k = point_on(*sl, sl->running_key); k > mine_point) mine = sl.get(), mine_point = k;
             if (mine != nullptr) {
                 if (held_logged_ != req.id) {
                     held_logged_ = req.id;
-                    slog(LogLevel::Info, "Request %lld waits for slot %d: it continues Request %lld's conversation "
-                         "(%s tokens), still running there", (long long)req.id, mine->index, (long long)mine->running_id,
-                         fmt_n((long long)mine->running_key.size()).c_str());
+                    if (mine_point > 0)
+                        slog(LogLevel::Info, "Request %lld waits for slot %d: it rewrote Request %lld's conversation, "
+                             "and a resume point at %s tokens lies on that slot's K/V", (long long)req.id, mine->index,
+                             (long long)mine->running_id, fmt_n(mine_point).c_str());
+                    else
+                        slog(LogLevel::Info, "Request %lld waits for slot %d: it continues Request %lld's conversation "
+                             "(%s tokens), still running there", (long long)req.id, mine->index, (long long)mine->running_id,
+                             fmt_n((long long)mine->running_key.size()).c_str());
                 }
                 return;  // FIFO: the requests behind it wait too
             }
         }
-        Slot *cont = nullptr, *empty = nullptr, *lru = nullptr;
-        int64_t cont_common = 0;
+        Slot *cont = nullptr, *empty = nullptr, *lru = nullptr, *pointed = nullptr;
+        int64_t cont_common = 0, pointed_at = 0;
         for (auto &sl : slots_) {
             if (sl->busy) continue;
             if (!req.image_pos3.empty() && sl->index != 0) continue;
@@ -223,9 +249,11 @@ void Engine::dispatch_locked() {
             while (c < (int64_t)n && c < (int64_t)key.size() && sl->seq[(size_t)c] == key[(size_t)c]) ++c;
             const bool same = (c == (int64_t)n && n < key.size()) || (sl->turn_pos > 0 && c >= sl->turn_pos);
             if (same && (!cont || c > cont_common)) cont = sl.get(), cont_common = c;
+            if (!same)
+                if (const int64_t k = point_on(*sl, sl->seq); k > pointed_at) pointed = sl.get(), pointed_at = k;
             if (!lru || sl->last_used < lru->last_used) lru = sl.get();
         }
-        Slot *best = cont ? cont : empty ? empty : lru;
+        Slot *best = cont ? cont : pointed ? pointed : empty ? empty : lru;
         if (best == nullptr) return;  // FIFO: the oldest request waits for a slot, the ones behind it too
         std::string why;
         if (slots_.size() > 1) {
@@ -235,6 +263,8 @@ void Engine::dispatch_locked() {
                     idle += (idle.empty() ? "" : ", ") + std::to_string(sl->index) + " (" + fmt_n((long long)sl->seq.size()) + ")";
             why = best == cont   ? "continues its live conversation (" + fmt_n(cont_common) + " of " + fmt_n((long long)best->seq.size()) +
                                        " tokens match)"
+                  : best == pointed ? "holds this conversation's previous version: a resume point at " + fmt_n(pointed_at) +
+                                          " tokens lies on its K/V"
                   : best == empty ? std::string("an empty slot")
                                   : "least recently used: its " + fmt_n((long long)best->seq.size()) +
                                         "-token conversation goes back to the prompt cache";
@@ -431,6 +461,14 @@ std::string Engine::kv_budget_refusal() const {
 int64_t Engine::resume_point(Slot &sl, const std::vector<int32_t> &prompt, int64_t id, bool &from_disk, bool &from_ram) {
     from_disk = false, from_ram = false;
     const int64_t P = (int64_t)prompt.size();
+    int64_t lcp = 0;
+    while (lcp < (int64_t)sl.seq.size() && lcp < P && sl.seq[(size_t)lcp] == prompt[(size_t)lcp]) ++lcp;
+    // A resume point (PromptCache "Resume points") worth more than any entry: the prompt rewrote an old message.
+    // When it lies on this slot's live K/V (the conversation's previous version is still here), the held Turn
+    // below must not park - a park takes those K/V pages out of the slot - so it goes to the cache as a copy.
+    const int64_t kp = points_on(sl) ? cache_->best_point(prompt, P - 1) : 0;
+    const bool point_wins = kp > 0 && kp > cache_->best(prompt, P - 1);
+    const bool point_live = point_wins && lcp >= kp && sl.be->pos() >= kp;
     // A Turn held in the slot (save_state): a prompt that extends it continues the conversation here - live, or
     // from the Turn snapshot - and this request's own Turn replaces it, so it is dropped unsaved. Any other
     // prompt is another conversation (or a rewrite of this one): the held Turn goes to the cache first, before
@@ -440,16 +478,69 @@ int64_t Engine::resume_point(Slot &sl, const std::vector<int32_t> &prompt, int64
         if (P > (int64_t)pt.size() && std::equal(pt.begin(), pt.end(), prompt.begin()))
             sl.pending = PendingTurn();
         else
-            flush_pending_turn(sl, "the slot takes another prompt");
+            flush_pending_turn(sl, point_live ? "the prompt rewrote this conversation (copied: a resume point lies "
+                                                "on the slot's K/V)" : "the slot takes another prompt",
+                               /*allow_park=*/!point_live);
     }
-    int64_t lcp = 0;
-    while (lcp < (int64_t)sl.seq.size() && lcp < P && sl.seq[(size_t)lcp] == prompt[(size_t)lcp]) ++lcp;
     // In memory: the live state if the prompt extends it, else the better of the snapshots.
     int64_t best = 0, how = -2;  // -1 = live, >= 0 = slot
     if (lcp == (int64_t)sl.seq.size() && lcp < P && sl.be->pos() == lcp) best = lcp, how = -1;
     for (int slot : {LmBackend::kTurnSlot, LmBackend::kSystemSlot, LmBackend::kUserSlot}) {
         const int64_t sp = sl.be->snapshot_pos(slot);
         if (sp > best && sp <= lcp && sp < P && sl.be->can_restore_snapshot(slot)) best = sp, how = slot;
+    }
+    // A resume point past the in-memory states and every entry (point_wins): its small half over K/V that holds
+    // its tokens - this slot's live state (the conversation's previous version), else an entry of the same
+    // conversation loaded first (a parked one maps its pages back; a copy is imported). The rows past the point
+    // are that longer state's and are overwritten as the prompt goes on. Nothing holds its K/V: the usual resume.
+    if (kp > best && point_wins) {
+        const double t0 = now_s();
+        const bool live = lcp >= kp && sl.be->pos() >= kp;  // (re-checked: the held Turn's save may have reset it)
+        std::string over;
+        size_t bytes = 0;
+        bool ram = true;
+        const bool done = cache_->with_point(prompt, kp, [&](const HostBuffer &small) {
+            if (live) {
+                over = "the slot's live K/V (" + fmt_n(sl.be->pos()) + " tokens)";
+            } else {
+                const std::vector<int32_t> d = cache_->donor(prompt, kp);
+                if (d.empty()) return;
+                const int64_t dn = (int64_t)d.size();
+                bool paged = false, loaded = false;
+                if (cache_->with_paged(d, dn, [&](const HostBuffer &ds, const PagedState &rec) {
+                        sl.be->resume_paged(ds, rec, dn);
+                        bytes += ds.size() + rec.bytes();
+                        paged = true;
+                    }))
+                    loaded = true;
+                else
+                    loaded = cache_->with_state(d, dn, [&](const HostBuffer &state, int64_t from, int64_t to) {
+                        sl.be->import_state(state, to, from);
+                        bytes += state.size();
+                    }, &ram);
+                if (!loaded) return;
+                over = (paged ? "a parked entry's K/V pages (" : "the K/V of an entry (") + fmt_n(dn) + " tokens, " +
+                       (ram ? "RAM" : "disk") + ")";
+            }
+            sl.be->resume_small(small, kp);
+            bytes += small.size();
+        });
+        if (done && !over.empty()) {
+            slog_row(LogLevel::Info, "resume", "%s of %s tokens from a resume point (a message boundary) over %s",
+                     fmt_n(kp).c_str(), fmt_n(P).c_str(), over.c_str());
+            slog_row(LogLevel::Info, "", "%s MB loaded in %s ms", fmt_rate(bytes / 1e6, 0).c_str(),
+                     fmt_rate((now_s() - t0) * 1e3, 0).c_str());
+            sl.seq.assign(prompt.begin(), prompt.begin() + kp);
+            from_ram = ram;
+            from_disk = true;
+            return kp;
+        }
+        // Not used: nothing holds the point's K/V any more, or the point left RAM since the lookup. Either way the
+        // slot is unchanged (a donor loads only inside with_point, after the point is pinned, and a failed lookup
+        // loads nothing), so the usual resume below still holds.
+        if (done)
+            slog_row(LogLevel::Debug, "resume", "a resume point at %s tokens: no live state or entry holds its K/V",
+                     fmt_n(kp).c_str());
     }
     // In the prompt cache (RAM, else disk), if it covers more.
     if (cache_) {
@@ -696,6 +787,41 @@ bool Engine::save_state(Slot &sl, const int32_t *tokens, int slot, int64_t n, Pr
              fmt_rate(state.size() / 1e6, 0).c_str(), fmt_rate(ms, 0).c_str());
     rows++;
     return cache_->put(std::vector<int32_t>(tokens, tokens + n), kind, std::move(state), one_shot, base_n, req_id);
+}
+
+bool Engine::points_on(const Slot &sl) const {
+    return cache_ != nullptr && cache_->options().max_points > 0 && cache_->options().ram_tier && sl.be->small_states();
+}
+
+bool Engine::save_point(Slot &sl, const int32_t *tokens, int slot, int64_t n, const char *what, int64_t req_id,
+                        int &rows) {
+    STRIX_CHECK(cache_ != nullptr && tokens != nullptr && n >= 1, "Engine::save_point: cache ", (const void *)cache_,
+                ", tokens ", (const void *)tokens, ", n = ", n);
+    const std::vector<int32_t> key(tokens, tokens + n);
+    if (cache_->best_point(key, n) == n) return false;  // held already (an earlier request saved it)
+    const char *skip = sl.be->snapshot_pos(slot) != n     ? "no snapshot there"
+                       : !sl.be->can_restore_snapshot(slot) ? "snapshot no longer valid"
+                                                            : nullptr;
+    if (skip) {
+        slog_row(LogLevel::Debug, rows++ ? "" : "cache", "%s, %s tokens: not saved - %s", what, fmt_n(n).c_str(), skip);
+        return false;
+    }
+    const double t0 = now_s();
+    const uint64_t want = sl.be->small_snapshot_bytes(slot);
+    if (!cache_->make_room_for(want, [&](const std::vector<int64_t> &ids) {
+            for (const int64_t id : ids) sl.be->release_parked(id);
+        })) {
+        slog_row(LogLevel::Debug, rows++ ? "" : "cache", "%s, %s tokens: not saved - no room in RAM for %s MB", what,
+                 fmt_n(n).c_str(), fmt_rate(want / 1e6, 0).c_str());
+        return false;
+    }
+    HostBuffer small;
+    sl.be->export_small_snapshot(slot, small);
+    const size_t bytes = small.size();
+    const bool put = cache_->put_point(key, std::move(small), req_id);
+    slog_row(LogLevel::Debug, rows++ ? "" : "cache", "%s, %s tokens -> RAM (%s MB small state, %s ms)", what,
+             fmt_n(n).c_str(), fmt_rate(bytes / 1e6, 0).c_str(), fmt_rate((now_s() - t0) * 1e3, 0).c_str());
+    return put;
 }
 
 void Engine::flush_pending_turn(Slot &sl, const char *why, bool allow_park) {
@@ -1553,6 +1679,12 @@ void Engine::run(Job &job, Slot &sl) {
                 if (save_state(sl, prompt.data(), slot, n, kind, what, req.one_shot, req.id, rows, /*hold_turn=*/true))
                     ++saved;
             };
+            // Resume points first: the saves below may take the snapshots' K/V out of the slot (a park). Past the
+            // system prompt only (a point there would be the System entry again), never for a one-shot request.
+            if (!req.one_shot && points_on(sl)) {
+                if (ust > sys) save_point(sl, prompt.data(), LmBackend::kUserSlot, ust, "resume point: the last user message's start", req.id, rows);
+                if (cut > sys && cut < P) save_point(sl, prompt.data(), LmBackend::kTurnSlot, cut, "resume point: the reply's start", req.id, rows);
+            }
             if (save_sys) save(LmBackend::kSystemSlot, sys, PromptCache::Kind::System, "the system prompt's end");
             // The checkpoint is the start of the user message, not its end: clients rewrite the latest user message
             // on the next one (opencode's plan mode appends a reminder to it and strips it later), so an entry that

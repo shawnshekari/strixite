@@ -412,6 +412,20 @@ void SeqBackend::resume_paged(const HostBuffer &small, const PagedState &paged, 
     arb_.run(seq_, GpuArbiter::Kind::Call, [&] { arb_.backend().resume_paged(seq_, small, paged, n); });
 }
 
+uint64_t SeqBackend::small_snapshot_bytes(int slot) const {
+    uint64_t b = 0;
+    arb_.run(seq_, GpuArbiter::Kind::Hint, [&] { b = arb_.backend().small_snapshot_bytes(seq_, slot); });
+    return b;
+}
+
+void SeqBackend::export_small_snapshot(int slot, HostBuffer &out) {
+    arb_.run(seq_, GpuArbiter::Kind::Call, [&] { arb_.backend().export_small_snapshot(seq_, slot, out); });
+}
+
+void SeqBackend::resume_small(const HostBuffer &small, int64_t n) {
+    arb_.run(seq_, GpuArbiter::Kind::Call, [&] { arb_.backend().resume_small(seq_, small, n); });
+}
+
 void SeqBackend::release_parked(int64_t parked_id) {
     arb_.run(seq_, GpuArbiter::Kind::Call, [&] { arb_.backend().release_parked(seq_, parked_id); });
 }
