@@ -123,6 +123,29 @@ What to watch:
   `strix_parked_generation_used` / `strix_parked_generation_capacity`, `strix_kv_renewals_total` and
   `strix_kv_renew_failures_total`.
 
+## Editing old messages: resume points
+
+The model's linear-attention layers keep a running state instead of a history, so a conversation can only resume
+where its state was saved, and only for a prompt that matches it from the first token. Most clients only ever append,
+and every turn resumes where the last one ended. Some rewrite what they sent long ago: an agent that trims old tool
+output to keep its context small, a client that drops old screenshots to stay under an image limit, a chat that lets
+you edit an earlier message. Everything after such an edit has to be read again - before, everything after the
+system prompt did.
+
+So the server also keeps small resume points: at the start of every reply and every user message it saves the part
+of the state that the K/V rows don't hold - about 0.11 GB however deep the conversation is. The K/V rows before a
+point are the same in every version of the conversation that shares those tokens, so a point resumes over the
+previous version's K/V: still in its slot, or saved in the prompt cache. An edit then costs only what comes after the
+last point before it. With several slots, the request goes to the slot that holds the previous version, waiting for
+it if it is still finishing a reply.
+
+`prompt-cache-points` (16) is how many the server keeps, in RAM only - they are never written to disk, and when
+memory gets short they go before anything else. `GET /cache` reports them under `resume_points`, and `/metrics` has
+`strix_prompt_cache_points` and `strix_prompt_cache_point_hits_total`. An edit inside the system prompt or the tool
+list still means reading the whole conversation again: keep those stable within a conversation.
+
+Thanks to @mikenavi for the idea and the two designs in #32 and #33.
+
 ## Structured output
 
 `response_format` with `json_object` or `json_schema` (`{name, strict, schema}`) constrains the answer token by token:

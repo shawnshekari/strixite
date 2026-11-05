@@ -40,6 +40,7 @@ With the shipped settings (`capacity = 524288`, `total-slots = 2`, `chunk = 1638
 | **one slot's K/V for a full 512k conversation** | 8.2 GiB | held back at startup but not used yet - the slots map K/V pages as conversations fill them ([below](#slots-conversations-at-once)) |
 | **n-gram row cache** (`ngram-cache-rows = 8388608`) | 3.0 GiB | fixed at startup |
 | **prompt cache, RAM tier** | 0 at startup, grows with use | saved conversations, a few GB each |
+| **resume points** (`prompt-cache-points = 16`) | 0 at startup, up to ~1.8 GiB | small states at message boundaries ([server.md](server.md#editing-old-messages-resume-points)); the first thing to go when memory is short |
 | **the margin** (`prompt-cache-ram-margin-gib = 5`) | 5 GiB | kept free for the kernel and everything else |
 | the operating system, services | a few GiB | |
 
