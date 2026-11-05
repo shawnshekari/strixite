@@ -2,8 +2,8 @@
 
 strixite's server speaks the OpenAI API on port 5300. This page covers the parts where it does something you might
 not expect: how thinking is switched and limited, the thinking nudge, prefill progress in a stream, conversations
-served together, the K/V budget behind long uptimes, and exactly what structured output enforces - and what it
-refuses.
+served together, the K/V budget behind long uptimes, resume points for edited messages, exactly what structured
+output enforces - and what it refuses - and token bias.
 
 | endpoint | what it is |
 |---|---|
@@ -173,6 +173,33 @@ schema - that's what moves a keyword up the list.
 
 A schema is compiled once and cached (the 16 most recent), so repeating one costs nothing the second time. Long
 `maxLength` bounds cost a little on a schema's first use, since every position in the string is its own state.
+
+## Token bias: logit_bias
+
+`logit_bias` works as in OpenAI's API, on `/v1/chat/completions` and `/v1/completions`: an object from token ids to
+a bias between -100 and 100, e.g. `"logit_bias": {"12345": -100, "678": 5}`. The bias is added to the token's logit
+on every token the model samples - thinking and answer alike - before top-k, top-p and temperature, so -100 all but
+bans a token and +100 all but forces it; values in between make a token more or less likely.
+
+- **Token ids are the model's own**, from `tokenizer.json` in the model directory (the Hugging Face tokenizer gives
+  the same ids). Keys are plain decimal ids: `"05"`, `"+5"` or `"5.0"` are a 400, and so is an id past the
+  vocabulary. `{}`, `null` and biases of 0 mean no bias.
+- **It biases tokens, not words.** A word usually has several tokens - with and without a leading space, in
+  different cases - and can still be spelled from smaller pieces. Banning the four "Paris" tokens on "What is the
+  capital of France?" gets the answer in another script: 巴黎. To keep a script out of the replies, bias every
+  token that holds one of its characters (for the CJK scripts, about 66,000 of them).
+- **A schema still wins.** With `response_format`, a token the schema doesn't allow stays out whatever its bias, and
+  when every allowed token is biased down the model still picks among them.
+- **Only sampled tokens.** Text the server writes into the reply itself - the thinking nudge, the end of a thinking
+  budget - is not sampled, so a bias doesn't touch it.
+- **Cost:** under 1% slower decode with a 66,000-token list, nothing measurable with a few tokens. Drafts from the
+  multi-token-prediction head stay unbiased; the server rejects a draft the biased model wouldn't pick, so the
+  output is the biased model's either way - but a token you ban that the draft head keeps proposing costs some
+  speed.
+
+There's no server-side default list: what to bias is the client's choice, per request.
+
+Thanks to @maxm86545 for the request and the use cases in #26.
 
 ## Streamed tool calls
 

@@ -79,14 +79,15 @@ reference derived from the model's spec.
 
 ## Features
 
-- **OpenAI-compatible server** - chat completions with streaming, tool calls, reasoning and structured output
-  ([what it accepts](docs/server.md))
+- **OpenAI-compatible server** - chat completions with streaming, tool calls, reasoning, structured output and
+  `logit_bias` ([what it accepts](docs/server.md))
 - **Images** - PNG, JPEG, WebP, GIF, BMP and TGA in chat requests, from a separate ~0.9 GB file in the weights repo
   ([images](docs/images.md))
 - **Multi-token prediction** - the model's own draft head, up to 7 tokens checked per step
 - **Thinking that ends** - a request can cap its reasoning with its own budget, and a nudge steps in when the
   model's thinking goes in circles ([thinking](docs/server.md#thinking))
-- **Prompt cache in RAM and on disk** - long agent conversations resume instead of being re-read every turn
+- **Prompt cache in RAM and on disk** - long agent conversations resume instead of being re-read every turn, and
+  an edited old message costs only what comes after it ([resume points](docs/server.md#editing-old-messages-resume-points))
 - **Conversations at once** - two by default, more for shallower contexts; their decode steps share one forward,
   and a slot's memory grows with its conversation
   ([memory](docs/memory.md#slots-conversations-at-once))

@@ -66,7 +66,7 @@ podman run -d --name strixite \
   -p 5300:5300 \
   -v ~/models/strix-infer:/models \
   --stop-timeout 90 \
-  ghcr.io/shawnshekari/strixite:v0.6.0
+  ghcr.io/shawnshekari/strixite:v0.7.0
 ```
 
 What each line is for:
@@ -79,12 +79,12 @@ What each line is for:
 | `--security-opt label=disable` | on SELinux systems (Fedora, RHEL), without it the container may not read files in your home directory, and the server stops with "can't open ... generation_config.json". Harmless where SELinux is off |
 | `-p 5300:5300` | the API port; change the first number to publish it elsewhere |
 | `-v ~/models/strix-infer:/models` | your weights, and the prompt cache (`/models/prompt-cache`, created on first use) - so the mount must be writable |
-| `:v0.6.0` | the release; `:latest` is the newest release |
+| `:v0.7.0` | the release; `:latest` is the newest release |
 | `--stop-timeout 90` | on stop, the server first writes the conversations in its prompt cache's RAM to disk (up to ~40 s); `podman stop` / `docker stop` would otherwise kill it after 10 s - [Memory](memory.md#stopping-and-restarting) |
 
 The server loads the weights in ~30 s. **Settings:** the image runs with the release's `deploy/strix-server.conf`;
-any setting can be changed by adding its flag after the image name, e.g. `... strixite:v0.6.0 --capacity 262144`.
-The full list: `podman run --rm ghcr.io/shawnshekari/strixite:v0.6.0 --help`.
+any setting can be changed by adding its flag after the image name, e.g. `... strixite:v0.7.0 --capacity 262144`.
+The full list: `podman run --rm ghcr.io/shawnshekari/strixite:v0.7.0 --help`.
 
 ## 4. Check it
 
@@ -108,7 +108,7 @@ With podman, a Quadlet file turns the container into a systemd service. Save thi
 Description=strixite (Qwen3.8-Flash-Next on Strix Halo)
 
 [Container]
-Image=ghcr.io/shawnshekari/strixite:v0.6.0
+Image=ghcr.io/shawnshekari/strixite:v0.7.0
 ContainerName=strixite
 AddDevice=/dev/kfd
 AddDevice=/dev/dri
@@ -174,7 +174,7 @@ Fedora 43 (`fedora-minimal`), `strix_server`, `inspect_strixw` and the converter
 
 ```sh
 podman run --rm --device /dev/kfd --device /dev/dri --group-add keep-groups --security-opt label=disable \
-  -v ~/models/strix-infer:/models --entrypoint inspect_strixw ghcr.io/shawnshekari/strixite:v0.6.0 \
+  -v ~/models/strix-infer:/models --entrypoint inspect_strixw ghcr.io/shawnshekari/strixite:v0.7.0 \
   /models/converted/Qwen3.8-Flash-Next.U-gdn_in-g128/weights.strixw --verify
 ```
 
