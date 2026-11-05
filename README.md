@@ -26,9 +26,10 @@ Speed by release as the context grows:
 ![v0.3.0](https://img.shields.io/badge/v0.3.0-1abc9c)
 ![v0.4.0](https://img.shields.io/badge/v0.4.0-3fe8d0)
 ![v0.5.0](https://img.shields.io/badge/v0.5.0-ffe083)
+![v0.6.0](https://img.shields.io/badge/v0.6.0-ff7b72)
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #9b87e8, #1abc9c, #3fe8d0, #ffe083"}}}}%%
+%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #9b87e8, #1abc9c, #3fe8d0, #ffe083, #ff7b72"}}}}%%
 xychart-beta
     title "Prefill (tokens/s)"
     x-axis ["32k", "120k", "250k", "350k", "481k"]
@@ -38,10 +39,11 @@ xychart-beta
     line [1638, 1583]
     line [1693, 1630, 1570, 1533, 1484]
     line [1900, 1817, 1716, 1685, 1633]
+    line [1843, 1808, 1731, 1665, 1632]
 ```
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #9b87e8, #1abc9c, #3fe8d0, #ffe083"}}}}%%
+%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #9b87e8, #1abc9c, #3fe8d0, #ffe083, #ff7b72"}}}}%%
 xychart-beta
     title "Decode (tokens/s)"
     x-axis ["32k", "120k", "250k", "350k", "481k"]
@@ -51,11 +53,12 @@ xychart-beta
     line [59.0, 56.7]
     line [57.7, 58.7, 56.4, 55.7, 52.8]
     line [60.3, 58.7, 63.8, 56.3, 54.3]
+    line [63.8, 58.3, 58.8, 56.5, 56.1]
 ```
 
 Each release measured the same way: one request at a time through the server, a fresh prompt at each length. Releases
-before v0.4.0 were measured at 32k and 120k only; v0.4.0's 250k-481k points are single runs, v0.5.0's are medians of
-two. The axes start near the data so the differences are visible.
+before v0.4.0 were measured at 32k and 120k only; v0.4.0's 250k-481k points are single runs, v0.5.0's and v0.6.0's are
+medians of two. The axes start near the data so the differences are visible.
 
 > [!TIP]
 > **Curious how a mini PC runs a 180B-parameter model this fast?** No background needed:
