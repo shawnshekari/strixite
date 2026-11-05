@@ -36,6 +36,10 @@ cache, so a screenshot is paid for once, not every turn. From v0.4.0 the server 
 already decoded, so an agent that resends 20 screenshots with every step no longer decodes them all again: in my test
 (20 known near-full-size screenshots + 1 new) image preparation went from 1.76 s to 0.07 s per request.
 
+With more than one slot, a conversation that has held an image takes its decode steps on its own rather than in the
+step the other conversations share (image positions aren't the plain kind a shared step takes); the others still
+share. Since v0.6.0 that's what happens - before, such a step failed both requests.
+
 Decoding and resizing an image takes up to a few hundred MB of RAM while it runs. `vision-preprocess-limit` (default
 2) is how many images may do that at once; an image request past the limit gets a 503 that says to retry, instead of
 pushing the machine into a low-memory stall.

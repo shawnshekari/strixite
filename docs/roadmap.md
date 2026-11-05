@@ -40,8 +40,9 @@ real use cases are what move items up.
 
 Ideas I want, but that wait for evidence that they're worth their cost, or for the items above.
 
-- **More conversations at once**: v0.5.0 ships two slots by default (and other counts fit: 6 shorter ones measured
-  fine). Raising the default is my call, not a limit - say in an issue what you'd run.
+- **More conversations at once**: two slots by default; other counts fit (three and four of 512k start since
+  v0.6.0, six shorter ones measured fine). Raising the default is my call, not a limit - say in an issue what you'd
+  run.
 - **Changing settings without a restart**: an endpoint to change the server's settings while it runs - no 30-second
   reload of the weights, no emptied prompt cache.
 - **Sleep mode**: after a configurable idle time, free the GPU memory and reload on the next request - for machines

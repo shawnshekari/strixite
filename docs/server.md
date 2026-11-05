@@ -2,7 +2,8 @@
 
 strixite's server speaks the OpenAI API on port 5300. This page covers the parts where it does something you might
 not expect: how thinking is switched and limited, the thinking nudge, prefill progress in a stream, conversations
-served together, and exactly what structured output enforces - and what it refuses.
+served together, the K/V budget behind long uptimes, and exactly what structured output enforces - and what it
+refuses.
 
 | endpoint | what it is |
 |---|---|
@@ -90,6 +91,37 @@ stay best in pairs and shallow ones run in crowds. Requests past the slots wait
 in arrival order; `strix_busy` out of `strix_slots` in `/metrics` shows how many are taken, and while one slot reads
 a long prompt the others keep decoding, because the prefill runs in small chunks when a second slot is busy. A slot's
 memory grows with its conversation: [memory and the slot recipes](memory.md#slots-conversations-at-once).
+
+A conversation that has held an image takes its decode steps on its own instead of sharing them: its positions
+aren't the plain kind a shared step takes. The other slots still share with each other, and
+`strix_verify_alone_total` in `/metrics` counts the steps that ran alone.
+
+## Long uptimes: the K/V budget
+
+On this GPU, memory released and mapped again at the same virtual address can read the wrong data without any
+error. So whenever a slot switches to a different conversation, the new conversation's K/V goes at addresses the
+process has never used. That costs no RAM, only address space, and address space is large but not endless: each
+slot gets `kv-generations` switches. The default, 0, means auto - the most, up to 1024, that fit your slots and
+capacity: 1024 at one or two slots of 512k, 1001 at three, 801 at four. The startup log prints the count. A
+conversation that continues in its slot spends nothing; only a switch does.
+
+You don't have to restart to get the budget back. When a slot comes within `kv-renew-margin` (16) switches of its
+last, the server renews itself: it holds new requests, lets the running ones finish, writes the conversations it
+kept in memory to disk and rebuilds its working state on the loaded model. The weights stay loaded and the prompt
+cache stays; it takes seconds, and every conversation resumes from the cache. Set an explicit `kv-generations` only
+if you want a different number - startup refuses one that doesn't fit and names the most that would.
+
+What to watch:
+
+- `GET /health` carries `kv_budget`: `generations_left` per slot, `generations_capacity`, `parked_left` (the
+  shared budget for conversations kept in memory at a switch) and `renewals` since startup. `status` turns
+  `degraded` - still HTTP 200, the server keeps serving - with the reasons and an `action` when a slot is at its last
+  switch, the shared budget is spent, a request was refused, or a renewal failed.
+- With `kv-renew-margin = 0` (renewal off), a switch past the last is refused with HTTP 503 and the error type
+  `kv_budget_exhausted`, and only a restart gets the budget back.
+- `/metrics`: `strix_kv_generation_used` / `strix_kv_generation_capacity` per slot,
+  `strix_parked_generation_used` / `strix_parked_generation_capacity`, `strix_kv_renewals_total` and
+  `strix_kv_renew_failures_total`.
 
 ## Structured output
 

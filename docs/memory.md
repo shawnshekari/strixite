@@ -40,7 +40,7 @@ With the shipped settings (`capacity = 524288`, `total-slots = 2`, `chunk = 1638
 | **one slot's K/V for a full 512k conversation** | 8.2 GiB | held back at startup but not used yet - the slots map K/V pages as conversations fill them ([below](#slots-conversations-at-once)) |
 | **n-gram row cache** (`ngram-cache-rows = 8388608`) | 3.0 GiB | fixed at startup |
 | **prompt cache, RAM tier** | 0 at startup, grows with use | saved conversations, a few GB each |
-| **the margin** (`prompt-cache-ram-margin-gib = 4`) | 4 GiB | kept free for the kernel and everything else |
+| **the margin** (`prompt-cache-ram-margin-gib = 5`) | 5 GiB | kept free for the kernel and everything else |
 | the operating system, services | a few GiB | |
 
 That leaves **about 23 GiB of MemAvailable** right after the server loads with two slots, of which the 8.2 GiB K/V
@@ -54,7 +54,7 @@ flowchart LR
     total --> avail["MemAvailable after loading<br/>~23 GiB"]
     avail --> kv["one slot's full K/V<br/>8.2 GiB, held, mapped as used"]
     avail --> tier["prompt cache RAM tier<br/>grows with use, gives memory back"]
-    avail --> margin["the margin<br/>4 GiB, never used by the cache"]
+    avail --> margin["the margin<br/>5 GiB, never used by the cache"]
 ```
 
 What each one is for:
@@ -101,27 +101,29 @@ flowchart TD
     dropped --> still
 ```
 
-**Why 4 GiB is the default:** on a dedicated machine nothing else grows, so the margin only has to cover the
-kernel's own reserves and the moment between a process growing and the cache answering. Through long sessions at
+**Why 5 GiB is the default:** on a dedicated machine nothing else grows, so the margin only has to cover the
+kernel's own reserves, the moment between a process growing and the cache answering, and one save of a very deep
+conversation (300k+ tokens is 5-6 GB) into a full RAM tier - with 4 GiB, a machine running nothing else could
+still run out of memory there. Through long sessions at
 512k I measured the lowest MemAvailable at 3.8-5.5 GiB, with conversations resuming from RAM in 1.2-1.4 s. In a test
 where another process grabbed 0.5 GiB every second, MemAvailable dipped to 2.5 GiB for a moment before the cache
 caught up and held it above the margin - that dip is exactly what the margin is there to absorb.
 
 **Why you'd raise it:** a desktop grows in bursts - a browser opening a heavy page, an IDE indexing a project - that
-can be bigger than 4 GiB at once. 8 GiB gives those bursts room without the cache having to scramble.
+can be bigger than 5 GiB at once. 8 GiB gives those bursts room without the cache having to scramble.
 
 ## The startup check
 
 After the weights are loaded, the server measures MemAvailable and checks that it covers **the margin plus one
 saved conversation at full capacity** - the biggest save it might ever have to make. The one slot's full K/V held
 back for depth is subtracted from the measurement first: the server must be able to lose it to a conversation at
-any time and still meet the rule. With the shipped settings the check needs 4 + 8.3 = 12.3 GiB, and my dedicated
-machine has 23.9 after loading, 15.7 once the 8.2 GiB hold is set aside. The startup log says so in one line:
+any time and still meet the rule. With the shipped settings the check needs 5 + 8.3 = 13.3 GiB, and my dedicated
+machine has 23.2 after loading, 15.0 once the 8.2 GiB hold is set aside. The startup log says so in one line:
 
 ```
-startup: memory: MemAvailable 23.9 GiB after loading (GPU buffers 84.7 GiB for 2 slots, n-gram row cache 3.0 GiB)
+startup: memory: MemAvailable 23.2 GiB after loading (GPU buffers 84.7 GiB for 2 slots, n-gram row cache 3.0 GiB)
 less 8.2 GiB held for one slot's K/V at full capacity (paged: mapped as conversations fill it); needs the prompt
-cache's RAM margin 4.0 GiB + one state at full capacity (524,288 tokens) 8.3 GiB = 12.3 GiB
+cache's RAM margin 5.0 GiB + one state at full capacity (524,288 tokens) 8.3 GiB = 13.3 GiB
 ```
 
 (The numbers below and in the examples are from my machine at these settings; your line has yours.)
@@ -138,7 +140,7 @@ prompt cache: everything other processes hold comes out of its RAM tier.
 
   ```
   fatal: not enough memory for these settings: MemAvailable 9.8 GiB after loading (...), short of the prompt
-  cache's RAM margin 4.0 GiB + one state at full capacity (524,288 tokens) 8.3 GiB = 12.3 GiB by 2.5 GiB.
+  cache's RAM margin 5.0 GiB + one state at full capacity (524,288 tokens) 8.3 GiB = 13.3 GiB by 3.5 GiB.
   To fit: free memory (another process?), or change: capacity = 262144 (state 4.2 GiB, at least 4.1 GiB less GPU
   memory), capacity = 131072 (state 2.1 GiB, at least 6.1 GiB less GPU memory), ngram-cache-rows = 262144 (frees
   2.9 GiB), prompt-cache-gib = 0 (no prompt cache). Or set low-memory = adapt ...
@@ -152,7 +154,7 @@ prompt cache: everything other processes hold comes out of its RAM tier.
 - **`adapt`**: the server starts anyway and turns its caches down, cheapest first, only as far as needed, with one
   WARNING line per step that says what it costs and how to get it back:
   1. spare export buffers off - each save maps a fresh buffer (~0.2 s instead of ~0.05 at 100-200k tokens);
-  2. if you raised the margin above 4 GiB: the RAM tier off - every save goes straight to disk and other
+  2. if you raised the margin above 5 GiB: the RAM tier off - every save goes straight to disk and other
      conversations resume from there (at the default margin the tier stays on and simply holds less);
   3. the n-gram row cache shrunk, down to 262,144 rows - more SSD reads while reading a prompt;
   4. if it's still short: the longest conversation it can still save is logged - longer ones aren't saved, and are
@@ -175,9 +177,15 @@ grows - the slot's full K/V is reserved as address space and backed page by page
 slot's K/V at full depth (the 8.2 GiB above) and lets the rest be filled in on demand, on the rule that not every
 slot runs a deepest-possible conversation at once. When a slot's K/V must grow, the server frees what it can in
 order - spare buffers, then the prompt cache's least recently used RAM entries (to disk, not dropped) - and only
-if that isn't enough does the request fail cleanly, naming what it needed and what was free. A page a conversation
-once reached stays with its slot: pages are not handed back at runtime, so the RAM a deep conversation used is not
-lent to the cache again until the server restarts.
+if that isn't enough does the request fail cleanly, naming what it needed and what was free.
+
+When another conversation takes the slot, the one that was there leaves with its pages: they go to the prompt cache
+as they are - parked, no copy - and come back as the same pages when that conversation resumes. A parked
+conversation counts in the RAM tier like any saved one; when the cache needs room it writes the conversation to
+disk and gives its pages back, so the RAM a deep conversation used is lent to the cache again without a restart.
+(A small state - a short conversation - is simply copied at the switch instead.) A conversation that continues in
+its slot keeps its pages and pays nothing. Each switch maps fresh addresses, so a slot has a budget of switches
+that the server renews by itself: [Long uptimes](server.md#long-uptimes-the-kv-budget).
 
 The trade to know: two slots at 512k leave the prompt cache's RAM tier a few GiB smaller than one slot did - in
 exchange for conversations no longer re-reading each other's prompts.
@@ -207,14 +215,14 @@ machine. At the defaults that leaves almost nothing - which is how it crashed. W
 
 | settings | MemAvailable after loading, minus 23 GiB | the check needs |
 |---|---|---|
-| defaults (2 x 512k) | 23.9 - 8.2 - 23 = below zero | 4 + 8.3 = 12.3 - no |
-| `capacity = 262144` | 31.4 - 4.1 - 23 = 4.3 | 4 + 4.2 = 8.2 - no |
-| `capacity = 131072` | 36.3 - 2.1 - 23 = 11.2 | 4 + 2.1 = 6.1 - **yes**, ~5 GiB to spare |
-| `capacity = 131072`, `ngram-cache-rows = 262144` | +2.9 - 23 = ~14 | 6.1 - **yes**, ~8 GiB to spare |
+| defaults (2 x 512k) | 23.2 - 8.2 - 23 = below zero | 5 + 8.3 = 13.3 - no |
+| `capacity = 262144` | 31.4 - 4.1 - 23 = 4.3 | 5 + 4.2 = 9.2 - no |
+| `capacity = 131072` | 36.3 - 2.1 - 23 = 11.2 | 5 + 2.1 = 7.1 - **yes**, ~4 GiB to spare |
+| `capacity = 131072`, `ngram-cache-rows = 262144` | +2.9 - 23 = ~14 | 7.1 - **yes**, ~7 GiB to spare |
 
 These assume the default two slots; if your agent doesn't need them, `total-slots = 1` frees a little more again.
 
-So: a 128k context, and keep the margin at 4 GiB. With the 8-bit KV cache (v0.4.0) the default row cache fits too;
+So: a 128k context, and keep the margin at 5 GiB. With the 8-bit KV cache (v0.4.0) the default row cache fits too;
 the small one buys more room for the prompt cache. Start the
 other model first, so strixite's startup check measures the memory that's really left. If the other model grows
 while it runs, the background check moves strixite's saved conversations to disk to make room.
@@ -226,11 +234,11 @@ Every slot at the full 512k fits up to four on 128 GB; shorter contexts fit more
 
 | `total-slots` x `capacity` | GPU buffers | MemAvailable after load |
 |---|---|---|
-| 1 x 524288 | 83.8 GiB | 24.1 |
-| **2 x 524288 (default)** | **84.7** | **23.9** |
+| 1 x 524288 | 83.8 GiB | 24.0 |
+| **2 x 524288 (default)** | **84.7** | **23.2** |
 | 3 x 524288 | 85.6 | 22.0 |
-| 4 x 524288 | 86.4 | 20.9 |
-| 6 x 262144 | 83.6 | 27.2 |
+| 4 x 524288 | 86.4 | 21.0 |
+| 6 x 262144 | 83.6 | 27.4 |
 
 All start cleanly on my machine; raise `total-slots` in the conf and startup names the largest count that fits if
 one doesn't. Six conversations share one forward per step too, but a step with more conversations reads more expert
@@ -260,7 +268,7 @@ reaches it, while a smaller cache costs a little on every switch.
   - `curl 127.0.0.1:5300/metrics` - counters, e.g. `strix_prompt_cache_ram_evicted_total` (conversations that left
     RAM for lack of memory) and `strix_prompt_cache_rejected_total` (ones that couldn't be written and were dropped);
   - the log every ten minutes while the cache is in use: `prompt cache: RAM N entries, X GB ...; MemAvailable Y GiB
-    (margin 4)`.
+    (margin 5)`.
 
 ## Disk: the prompt cache's second tier, and its write budget
 
@@ -287,7 +295,7 @@ budget is a bucket: it starts full (one hour's worth), refills continuously at t
 
 ```
 prompt cache: dropped a turn entry of 95,112 tokens, 1.7 GB (saved by Request 812, last used 4 min ago)
-              it had to leave RAM (MemAvailable 3.9 GiB, below the 4 GiB margin) and can't go to disk:
+              it had to leave RAM (MemAvailable 4.9 GiB, below the 5 GiB margin) and can't go to disk:
               the write budget is spent (0.4 of 32 GiB left this hour, needs 1.7 GB: enough in 3 min)
 ```
 
@@ -350,7 +358,7 @@ budgets keeps them.
 |---|---|---|
 | the server exits with status 4 right after loading | the startup check failed | the fixes in the message, or stop whatever else is using memory |
 | "performance degraded" in every request's log block, `degraded` in `/health` | `low-memory = adapt` turned something down | the startup WARNING lines name each step and how to get it back |
-| "below the 4 GiB margin between saves (another process grew)" in the log | something else grew and conversations moved to disk | fine now and then; often means the margin or `capacity` is too tight for this machine |
+| "below the 5 GiB margin between saves (another process grew)" in the log | something else grew and conversations moved to disk | fine now and then; often means the margin or `capacity` is too tight for this machine |
 | "dropped a ... entry" warnings | a conversation had to leave RAM and couldn't be written (write budget or disk space) | it's read again when it comes back; if the reason is the budget and it happens a lot, raise `prompt-cache-write-gib-per-hour` ([Disk](#disk-the-prompt-caches-second-tier-and-its-write-budget)) |
 | switching conversations is slow | they're coming back from disk, not RAM | more free memory, or a lower `capacity` to leave the cache more room |
 | driver errors, `hipErrorOutOfMemory`, a crash, a hang | the machine ran out of memory | check the kernel parameters (Quick start step 1), then this page - the defaults assume nothing else is running |
