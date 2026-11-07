@@ -121,7 +121,8 @@ public:
     void import_state(const HostBuffer &state, int64_t n, int64_t from = 0) override { import_state(0, state, n, from); }
     // The paged seam: this backend's K/V is VMM-paged, so a snapshot's state can go
     // out as pages instead of a host copy. Available when the session has a parked budget (kv-generations >= 2).
-    bool paged_states() const override { return session_->kv_layout().generations > 1; }
+    // When kv-precommit is on, the slot holds its full capacity permanently and must never surrender its pages to park.
+    bool paged_states() const override { return !is_precommitted() && session_->kv_layout().generations > 1; }
     PagedSnapshot park_snapshot(int slot) override { return park_snapshot(0, slot); }
     void resume_paged(const HostBuffer &small, const PagedState &paged, int64_t n) override {
         resume_paged(0, small, paged, n);

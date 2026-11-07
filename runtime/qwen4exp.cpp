@@ -628,13 +628,31 @@ void Qwen4ExpSession::ensure_rows(Qwen4ExpSeqState &sq, int64_t end) {
         sq.ensured_rows = std::max(sq.ensured_rows, end);
         return;
     }
-    if (kv_budget_) {
-        kv_budget_(missing);  // throws to refuse (nothing mapped yet)
-    } else {
-        const uint64_t avail = mem_available_bytes();
-        STRIX_CHECK(avail >= kSlotFloorBytes + missing, "Qwen4ExpSession: the K/V for positions [0, ", end, ") needs ",
-                    missing >> 20, " MiB more, MemAvailable ", avail >> 20, " MiB would leave less than the ",
-                    kSlotFloorBytes >> 30, " GiB floor");
+    for (;;) {
+        try {
+            if (kv_budget_) {
+                kv_budget_(missing);  // throws to refuse (nothing mapped yet)
+            } else {
+                const uint64_t avail = mem_available_bytes();
+                STRIX_CHECK(avail >= kSlotFloorBytes + missing, "Qwen4ExpSession: the K/V for positions [0, ", end, ") needs ",
+                            missing >> 20, " MiB more, MemAvailable ", avail >> 20, " MiB would leave less than the ",
+                            kSlotFloorBytes >> 30, " GiB floor");
+            }
+            break;
+        } catch (const std::exception &) {
+            // Memory budget refused: try evicting an idle slot to free physical memory
+            bool evicted = false;
+            for (size_t k = 0; k < seqs_.size(); ++k) {
+                if (seqs_[k].get() != &sq && (k >= slot_busy_.size() || !slot_busy_[k]) &&
+                    seqs_[k]->ensured_rows > precommitted_rows_) {
+                    reset_seq_state(*seqs_[k]);
+                    if (on_slot_evicted_) on_slot_evicted_((int)k);
+                    evicted = true;
+                    break;
+                }
+            }
+            if (!evicted) throw;
+        }
     }
     for_paged(sq, end, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &r) { b.ensure(r); });
     sq.ensured_rows = std::max(sq.ensured_rows, end);
@@ -1619,6 +1637,7 @@ int Qwen4ExpSession::seq_index(const Qwen4ExpSeqState &s) const {
 // and asking it touches nothing: refused here, the slot still holds its conversation - which is what lets the
 // engine keep serving that conversation (KvBudgetExhausted) instead of resetting into a broken session.
 void Qwen4ExpSession::kv_budget_for_reset(const Qwen4ExpSeqState &s) const {
+    if (is_precommitted()) return;
     const int slot = seq_index(s);
     if (kv_layout_.generations <= 1 || kv_generation_fresh(slot)) return;
     const int64_t gen = kv_generation(slot);
