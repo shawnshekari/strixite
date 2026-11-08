@@ -32,7 +32,7 @@ int64_t largest_fitting(const MemoryPlanInput &in, uint64_t room) {
     return lo * 1024;
 }
 
-// "capacity = 262144 (a state 6.8 GiB, ~6.8 GiB less GPU memory)" for the halved and quartered capacities.
+// "slot-capacity = 262144 (a state 6.8 GiB, ~6.8 GiB less GPU memory)" for the halved and quartered capacities.
 std::string capacity_options(const MemoryPlanInput &in) {
     std::string s;
     const uint64_t full = in.state_bytes(in.capacity);
@@ -41,7 +41,7 @@ std::string capacity_options(const MemoryPlanInput &in) {
         if (c < 4096) break;
         const uint64_t st = in.state_bytes(c);
         // The GPU's KV cache and block keys scale with capacity exactly as the state's do: at least this much less.
-        s += std::string(s.empty() ? "" : ", ") + "capacity = " + std::to_string(c) + " (state " + gib(st) + ", at least " +
+        s += std::string(s.empty() ? "" : ", ") + "slot-capacity = " + std::to_string(c) + " (state " + gib(st) + ", at least " +
              gib(full - st) + " less GPU memory)";
     }
     return s;
@@ -131,7 +131,7 @@ MemoryPlan plan_memory(const MemoryPlanInput &in) {
         status.push_back("spares off");
         p.warnings.push_back("WARNING: low memory (" + measured + "): prompt cache spare buffers and prefault off - each "
                              "export maps a fresh buffer (~0.2 s at 100-200k context instead of ~0.05). Back on with "
-                             "more free memory or a lower capacity; low-memory = fail refuses to start instead");
+                             "more free memory or a lower slot-capacity; low-memory = fail refuses to start instead");
         if (avail < M + S && in.ram_margin > F) {
             // 2. The RAM tier: entries go to disk and leave RAM; an allocation keeps only the floor. (With the margin at
             // the floor it would lower nothing - make_room_for already evicts before every export - and only lose the

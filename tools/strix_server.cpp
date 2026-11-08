@@ -100,7 +100,21 @@ int run(int argc, char **argv) {
     cfg.port = (int)settings.integer("port");
     cfg.request_read_timeout_s = (int)settings.integer("request-read-timeout-s");
     cfg.model_id = settings.text("model-id");
-    const int64_t capacity = settings.integer("capacity"), chunk = settings.integer("chunk");
+    const int64_t slot_capacity = settings.integer("slot-capacity");
+    const int64_t total_capacity = settings.integer("total-capacity");
+    const int64_t total_slots = settings.integer("total-slots");
+    const bool kv_precommit = settings.on("kv-precommit");
+    if (total_capacity > 0) {
+        STRIX_CHECK(slot_capacity <= total_capacity,
+                    "startup: slot-capacity (", slot_capacity, ") cannot exceed total-capacity (", total_capacity, ")");
+        if (kv_precommit) {
+            STRIX_CHECK(total_slots * slot_capacity <= total_capacity,
+                        "startup: kv-precommit: total-slots (", total_slots, ") * slot-capacity (", slot_capacity,
+                        " = ", total_slots * slot_capacity, " tokens) exceeds total-capacity (", total_capacity,
+                        "); to use dynamic oversubscription across slots, set kv-precommit = off");
+        }
+    }
+    const int64_t chunk = settings.integer("chunk");
     const int64_t chunk_shared = settings.integer("chunk-shared");
     const float yarn_factor = (float)settings.number("rope-yarn-factor");
     const std::string cache_dir = settings.text("prompt-cache-dir");
@@ -207,15 +221,22 @@ int run(int argc, char **argv) {
              served_vision->cfg.std[0], served_vision->cfg.std[1], served_vision->cfg.std[2],
              (long long)cfg.vision_preprocess_limit);
     }
-    const int64_t total_slots = settings.integer("total-slots");
     const int64_t kv_generations = settings.integer("kv-generations");  // 0: auto (Qwen4ExpSession)
     STRIX_CHECK(kv_generations != 1, "strix_server: kv-generations 1 (the pages reused, unsafe on this GPU), "
                 "expected 0 (auto) or 2..4096");
-    Qwen4ExpBackend backend(model, capacity, chunk, use_mtp, mtp_vocab, precision, kv_format, total_slots,
+    Qwen4ExpBackend backend(model, slot_capacity, chunk, use_mtp, mtp_vocab, precision, kv_format, total_slots,
                             kv_generations);
+    if (total_capacity > 0) backend.set_total_capacity(total_capacity);
+    if (kv_precommit) {
+        backend.precommit();
+        slog(LogLevel::Info, "startup: KV cache: statically pre-committed full capacity (%s tokens per slot, %lld slots, total %s tokens)",
+             fmt_n(slot_capacity).c_str(), (long long)total_slots, fmt_n(slot_capacity * total_slots).c_str());
+    }
     if (total_slots > 1)
-        slog(LogLevel::Info, "startup: %lld slots: %lld conversations at once, each at the full capacity %s",
-             (long long)total_slots, (long long)total_slots, fmt_n(capacity).c_str());
+        slog(LogLevel::Info, "startup: %lld slots: %lld conversations at once, each at slot-capacity %s (total-capacity: %s, kv-precommit: %s)",
+             (long long)total_slots, (long long)total_slots, fmt_n(slot_capacity).c_str(),
+             total_capacity > 0 ? fmt_n(total_capacity).c_str() : "unconstrained",
+             kv_precommit ? "on" : "off");
     slog(LogLevel::Info, "startup: kv-generations %s: %lld K/V generations per slot (~%.1f TiB of address "
          "space per slot, no RAM); %s",
          kv_generations == kKvGenerationsAuto ? "auto" : std::to_string(kv_generations).c_str(),
@@ -256,14 +277,14 @@ int run(int argc, char **argv) {
         mi.gpu_bytes = (uint64_t)gpu_total;
         mi.prompt_cache = cache_gib > 0;
         mi.ram_margin = cache_opts.ram_margin;
-        mi.capacity = capacity;
+        mi.capacity = slot_capacity;
         mi.state_bytes = [&backend](int64_t n) { return backend.state_bytes_at(n); };
         mi.row_cache_rows = table ? table->cache_rows() : 0;
         mi.row_cache_row_bytes = table ? table->cache_bytes_per_row() : 0;
         mi.row_cache_min_rows = std::min<int64_t>(mi.row_cache_rows, NgramTableRows::kDefaultCacheRows);
         mi.slots = total_slots;
-        mi.slot_bytes = backend.state_bytes_at(capacity);
-        mi.kv_unmapped = backend.kv_full_bytes();
+        mi.slot_bytes = backend.state_bytes_at(slot_capacity);
+        mi.kv_unmapped = backend.is_precommitted() ? 0 : backend.kv_full_bytes();
         const MemoryPlan plan = plan_memory(mi);
         for (const std::string &l : plan.info) slog(LogLevel::Info, "%s", l.c_str());
         if (plan.refuse) {

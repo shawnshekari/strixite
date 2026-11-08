@@ -596,19 +596,72 @@ void Qwen4ExpSession::for_paged(Qwen4ExpSeqState &sq, int64_t end, const std::fu
     }
 }
 
+void Qwen4ExpSession::precommit() {
+    for (size_t k = 0; k < seqs_.size(); ++k) {
+        ensure_rows(*seqs_[k], capacity_);
+    }
+    precommitted_rows_ = capacity_;
+}
+
 void Qwen4ExpSession::ensure_rows(Qwen4ExpSeqState &sq, int64_t end) {
+    if (total_capacity_ > 0) {
+        int64_t total_tokens = 0;
+        for (const auto &s : seqs_) {
+            total_tokens += (s.get() == &sq ? end : s->ensured_rows);
+        }
+        if (total_tokens > total_capacity_) {
+            // Evict/reclaim memory only from IDLE slots (!slot_busy_[k])
+            for (size_t k = 0; k < seqs_.size(); ++k) {
+                if (seqs_[k].get() != &sq && (k >= slot_busy_.size() || !slot_busy_[k]) &&
+                    seqs_[k]->ensured_rows > precommitted_rows_) {
+                    reset_seq_state(*seqs_[k]);
+                    if (on_slot_evicted_) on_slot_evicted_((int)k);
+                    total_tokens = 0;
+                    for (const auto &s : seqs_) {
+                        total_tokens += (s.get() == &sq ? end : s->ensured_rows);
+                    }
+                    if (total_tokens <= total_capacity_) break;
+                }
+            }
+        }
+        STRIX_CHECK(total_tokens <= total_capacity_,
+                    "Qwen4ExpSession: total tokens across all active slots would reach ", total_tokens,
+                    ", exceeding total-capacity ", total_capacity_);
+    }
     uint64_t missing = 0;
     for_paged(sq, end, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &r) { missing += b.missing_bytes(r); });
-    if (missing == 0) return;
-    if (kv_budget_) {
-        kv_budget_(missing);  // throws to refuse (nothing mapped yet)
-    } else {
-        const uint64_t avail = mem_available_bytes();
-        STRIX_CHECK(avail >= kSlotFloorBytes + missing, "Qwen4ExpSession: the K/V for positions [0, ", end, ") needs ",
-                    missing >> 20, " MiB more, MemAvailable ", avail >> 20, " MiB would leave less than the ",
-                    kSlotFloorBytes >> 30, " GiB floor");
+    if (missing == 0) {
+        sq.ensured_rows = std::max(sq.ensured_rows, end);
+        return;
+    }
+    for (;;) {
+        try {
+            if (kv_budget_) {
+                kv_budget_(missing);  // throws to refuse (nothing mapped yet)
+            } else {
+                const uint64_t avail = mem_available_bytes();
+                STRIX_CHECK(avail >= kSlotFloorBytes + missing, "Qwen4ExpSession: the K/V for positions [0, ", end, ") needs ",
+                            missing >> 20, " MiB more, MemAvailable ", avail >> 20, " MiB would leave less than the ",
+                            kSlotFloorBytes >> 30, " GiB floor");
+            }
+            break;
+        } catch (const std::exception &) {
+            // Memory budget refused: try evicting an idle slot to free physical memory
+            bool evicted = false;
+            for (size_t k = 0; k < seqs_.size(); ++k) {
+                if (seqs_[k].get() != &sq && (k >= slot_busy_.size() || !slot_busy_[k]) &&
+                    seqs_[k]->ensured_rows > precommitted_rows_) {
+                    reset_seq_state(*seqs_[k]);
+                    if (on_slot_evicted_) on_slot_evicted_((int)k);
+                    evicted = true;
+                    break;
+                }
+            }
+            if (!evicted) throw;
+        }
     }
     for_paged(sq, end, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &r) { b.ensure(r); });
+    sq.ensured_rows = std::max(sq.ensured_rows, end);
 }
 
 uint64_t Qwen4ExpSession::kv_full_bytes() const {
@@ -1122,6 +1175,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
         seqs_.push_back(std::make_unique<Qwen4ExpSeqState>(m_, capacity, max_tokens, mtp, kv, *kv_res_, kv_layout_,
                                                             /*slot=*/k));
     }
+    slot_busy_.assign(seqs_.size(), 0);
     reset();
 }
 
@@ -1581,6 +1635,7 @@ int Qwen4ExpSession::seq_index(const Qwen4ExpSeqState &s) const {
 // and asking it touches nothing: refused here, the slot still holds its conversation - which is what lets the
 // engine keep serving that conversation (KvBudgetExhausted) instead of resetting into a broken session.
 void Qwen4ExpSession::kv_budget_for_reset(const Qwen4ExpSeqState &s) const {
+    if (is_precommitted()) return;
     const int slot = seq_index(s);
     if (kv_layout_.generations <= 1 || kv_generation_fresh(slot)) return;
     const int64_t gen = kv_generation(slot);
@@ -1604,7 +1659,7 @@ void Qwen4ExpSession::reset_seq_state(Qwen4ExpSeqState &s) {
     });
     const int slot = seq_index(s);
     kv_budget_for_reset(s);  // the budget refusal first, before any buffer steps (the per-buffer check is a drift guard)
-    if (kv_layout_.generations > 1 && !fresh) {
+    if (kv_layout_.generations > 1 && !fresh && !is_precommitted()) {
         uint32_t gen_now = 0, gen_cap = 0;  // every buffer of the slot advances together; the log names the slot
         auto advance = [&](PagedDeviceBuffer &b) {
             if (b.capacity() == 0) return;  // the other layer kind's default-constructed buffer
@@ -1626,6 +1681,7 @@ void Qwen4ExpSession::reset_seq_state(Qwen4ExpSeqState &s) {
              "(one-use addresses; reaching %u refuses the next switch - only a restart reclaims)",
              slot, gen_now, gen_cap, gen_cap);
     }
+    s.ensured_rows = precommitted_rows_;
     {
         s.pos = 0, s.tail_cur = 0, s.mtp_tail_cur = 0, s.mtp_chain_step = -1, s.verify_pending = false;  // GDN states reset on the first call (reset_state); KV overwritten
         s.verify_rows = 0, s.verify_carry = 0, s.verify_row_base = 0, s.verify_ple_wbase = 0;
