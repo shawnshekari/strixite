@@ -257,6 +257,9 @@ target_link_libraries(check_stream_calls PRIVATE strix_serve)
 add_executable(strix_server tools/strix_server.cpp)
 target_link_libraries(strix_server PRIVATE strix_serve_model)
 
+add_executable(compare_slot_concurrency tools/compare_slot_concurrency.cpp)
+target_link_libraries(compare_slot_concurrency PRIVATE strix_serve_model)
+
 
 
 # The tutorials live in the public repo only; built when present.

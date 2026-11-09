@@ -840,6 +840,9 @@ void HttpServer::routes() {
         metric("strix_verify_alone_total", "counter",
                "Verifies run alone because their conversation holds image rows (a shared forward takes scalar "
                "positions only).", (double)s.verify_alone);
+        metric("strix_draft_batches_total", "counter", "Batched MTP drafts across slots.", (double)s.draft_batches);
+        metric("strix_draft_batch_runs_total", "counter",
+               "Slots' runs in those batched drafts (/ batches = runs per batched forward).", (double)s.draft_batch_runs);
         metric("strix_idle_seconds", "gauge",
                "Seconds since the last request finished; 0 while one runs or waits. Batch clients: wait for a gap here.",
                s.idle_seconds);

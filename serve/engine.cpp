@@ -288,6 +288,7 @@ EngineStats Engine::stats() const {
     if (arbiter_) {
         const GpuArbiter::Stats a = arbiter_->stats();
         s.verify_batches = a.verify_batches, s.verify_batch_runs = a.verify_runs, s.verify_alone = a.verify_alone;
+        s.draft_batches = a.draft_batches, s.draft_batch_runs = a.draft_runs;
         s.decoding_slots = arbiter_->decoding_count();
     }
     return s;

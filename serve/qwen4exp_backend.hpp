@@ -96,6 +96,16 @@ public:
         t.best = p.best, t.best_v = p.best_v, t.second_v = p.second_v, t.nan = p.nan;
         return t;
     }
+    std::vector<Top2> forward_mtp_top2_batch(const std::vector<MtpDraftRun> &runs) override {
+        std::vector<Qwen4ExpSession::MtpDraftRun> r;
+        r.reserve(runs.size());
+        for (const auto &run : runs) r.push_back({run.seq, run.token_id, run.step});
+        const auto top2 = session_->forward_mtp_top2_batch(r);
+        std::vector<Top2> out;
+        out.reserve(top2.size());
+        for (const auto &p : top2) out.push_back({p.best, p.best_v, p.second_v, p.nan});
+        return out;
+    }
     void prefetch_ple(int seq, const std::vector<int32_t> &ids, int64_t first) override {
         session_->prefetch_ple(seq, ids, first);
     }
