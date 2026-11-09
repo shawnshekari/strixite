@@ -3536,6 +3536,7 @@ void Qwen4ExpSession::keep_verify_prefix_seq(Qwen4ExpSeqState &sq, int64_t rows)
     const Act act = m_.act();
     const size_t e = es(act);
     const int64_t n4 = D.H * D.d, p0 = sq.verify_pos;
+    const bool wmma = prefill_math_ == PrefillMath::WmmaBf16;
     // mRoPE: the verify's rows (kept and rejected alike) are already in the history; the block keys of a
     // block completed within the kept rows replay with its first row's triple / the scalar base + delta -
     // exactly like the verify's own forward did.
@@ -3546,14 +3547,17 @@ void Qwen4ExpSession::keep_verify_prefix_seq(Qwen4ExpSeqState &sq, int64_t rows)
         const size_t li = (size_t)i;
         if (!D.is_attention[li]) {
             // GDN: the verify wrote its states to the spare set, so sq.conv_state / sq.rec_state are still the ones
-            // before it - replay rows [0, rows) on them in place, with the verify's own path (Auto: per token), so
+            // before it - replay rows [0, rows) on them in place, with the verify's own path and precision, so
             // the state is exactly the verify's after that row (split invariance).
             kernels::gdn_front(sq.verify_in[li].get(),
                                {rows, D.gk, kHD, D.gv, kHD, D.gstride, D.conv_c + D.gz, D.conv_c + D.gz + D.gv},
                                l.conv_w, sq.conv_state[li].get(), sq.conv_state[li].get(), false, l.A_log, l.dt_bias,
                                qkv_.get(), beta_.get(), g_.get(), act, stream_);
             kernels::delta_rule(qkv_.get(), beta_.get(), g_.get(), {rows, D.gk, D.gv, D.conv_c}, sq.rec_state[li].get(),
-                                sq.rec_state[li].get(), false, core_.get(), act, stream_, kernels::DeltaRulePath::Auto);
+                                sq.rec_state[li].get(), false, core_.get(), act, stream_,
+                                wmma && rows >= kWmmaMinTokens ? kernels::DeltaRulePath::ChunkedWmma
+                                                               : kernels::DeltaRulePath::Auto,
+                                precision_.gdn);
         } else {
             // Attention: the tail (and any block completed within the kept rows - same keys the verify wrote) from
             // the tail before the verify, which it only read. Same block-window triples as the verify's forward.
