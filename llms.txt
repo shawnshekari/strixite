@@ -1,0 +1,22 @@
+# strixite
+
+> An LLM inference engine written from scratch in HIP for AMD Strix Halo hardware, serving Qwen3.8-Flash-Next with 512k context at high token speeds from a single mini PC.
+
+Runs on Linux on AMD Strix Halo (gfx1151) with 128 GB of memory; build with CMake against AMD's TheRock ROCm tarball, download ~115 GiB of weights, then run the server for an OpenAI-compatible API on port 5300. Features include streaming chat with tool calls and reasoning, image inputs, multi-token prediction, capped thinking with a nudge against loops, and RAM/disk prompt caching for resuming long agent conversations. A container image with the server and ROCm runtime is available for podman or docker. The server has no authentication by default and listens on all interfaces.
+
+## Docs
+
+- [strixite README](https://raw.githubusercontent.com/shawnshekari/strixite/main/README.md): What strixite is: a HIP inference engine for AMD Strix Halo running Qwen3.8-Flash-Next, with speed and measurement details.
+- [Third-party material](https://raw.githubusercontent.com/shawnshekari/strixite/main/THIRD_PARTY.md): Vendored libraries (cpp-httplib, stb_image, libwebp) with their licenses, and how third-party material is handled.
+- [Run strixite in a container](https://raw.githubusercontent.com/shawnshekari/strixite/main/docs/container.md): Preparing the host, downloading ~115 GiB of weights, and running the server via podman or docker.
+- [How strixite got fast](https://raw.githubusercontent.com/shawnshekari/strixite/main/docs/how-it-got-fast.md): The five ideas behind strixite's speed, from quantization to attention, with measured numbers.
+- [Images](https://raw.githubusercontent.com/shawnshekari/strixite/main/docs/images.md): Image inputs via the OpenAI-style image_url part, required vision files, accepted sizes, resize rules and token cost.
+- [Memory: where it goes, what the server checks, and how to share the machine](https://raw.githubusercontent.com/shawnshekari/strixite/main/docs/memory.md): Where memory goes on Strix Halo, MemAvailable checks, and settings changes for sharing the machine.
+- [Roadmap](https://raw.githubusercontent.com/shawnshekari/strixite/main/docs/roadmap.md): Current priorities - less wasted thinking, faster prefill - planned work, what's excluded, and how issues move items up.
+- [What the server accepts](https://raw.githubusercontent.com/shawnshekari/strixite/main/docs/server.md): OpenAI API on port 5300, thinking control and budgets, the strix response object, prefill progress, K/V budget, token bias.
+- [The tools](https://raw.githubusercontent.com/shawnshekari/strixite/main/docs/tools.md): Four command-line tools for building weights yourself from Qwen/Qwen3.8-Flash-Next and checking a weights file.
+- [What quant is this?](https://raw.githubusercontent.com/shawnshekari/strixite/main/docs/weights.md): The file's mixed 4- and 8-bit formats, why each part gets what it does, and the accuracy cost.
+
+## Optional
+
+- [Contributing to strixite](https://raw.githubusercontent.com/shawnshekari/strixite/main/CONTRIBUTING.md): How pull requests land under AGPL-3.0, and what helps: output identity checks and before/after Strix Halo benchmarks.
