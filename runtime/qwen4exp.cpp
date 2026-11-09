@@ -2690,9 +2690,9 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
         STRIX_CHECK(image == nullptr, "Qwen4ExpSession::forward: ", runs.size(),
                     " runs and an image forward - image rows run alone (vision's one-forward-one-image contract)");
         for (const Run &r : runs)
-            STRIX_CHECK(r.sq->pending3.empty() && !r.sq->history_ever_interleaved && r.sq->rope_delta == 0,
+            STRIX_CHECK(r.sq->pending3.empty(),
                         "Qwen4ExpSession::forward: run on seq ", r.seq,
-                        " carries mRoPE position state - a multi-run forward is scalar positions only");
+                        " carries in-flight mRoPE 3D positions - a multi-run forward is scalar positions only");
     }
     // Image forward (vision): every check that can fail without touching session state runs here, before
     // the pending positions are consumed. run_tower_and_scatter checks the rest (the row count, against ids).
@@ -2775,7 +2775,7 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
             r.rope0 = mk_jobs_.pos3 == nullptr ? r.p + sq.rope_delta : r.p;  // scalar-path rope base (Phase A:
             // interleaved calls pass the kernels their positions, so pos0 is unused there)
         } else {
-            r.rope0 = r.p;  // scalar with rope_delta 0 (checked above); a pure-text state's rope_pos(p) == p
+            r.rope0 = r.p + sq.rope_delta;  // scalar with rope_delta (pure-text state's rope_pos(p) == p + 0)
             // A multi-run forward is scalar-only (checked above), so it must carry no mRoPE window to the
             // kernels: clear whatever the last single-run forward prepared. Left stale, an image's triples
             // (a non-null mk_block_ / mk_jobs_) would be matched against these runs' positions by
@@ -3049,7 +3049,7 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                                         r.Tr, r.p, r.p % kernels::kQsaBlock ? sq.tail[sq.tail_cur][(size_t)i].get() : nullptr,
                                         sq.tail[1 - sq.tail_cur][(size_t)i].get(), D.idx_d, l.idx_k_norm, D.eps,
                                         m_.inv_freq(), D.rot, sq.block_keys[(size_t)i].get(), cap_blocks_, act, stream_,
-                                        m_.rope_scale(), mk_block_);
+                                        m_.rope_scale(), mk_block_, sq.rope_delta);
                 const kernels::AttentionShape as{r.Tr, r.p, D.hq, D.hkv, hd, D.astride, 2 * hd};
                 const float scale = 1.0f / std::sqrt((float)hd);
                 kernels::Kv8View kv8;
@@ -3296,7 +3296,7 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                                     r.p % kernels::kQsaBlock ? sq.tail_mtp[sq.mtp_tail_cur].get() : nullptr,
                                     sq.tail_mtp[1 - sq.mtp_tail_cur].get(), D.idx_d, ml.idx_k_norm, D.eps,
                                     m_.inv_freq(), D.rot, sq.block_keys_mtp.get(), cap_blocks_, act, stream_,
-                                    m_.rope_scale(), mk_block_);
+                                    m_.rope_scale(), mk_block_, sq.rope_delta);
             sq.mtp_tail_cur = 1 - sq.mtp_tail_cur;
             STRIX_HIP_CHECK(hipMemcpyAsync(sq.mtp_prev.get(), at(x_, (r.base + r.Tr - 1) * n4), (size_t)n4 * e,
                                            hipMemcpyDeviceToDevice, stream_),
@@ -3561,7 +3561,7 @@ void Qwen4ExpSession::keep_verify_prefix_seq(Qwen4ExpSeqState &sq, int64_t rows)
                                     p0 % kernels::kQsaBlock ? sq.tail[sq.verify_tail_cur][li].get() : nullptr,
                                     sq.tail[1 - sq.verify_tail_cur][li].get(), D.idx_d, l.idx_k_norm, D.eps,
                                     m_.inv_freq(), D.rot, sq.block_keys[li].get(), cap_blocks_, act, stream_, m_.rope_scale(),
-                                    mk_block_);
+                                    mk_block_, sq.rope_delta);
             // 8-bit K/V: the groups completed within the kept rows and the tail, from the verify's saved rows and
             // the tail before it (its own commit wrote the other tail buffer, which this overwrites).
             if (kv_format_ == KvFormat::Q8) {
@@ -3593,7 +3593,7 @@ void Qwen4ExpSession::keep_verify_prefix_seq(Qwen4ExpSeqState &sq, int64_t rows)
                                 D.astride, rows, p0,
                                 p0 % kernels::kQsaBlock ? sq.tail_mtp[sq.verify_mtp_tail_cur].get() : nullptr,
                                 sq.tail_mtp[1 - sq.verify_mtp_tail_cur].get(), D.idx_d, ml.idx_k_norm, D.eps, m_.inv_freq(),
-                                D.rot, sq.block_keys_mtp.get(), cap_blocks_, act, stream_, m_.rope_scale(), mk_block_);
+                                D.rot, sq.block_keys_mtp.get(), cap_blocks_, act, stream_, m_.rope_scale(), mk_block_, sq.rope_delta);
         STRIX_HIP_CHECK(hipMemcpyAsync(sq.mtp_prev.get(), x_.get() + (size_t)((rbase + rows - 1) * n4) * e,
                                        (size_t)n4 * e, hipMemcpyDeviceToDevice, stream_),
                         "Qwen4ExpSession::keep_verify_prefix: MTP previous streams");
@@ -3811,7 +3811,7 @@ void Qwen4ExpSession::run_mtp(int seq, int32_t token_id, int64_t step) {
                                m_.rope_scale(), mk_jobs_);
     kernels::qsa_block_keys(at(proj_, D.idx_col + D.idx_h * D.idx_d), D.astride, T, p,
                             p % kernels::kQsaBlock ? tail_in : nullptr, tail_out, D.idx_d, l.idx_k_norm, D.eps, m_.inv_freq(),
-                            D.rot, sq.block_keys_mtp.get(), cap_blocks_, act, stream_, m_.rope_scale(), mk_block_);
+                            D.rot, sq.block_keys_mtp.get(), cap_blocks_, act, stream_, m_.rope_scale(), mk_block_, sq.rope_delta);
     const kernels::AttentionShape as{T, p, D.hq, D.hkv, hd, D.astride, 2 * hd};
     const float scale = 1.0f / std::sqrt((float)hd);
     // The head's own layer, as a trunk full-attention layer: the same dispatch, including the matrix-unit

@@ -47,7 +47,7 @@ std::vector<std::pair<size_t, size_t>> qsa_block_keys_used_ranges(int64_t cap_bl
 void qsa_block_keys(const void *raw, int64_t raw_ts, int64_t T, int64_t pos0, const void *tail_in, void *tail_out,
                     int64_t D, const float *k_norm, float eps, const float *inv_freq, int64_t rot_dim,
                     void *block_keys, int64_t cap_blocks, Act act, hipStream_t stream, float cos_sin_scale = 1.0f,
-                    const MropePos &pos3 = {});
+                    const MropePos &pos3 = {}, int64_t rope_delta = 0);
 
 // q: normed + roped indexer queries, (t, h, d) at q[t*q_ts + h*q_hs + d], H heads (<= 8) x D (% 8 == 0,
 // <= 256). scores [T, ld] F32: row t has its (pos0 + t + 1) / 4 complete blocks' scores; the rest of the

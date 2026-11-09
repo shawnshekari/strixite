@@ -635,13 +635,17 @@ public:
     // any of the other calls that touch position (forward_mtp, save, import_state) it is refused.
     void set_positions(std::vector<int64_t> pos3);
     int64_t rope_delta() const { return st().rope_delta; }  // rows after the last image: rope angle at seq + delta
+    int64_t rope_delta(int seq) const {
+        STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::rope_delta: seq out of range");
+        return seqs_[(size_t)seq]->rope_delta;
+    }
     // Whether slot seq's runs may share a multi-run forward (forward_batch with > 1 runs: scalar positions only).
-    // False once its conversation holds image rows - set by the image forward or restored from a saved state with
-    // an image (import_state), cleared only by the slot's reset - so its verifies must run alone (GpuArbiter).
+    // False while a forward has pending 3D positions (image prefill in flight). During decode and verify,
+    // positions are scalar (pos + rope_delta) and batchable with other slots.
     bool batchable(int seq) const {
         STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::batchable: seq ", seq, ", expected 0..", n_slots() - 1);
         const Qwen4ExpSeqState &s = *seqs_[(size_t)seq];
-        return s.pending3.empty() && !s.history_ever_interleaved && s.rope_delta == 0;
+        return s.pending3.empty();
     }
     // The rope angle position of sequence position seq on the scalar path (seq + rope_delta). Sequence-index
     // uses (cache rows, QSA block counts, dense-limit checks) stay seq - only rope angles use this.

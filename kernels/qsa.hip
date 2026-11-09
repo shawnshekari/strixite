@@ -39,7 +39,7 @@ template <typename T>
 __global__ void __launch_bounds__(kThreads)
     block_keys_kernel(const T *raw, int64_t raw_ts, int64_t T_, int64_t pos0, const T *tail_in, T *tail_out, int D,
                       const float *w, float eps, const float *inv_freq, float cos_sin_scale, int rot, T *bk,
-                      int64_t cap, int64_t b0, int64_t nblocks, const int64_t *pos3, int64_t p3base) {
+                      int64_t cap, int64_t b0, int64_t nblocks, const int64_t *pos3, int64_t p3base, int64_t rope_delta) {
     __shared__ float xs[kMaxD];
     __shared__ float red[kThreads];
     const int64_t tail0 = (pos0 / kQsaBlock) * kQsaBlock;  // first position held by tail_in
@@ -86,7 +86,7 @@ __global__ void __launch_bounds__(kThreads)
         if (d < rot) {
             const int i = d < half ? d : d - half;
             float c, s, y0, y1;
-            rm::cos_sin<kBF16>(tr ? tr[i % 3] : b * kQsaBlock, inv_freq[i], cos_sin_scale, c, s);
+            rm::cos_sin<kBF16>(tr ? tr[i % 3] : b * kQsaBlock + rope_delta, inv_freq[i], cos_sin_scale, c, s);
             rm::rotate<kBF16>(xs[i], xs[i + half], c, s, y0, y1);
             y = d < half ? y0 : y1;
         }
@@ -899,7 +899,7 @@ std::vector<std::pair<size_t, size_t>> qsa_block_keys_used_ranges(int64_t cap_bl
 void qsa_block_keys(const void *raw, int64_t raw_ts, int64_t T, int64_t pos0, const void *tail_in, void *tail_out,
                     int64_t D, const float *k_norm, float eps, const float *inv_freq, int64_t rot_dim,
                     void *block_keys, int64_t cap_blocks, Act act, hipStream_t stream, float cos_sin_scale,
-                    const MropePos &pos3) {
+                    const MropePos &pos3, int64_t rope_delta) {
     const char *fn = "qsa_block_keys";
     const size_t es = act_bytes(fn, act);
     STRIX_CHECK(raw && k_norm && inv_freq && block_keys && tail_out && (tail_in || pos0 % kQsaBlock == 0), fn,
@@ -929,12 +929,12 @@ void qsa_block_keys(const void *raw, int64_t raw_ts, int64_t T, int64_t pos0, co
         block_keys_kernel<float><<<grid, kThreads, 0, stream>>>(
             static_cast<const float *>(raw), raw_ts, T, pos0, static_cast<const float *>(tail_in),
             static_cast<float *>(tail_out), (int)D, k_norm, eps, inv_freq, cos_sin_scale, (int)rot_dim, static_cast<float *>(block_keys),
-            cap_blocks, b0, nblocks, pos3.pos3, pos3.base);
+            cap_blocks, b0, nblocks, pos3.pos3, pos3.base, rope_delta);
     else
         block_keys_kernel<uint16_t><<<grid, kThreads, 0, stream>>>(
             static_cast<const uint16_t *>(raw), raw_ts, T, pos0, static_cast<const uint16_t *>(tail_in),
             static_cast<uint16_t *>(tail_out), (int)D, k_norm, eps, inv_freq, cos_sin_scale, (int)rot_dim,
-            static_cast<uint16_t *>(block_keys), cap_blocks, b0, nblocks, pos3.pos3, pos3.base);
+            static_cast<uint16_t *>(block_keys), cap_blocks, b0, nblocks, pos3.pos3, pos3.base, rope_delta);
     STRIX_HIP_CHECK_LAUNCH(fn, " ", act_name(act), " T=", T, " pos0=", pos0, " blocks=", nblocks);
 }
 
