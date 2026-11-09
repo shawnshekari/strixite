@@ -73,6 +73,48 @@ __global__ void __launch_bounds__(kThreads)
     }
 }
 
+__global__ void __launch_bounds__(kThreads)
+    mtp_pick_batch_kernel(const float *x, int64_t n, int64_t B, const uint32_t *router_err, const uint32_t *expert_err,
+                          const uint32_t *attn_err, const EmbeddingError *emb_err, MtpPick *out) {
+    const int b = blockIdx.x;
+    if (b >= B) return;
+    const float *xb = x + (int64_t)b * n;
+    MtpPick *outb = out + b;
+    __shared__ Part wave_part[kThreads / kLanes];
+    const int tid = threadIdx.x, lane = tid % kLanes, wave = tid / kLanes;
+    Part p{-INFINITY, -INFINITY, INT_MAX, 0u};
+    for (int64_t i = tid; i < n; i += kThreads) {
+        const float v = xb[i];
+        if (v != v) {
+            p.nan = 1u;
+            continue;
+        }
+        if (p.i1 == INT_MAX || v > p.b1) {
+            p.b2 = p.b1;
+            p.b1 = v, p.i1 = (int)i;
+        } else if (v > p.b2) {
+            p.b2 = v;
+        }
+    }
+    for (int off = kLanes / 2; off > 0; off >>= 1) p = merge(p, shfl_xor(p, off));
+    if (lane == 0) wave_part[wave] = p;
+    __syncthreads();
+    if (wave != 0) return;
+    p = lane < kThreads / kLanes ? wave_part[lane] : Part{-INFINITY, -INFINITY, INT_MAX, 0u};
+    for (int off = kLanes / 2; off > 0; off >>= 1) p = merge(p, shfl_xor(p, off));
+    if (lane == 0) {
+        outb->best = p.i1 == INT_MAX ? 0 : p.i1;
+        outb->best_v = p.b1, outb->second_v = p.b2, outb->nan = p.nan;
+        outb->pad = 0;
+        outb->emb = *emb_err;
+    }
+    if (lane < 3) {
+        outb->err[lane] = router_err[lane];
+        outb->err[3 + lane] = expert_err[lane];
+        outb->err[6 + lane] = attn_err[lane];
+    }
+}
+
 }  // namespace
 
 void mtp_pick(const float *logits, int64_t n, const uint32_t *router_err, const uint32_t *expert_err,
@@ -85,6 +127,16 @@ void mtp_pick(const float *logits, int64_t n, const uint32_t *router_err, const 
     STRIX_CHECK(n >= 1 && n <= INT_MAX, "mtp_pick: n = ", n, " logits, expected 1..", INT_MAX);
     mtp_pick_kernel<<<1, kThreads, 0, stream>>>(logits, n, router_err, expert_err, attn_err, emb_err, out);
     STRIX_HIP_CHECK_LAUNCH("mtp_pick n=", n);
+}
+
+void mtp_pick_batch(const float *logits, int64_t n, int64_t B, const uint32_t *router_err, const uint32_t *expert_err,
+                    const uint32_t *attn_err, const EmbeddingError *emb_err, MtpPick *out, hipStream_t stream) {
+    STRIX_CHECK(logits != nullptr && router_err != nullptr && expert_err != nullptr && attn_err != nullptr &&
+                    emb_err != nullptr && out != nullptr,
+                "mtp_pick_batch: null pointer");
+    STRIX_CHECK(n >= 1 && n <= INT_MAX && B >= 1 && B <= 64, "mtp_pick_batch: n = ", n, ", B = ", B);
+    mtp_pick_batch_kernel<<<(unsigned)B, kThreads, 0, stream>>>(logits, n, B, router_err, expert_err, attn_err, emb_err, out);
+    STRIX_HIP_CHECK_LAUNCH("mtp_pick_batch n=", n, " B=", B);
 }
 
 }  // namespace strix::kernels

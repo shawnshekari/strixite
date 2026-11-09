@@ -27,10 +27,13 @@ void GpuArbiter::check_ok_locked(int seq) const {
 
 void GpuArbiter::fail_locked() {
     failed_ = true, ++failures_;
-    owner_ = -1, resolving_.clear();
+    resolving_.clear();
     for (auto &[s, p] : pending_)
         if (!p.done) p.done = true, p.error = std::make_exception_ptr(std::runtime_error(
                                          "GpuArbiter: the batched verify was abandoned - another slot's call failed"));
+    for (auto &[s, pd] : pending_drafts_)
+        if (!pd.done) pd.done = true, pd.error = std::make_exception_ptr(std::runtime_error(
+                                         "GpuArbiter: the batched draft was abandoned - another slot's call failed"));
 }
 
 bool GpuArbiter::can_run_locked(int seq, Kind kind) const {
@@ -38,14 +41,14 @@ bool GpuArbiter::can_run_locked(int seq, Kind kind) const {
     if (kind == Kind::Hint) return true;
     if (kind == Kind::Resolve) return resolving_.count(seq) > 0;
     if (!resolving_.empty()) return false;  // the batch's resolutions first (its shared workspaces)
-    if (owner_ >= 0 && owner_ != seq) return false;  // another seq's chain runs uninterrupted
-    if (owner_ == seq) return true;                  // its own chain (or the forward that ends it)
     // A new chain waits for another seq's call that has waited through a decode step (see calls_waiting_).
     if (kind == Kind::Draft)
         for (int s : calls_waiting_)
             if (s != seq && stats_.verify_batches > last_call_batch_[(size_t)s]) return false;
     // A batch ready to go runs before a new call (between a prefill's chunks the other slots' decode steps run).
-    return !lead_ready_locked(now_s());
+    if (lead_ready_locked(now_s())) return false;
+    if (can_run_draft_batch_locked(now_s())) return false;
+    return true;
 }
 
 bool GpuArbiter::poisoned_locked(int seq) const {
@@ -61,8 +64,8 @@ bool GpuArbiter::run(int seq, Kind kind, const std::function<void()> &f) {
     check_ok_locked(seq);
     STRIX_CHECK(seq >= 0 && seq < (int)last_call_batch_.size(), "GpuArbiter::run: seq ", seq, ", expected 0..",
                 last_call_batch_.size() - 1);
-    const bool call = kind == Kind::Call && owner_ != seq;  // a chain-ending forward isn't waiting for a turn
-    const bool chain_start = kind == Kind::Draft && owner_ != seq;
+    const bool call = kind == Kind::Call;  // a chain-ending forward isn't waiting for a turn
+    const bool chain_start = kind == Kind::Draft;
     auto waiting = call ? calls_waiting_.insert(seq) : calls_waiting_.end();
     auto drafting = chain_start ? drafts_waiting_.insert(seq) : drafts_waiting_.end();
     cv_.wait(lock, [&] { return failed_ || can_run_locked(seq, kind); });
@@ -76,15 +79,12 @@ bool GpuArbiter::run(int seq, Kind kind, const std::function<void()> &f) {
     STRIX_CHECK(kind != Kind::Resolve || resolving_.count(seq), "GpuArbiter: seq ", seq,
                 " resolves a verify it has no pending run of");
     busy_ = true;
-    if (kind == Kind::Draft) owner_ = seq;
-    else if (kind == Kind::Call && owner_ == seq) owner_ = -1;  // a forward ends the chain (no draft passed)
     lock.unlock();
     try {
         f();
     } catch (...) {
         lock.lock();
         busy_ = false;
-        if (owner_ == seq) owner_ = -1;
         if (be_.failed()) fail_locked();
         lock.unlock();
         cv_.notify_all();
@@ -99,7 +99,7 @@ bool GpuArbiter::run(int seq, Kind kind, const std::function<void()> &f) {
 }
 
 bool GpuArbiter::lead_ready_locked(double now) const {
-    if (busy_ || owner_ >= 0 || !resolving_.empty()) return false;
+    if (busy_ || !resolving_.empty()) return false;
     double first = 0;
     int waiting = 0;
     bool first_alone = false;  // the oldest waiting run can't share a forward: no partner to wait for
@@ -110,10 +110,9 @@ bool GpuArbiter::lead_ready_locked(double now) const {
     bool host_side = false;  // a decoding seq still to come that is busy on the host (sampling, parsing, streaming)
     for (int s : decoding_) {
         if (pending_.count(s) && !pending_.at(s).done) continue;
-        // Waiting for the GPU to start its chain: it comes in a few ms after its chain - wait for it, no timeout. (The
-        // timeout alone fired while the other slots' chains queued one after another: four slots averaged 2 runs a
-        // batch, and the ready batch then held off the waiting chains.)
+        // Waiting for the GPU to start its chain or finish drafting:
         if (drafts_waiting_.count(s)) return false;
+        if (pending_drafts_.count(s) && now - first < batch_wait_locked()) return false;
         host_side = true;
     }
     return !host_side || now - first >= batch_wait_locked();  // every decoding seq is in, or the host-side wait ran out
@@ -186,7 +185,6 @@ LogitRows GpuArbiter::verify(int seq, const LmBackend::VerifyRun &run, bool cand
     STRIX_CHECK(!pending_.count(seq) && !resolving_.count(seq), "GpuArbiter: seq ", seq,
                 " verifies again before its last verify was resolved");
     STRIX_CHECK(run.seq == seq, "GpuArbiter: seq ", seq, " sends a run of seq ", run.seq);
-    if (owner_ == seq) owner_ = -1;  // the chain is done
     Pending &me = pending_[seq];
     me.run = run, me.cands = cands, me.n_valid = n_valid, me.since = now_s();
     me.batchable = be_.batchable(seq);  // read here: this seq's own state, between its own calls
@@ -205,10 +203,105 @@ LogitRows GpuArbiter::verify(int seq, const LmBackend::VerifyRun &run, bool cand
     return std::move(done.rows);
 }
 
+bool GpuArbiter::can_run_draft_batch_locked(double now) const {
+    if (busy_ || !resolving_.empty() || pending_drafts_.empty()) return false;
+    double first = 0;
+    for (const auto &[s, pd] : pending_drafts_) {
+        if (!pd.done && (first == 0 || pd.since < first)) first = pd.since;
+    }
+    if (first == 0) return false;
+
+    int waiting_on_others = 0;
+    for (int s : decoding_) {
+        if (pending_drafts_.count(s) && !pending_drafts_.at(s).done) continue;
+        if (pending_.count(s) && !pending_.at(s).done) continue;
+        if (resolving_.count(s)) continue;
+        waiting_on_others++;
+    }
+    if (waiting_on_others == 0) return true;
+    return (now - first) >= 0.0008;
+}
+
+void GpuArbiter::run_draft_batch(std::unique_lock<std::mutex> &lock) {
+    std::vector<LmBackend::MtpDraftRun> runs;
+    std::vector<int> members;
+    for (auto &[s, pd] : pending_drafts_) {
+        if (!pd.done) {
+            runs.push_back(pd.run);
+            members.push_back(s);
+        }
+    }
+    if (runs.empty()) return;
+
+    busy_ = true;
+    lock.unlock();
+
+    std::vector<Top2> out;
+    std::exception_ptr err;
+    try {
+        out = be_.forward_mtp_top2_batch(runs);
+        STRIX_CHECK(out.size() == runs.size(), "GpuArbiter: forward_mtp_top2_batch returned ", out.size(),
+                    " results for ", runs.size(), " runs");
+    } catch (...) {
+        err = std::current_exception();
+    }
+
+    lock.lock();
+    busy_ = false;
+    if (err && be_.failed()) {
+        for (int m : members) {
+            pending_drafts_[m].done = true;
+            pending_drafts_[m].error = err;
+        }
+        fail_locked();
+    } else {
+        for (size_t i = 0; i < members.size(); ++i) {
+            PendingDraft &pd = pending_drafts_[members[i]];
+            pd.done = true;
+            if (err) pd.error = err;
+            else pd.result = out[i];
+        }
+        if (!err) {
+            ++stats_.draft_batches;
+            stats_.draft_runs += (int64_t)members.size();
+            stats_.max_draft_runs = std::max(stats_.max_draft_runs, (int64_t)members.size());
+        }
+    }
+    cv_.notify_all();
+}
+
+Top2 GpuArbiter::draft(int seq, int32_t token_id, int64_t step) {
+    std::unique_lock<std::mutex> lock(mu_);
+    check_ok_locked(seq);
+    STRIX_CHECK(!pending_drafts_.count(seq), "GpuArbiter: seq ", seq, " drafts again before previous draft resolved");
+
+    PendingDraft &me = pending_drafts_[seq];
+    me.run = {seq, token_id, step};
+    me.since = now_s();
+    me.done = false;
+    cv_.notify_all();
+
+    for (;;) {
+        if (me.done) break;
+        if (failed_) check_ok_locked(seq);
+        if (can_run_draft_batch_locked(now_s())) {
+            run_draft_batch(lock);
+            continue;
+        }
+        cv_.wait_for(lock, std::chrono::microseconds(500));
+    }
+
+    PendingDraft done = std::move(me);
+    pending_drafts_.erase(seq);
+    if (done.error) std::rethrow_exception(done.error);
+    return done.result;
+}
+
 void GpuArbiter::reset(int seq) {
     std::unique_lock<std::mutex> lock(mu_);
     STRIX_CHECK(seq >= 0 && seq < (int)epoch_.size(), "GpuArbiter::reset: seq ", seq, ", expected 0..",
                 epoch_.size() - 1);
+    pending_drafts_.erase(seq);
     cv_.wait(lock, [&] { return !busy_; });
     busy_ = true;
     const bool whole = failed_;
@@ -230,7 +323,6 @@ void GpuArbiter::reset(int seq) {
         if (whole) failed_ = false;  // the other seqs' epochs stay behind: each resets before its next call
         epoch_[(size_t)seq] = failures_;
         resolving_.erase(seq);
-        if (owner_ == seq) owner_ = -1;
     } else if (be_.failed()) {
         fail_locked();
     }
@@ -304,9 +396,7 @@ void SeqBackend::set_lookahead(const std::vector<int32_t> &next_ids) {
 }
 
 Top2 SeqBackend::forward_mtp_top2(int32_t token_id, int64_t step) {
-    Top2 t;
-    arb_.run(seq_, GpuArbiter::Kind::Draft, [&] { t = arb_.backend().forward_mtp_top2(seq_, token_id, step); });
-    return t;
+    return arb_.draft(seq_, token_id, step);
 }
 
 std::vector<float> SeqBackend::forward_verify(const std::vector<int32_t> &ids, int64_t n_logits) {

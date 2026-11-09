@@ -32,4 +32,8 @@ static_assert(sizeof(MtpPick) == 64, "MtpPick is copied as one 64-byte block");
 void mtp_pick(const float *logits, int64_t n, const uint32_t *router_err, const uint32_t *expert_err,
               const uint32_t *attn_err, const EmbeddingError *emb_err, MtpPick *out, hipStream_t stream);
 
+// Batched MTP pick: B independent sets of logits [B * n], producing B MtpPick structs in out.
+void mtp_pick_batch(const float *logits, int64_t n, int64_t B, const uint32_t *router_err, const uint32_t *expert_err,
+                    const uint32_t *attn_err, const EmbeddingError *emb_err, MtpPick *out, hipStream_t stream);
+
 }  // namespace strix::kernels

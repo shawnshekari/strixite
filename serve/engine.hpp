@@ -202,6 +202,17 @@ public:
         check_seq(seq, "forward_mtp_top2");
         return forward_mtp_top2(token_id, step);
     }
+    struct MtpDraftRun {
+        int seq = 0;
+        int32_t token_id = 0;
+        int64_t step = 0;
+    };
+    virtual std::vector<Top2> forward_mtp_top2_batch(const std::vector<MtpDraftRun> &runs) {
+        std::vector<Top2> out;
+        out.reserve(runs.size());
+        for (const auto &r : runs) out.push_back(forward_mtp_top2(r.seq, r.token_id, r.step));
+        return out;
+    }
     virtual void prefetch_ple(int seq, const std::vector<int32_t> &ids, int64_t first) {
         check_seq(seq, "prefetch_ple");
         prefetch_ple(ids, first);
@@ -531,6 +542,7 @@ struct EngineStats {
     std::vector<int64_t> slot_request, slot_live_tokens, slot_snapshot_pos;
     int64_t verify_batches = 0, verify_batch_runs = 0;  // batched MTP verifies (GpuArbiter) and their runs
     int64_t verify_alone = 0;  // verifies run alone: their conversation holds image rows (GpuArbiter Stats)
+    int64_t draft_batches = 0, draft_batch_runs = 0;    // batched MTP drafts (GpuArbiter) and their runs
     int64_t decoding_slots = 0;  // slots in their decode loop (GpuArbiter::decoding_count; 0 with one slot)
     // Seconds since the last request finished (or the engine started); 0 while one runs or waits. `busy` alone reads
     // 1 through a steady agent session, so a batch client sampling it saw a "stuck" flag; this lets it
