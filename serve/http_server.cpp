@@ -425,10 +425,15 @@ void HttpServer::routes() {
                 }
                 return true;
             };
-            json::Value first = json::Value::object();
-            first.set("role", json::Value::string("assistant"));
-            first.set("content", json::Value::string(""));
-            if (!send(chunk_body(meta, first, nullptr))) return false;
+            bool first_sent = false;
+            const auto ensure_first = [&]() {
+                if (first_sent) return true;
+                first_sent = true;
+                json::Value first = json::Value::object();
+                first.set("role", json::Value::string("assistant"));
+                first.set("content", json::Value::string(""));
+                return send(chunk_body(meta, first, nullptr));
+            };
             int tool_index = 0;
             QueueSink::Item it;
             std::string progress;
@@ -448,6 +453,7 @@ void HttpServer::routes() {
                     }
                     break;
                 case QueueSink::Item::Kind::Events:
+                    if (!ensure_first()) return false;
                     for (size_t k = 0; k < it.events.size(); ++k) {
                         const OutputEvent &e = it.events[k];
                         json::Value d = json::Value::object();
@@ -473,13 +479,16 @@ void HttpServer::routes() {
                 case QueueSink::Item::Kind::Done: {
                     const GenerationResult &r = it.result;
                     if (r.finish_reason == "error") {
-                        send(error_body(r.error, engine_error_type(r), ""));
+                        const std::string err_frame = "event: error\ndata: " + error_body(r.error, engine_error_type(r), "") + "\n\n";
+                        out.write(err_frame.data(), err_frame.size());
+                        send(chunk_body(meta, json::Value::object(), "error"));
                     } else if (r.finish_reason != "cancelled") {
+                        ensure_first();
                         send(chunk_body(meta, json::Value::object(), r.finish_reason.c_str()));
                         send(usage_chunk_body(meta, r, clamped));
+                        const std::string done = "data: [DONE]\n\n";
+                        out.write(done.data(), done.size());
                     }
-                    const std::string done = "data: [DONE]\n\n";
-                    out.write(done.data(), done.size());
                     out.done();
                     return true;
                 }
@@ -592,12 +601,13 @@ void HttpServer::routes() {
                 case QueueSink::Item::Kind::Done: {
                     const GenerationResult &r = it.result;
                     if (r.finish_reason == "error") {
-                        frame("data: " + error_body(r.error, engine_error_type(r), "") + "\n\n");
+                        frame("event: error\ndata: " + error_body(r.error, engine_error_type(r), "") + "\n\n");
+                        frame("data: " + text_chunk_body(meta, "", "error") + "\n\n");
                     } else if (r.finish_reason != "cancelled") {
                         frame("data: " + text_chunk_body(meta, "", r.finish_reason.c_str()) + "\n\n");
                         frame("data: " + text_usage_chunk_body(meta, r, clamped) + "\n\n");
+                        frame("data: [DONE]\n\n");
                     }
-                    frame("data: [DONE]\n\n");
                     out.done();
                     return true;
                 }
