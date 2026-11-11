@@ -541,6 +541,14 @@ Qwen4ExpSeqState::Qwen4ExpSeqState(const Qwen4ExpModel &model, int64_t capacity,
             mtp_chain_tail[k] = DeviceBuffer<uint8_t>((size_t)(3 * D.idx_d) * e,
                                                        "MTP chain indexer tail " + std::to_string(k));
     }
+    STRIX_HIP_CHECK(hipStreamCreateWithFlags(&copy_stream, hipStreamNonBlocking), "Qwen4ExpSeqState: copy stream");
+}
+
+Qwen4ExpSeqState::~Qwen4ExpSeqState() {
+    if (copy_stream) {
+        (void)hipStreamSynchronize(copy_stream);
+        (void)hipStreamDestroy(copy_stream);
+    }
 }
 
 // /proc/meminfo's MemAvailable in bytes (the slot allocation guard); 0 if it can't be read (the guard then refuses
@@ -1527,6 +1535,8 @@ void Qwen4ExpSession::trace_upload(const UploadTrace &p) const {
 
 void Qwen4ExpSession::reset() {
     STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::reset");
+    for (const auto &sq : seqs_)
+        if (sq->copy_stream) STRIX_HIP_CHECK(hipStreamSynchronize(sq->copy_stream), "Qwen4ExpSession::reset: copy stream");
     // The kernels' error words are one-way flags (set by atomicCAS, never cleared by the readers or the
     // report that throws): left set, every later forward's read_back re-reports this stale error - the
     // engine resets after a failed request expecting a clean slate, so a reset must clear them (the
@@ -1809,18 +1819,24 @@ size_t Qwen4ExpSession::state_bytes(int64_t n, int64_t from) const {
     STRIX_CHECK(from >= 0 && from <= n, "Qwen4ExpSession::state_bytes: from = ", from, ", expected 0..n = ", n);
     const Qwen4ExpDims &D = m_.dims();
     const size_t e = es(m_.act());
-    // The rows [from, n) and the blocks [from / 4, n / 4) (see export_state).
+    // Compute sizes from model geometry rather than st()'s vectors (keep_verify_full swaps seq 0's conv_state /
+    // rec_state while another seq may call state_bytes concurrently).
     const size_t kv = 2 * (size_t)((n - from) * D.hkv * D.hd) * e,
-                 keys = (size_t)((n / kernels::kQsaBlock - from / kernels::kQsaBlock) * D.idx_d) * e;
+                 keys = (size_t)((n / kernels::kQsaBlock - from / kernels::kQsaBlock) * D.idx_d) * e,
+                 tail_b = (size_t)(3 * D.idx_d) * e,
+                 conv_b = (size_t)((kernels::kGdnConvWidth - 1) * D.conv_c) * e,
+                 rec_b = (size_t)(D.gv * kHD * kHD) * sizeof(float),
+                 ple_b = D.ple_layer >= 0 ? (size_t)((D.ple_taps - 1) * D.ple_dil * D.H * D.d) * e : 0,
+                 mtp_prev_b = (size_t)(D.H * D.d) * e;
     size_t b = sizeof(PleHistory) + sizeof(Qwen4ExpStateHeader);
-    for (size_t l = 0; l < st().conv_state.size(); ++l) {
-        if (D.is_attention[l])
-            b += (kv_format_ == KvFormat::Q8 ? kv8_state_bytes(n, from) : kv) + keys + st().tail[0][l].size();
+    for (int64_t l = 0; l < D.layers; ++l) {
+        if (D.is_attention[(size_t)l])
+            b += (kv_format_ == KvFormat::Q8 ? kv8_state_bytes(n, from) : kv) + keys + tail_b;
         else
-            b += st().conv_state[l].size() + st().rec_state[l].size() * sizeof(float);
+            b += conv_b + rec_b;
     }
-    b += st().ple_state.size();
-    if (mtp_) b += kv + keys + st().tail_mtp[0].size() + st().mtp_prev.size();
+    b += ple_b;
+    if (mtp_) b += kv + keys + tail_b + mtp_prev_b;
     return b;
 }
 
@@ -1873,7 +1889,7 @@ size_t Qwen4ExpSession::kv8_state_bytes(int64_t n, int64_t from) const {
 
 void Qwen4ExpSession::kv8_copy(const Qwen4ExpSeqState &sq, uint8_t *&cur, size_t layer, int64_t n, int64_t from,
                                const DeviceBuffer<uint8_t> &tail, bool to_host,
-                               std::vector<std::pair<uint8_t *, size_t>> *unused, bool paged) {
+                               std::vector<std::pair<uint8_t *, size_t>> *unused, hipStream_t stream, bool paged) {
     const Qwen4ExpDims &D = m_.dims();
     const int64_t W = D.hkv * D.hd, G = kernels::kKv8Group, cap = kv8_cap_, ga = from / G, gb = n / G;
     STRIX_CHECK(layer < sq.kv8_store.size() && sq.kv8_store[layer].capacity() >= kernels::kv8_bytes(cap, W),
@@ -1883,19 +1899,19 @@ void Qwen4ExpSession::kv8_copy(const Qwen4ExpSeqState &sq, uint8_t *&cur, size_t
     uint8_t *store = sq.kv8_store[layer].get();  // (its address; the store is touched only when paged)
     const size_t kc = (size_t)(cap * W), kp = (size_t)((cap / G) * W) * 4, nb = (size_t)(W / kernels::kKv8Block);
     if (paged) {  // not paged = the small half of a parked entry: those four regions ARE its parked pages
-        host_copy(cur, store + (size_t)(ga * G * W), (size_t)((gb - ga) * G * W), to_host, stream_, "8-bit K codes");
-        host_copy(cur, store + kc + (size_t)(ga * W) * 4, (size_t)((gb - ga) * W) * 4, to_host, stream_,
+        host_copy(cur, store + (size_t)(ga * G * W), (size_t)((gb - ga) * G * W), to_host, stream, "8-bit K codes");
+        host_copy(cur, store + kc + (size_t)(ga * W) * 4, (size_t)((gb - ga) * W) * 4, to_host, stream,
                   "8-bit K params");
-        host_copy(cur, store + kc + kp + (size_t)(ga * G * W), (size_t)((gb - ga) * G * W), to_host, stream_,
+        host_copy(cur, store + kc + kp + (size_t)(ga * G * W), (size_t)((gb - ga) * G * W), to_host, stream,
                   "8-bit V codes");
         host_copy(cur, store + 2 * kc + kp + (size_t)(ga * G) * nb * 4, (size_t)((gb - ga) * G) * nb * 4, to_host,
-                  stream_, "8-bit V params");
+                  stream, "8-bit V params");
     }
     // The tail: rows [gb * G, n) valid in each half (K, V).
     const size_t es_ = es(m_.act()), half = (size_t)(G * W) * es_, valid = (size_t)((n - gb * G) * W) * es_;
     if (unused)
         for (int h = 0; h < 2; ++h) unused->emplace_back(cur + h * half + valid, half - valid);
-    host_copy(cur, tail.get(), tail.size(), to_host, stream_, "K/V tail");
+    host_copy(cur, tail.get(), tail.size(), to_host, stream, "K/V tail");
 }
 
 void Qwen4ExpSession::export_state(const Qwen4ExpSnapshot &s, uint8_t *out, size_t bytes, int64_t from) {
@@ -1920,11 +1936,15 @@ std::vector<Qwen4ExpSession::StatePagedRange> Qwen4ExpSession::state_paged_range
     const size_t keys_row = (size_t)(b1 * 8) * e, pitch = (size_t)(cap_blocks_ * 8) * e;
     const int64_t key_chunks = D.idx_d / 8;
     const bool q8 = kv_format_ == KvFormat::Q8;
+    const size_t tail_b = (size_t)(3 * D.idx_d) * e,
+                 conv_b = (size_t)((kernels::kGdnConvWidth - 1) * D.conv_c) * e,
+                 rec_b = (size_t)(D.gv * kHD * kHD) * sizeof(float),
+                 ple_b = D.ple_layer >= 0 ? (size_t)((D.ple_taps - 1) * D.ple_dil * D.H * D.d) * e : 0;
     std::vector<StatePagedRange> r;
     size_t off = sizeof(Qwen4ExpStateHeader) + sizeof(PleHistory);
-    for (size_t l = 0; l < st().conv_state.size(); ++l) {
-        if (!D.is_attention[l]) {  // GDN: conv + recurrent, all small
-            off += st().conv_state[l].size() + st().rec_state[l].size() * sizeof(float);
+    for (int64_t l = 0; l < D.layers; ++l) {
+        if (!D.is_attention[(size_t)l]) {  // GDN: conv + recurrent, all small
+            off += conv_b + rec_b;
             continue;
         }
         if (q8) {
@@ -1946,9 +1966,9 @@ std::vector<Qwen4ExpSession::StatePagedRange> Qwen4ExpSession::state_paged_range
         const int64_t sk = kv_spec_index(kv_layout_, "block keys layer " + std::to_string(l));
         for (int64_t c = 0; c < key_chunks; ++c)  // one range per 8-dimension chunk
             r.push_back({sk, (size_t)(c * pitch), off + (size_t)(c * keys_row), keys_row});
-        off += (size_t)(b1 * D.idx_d) * e + st().tail[0][l].size();
+        off += (size_t)(b1 * D.idx_d) * e + tail_b;
     }
-    off += st().ple_state.size();
+    off += ple_b;
     if (mtp_) {
         r.push_back({kv_spec_index(kv_layout_, "MTP K cache"), 0, off, (size_t)n * row});
         r.push_back({kv_spec_index(kv_layout_, "MTP V cache"), 0, off + (size_t)n * row, (size_t)n * row});
@@ -2034,38 +2054,44 @@ void Qwen4ExpSession::export_state(int seq, const Qwen4ExpSnapshot &s, uint8_t *
     // sequence. The zeroing waits for the copies.
     const size_t tail_valid = (size_t)((n % kernels::kQsaBlock) * D.idx_d) * e;
     std::vector<std::pair<uint8_t *, size_t>> tail_unused;
-    for (size_t l = 0; l < sq.conv_state.size(); ++l) {
-        if (D.is_attention[l]) {
-            const size_t row = (size_t)(D.hkv * D.hd) * e, kv = (size_t)(n - from) * row;
-            if (kv_format_ == KvFormat::Q8) {
-                kv8_copy(sq, cur, l, n, from, s.kv8_tail_[l], true, &tail_unused);
+    try {
+        for (size_t l = 0; l < sq.conv_state.size(); ++l) {
+            if (D.is_attention[l]) {
+                const size_t row = (size_t)(D.hkv * D.hd) * e, kv = (size_t)(n - from) * row;
+                if (kv_format_ == KvFormat::Q8) {
+                    kv8_copy(sq, cur, l, n, from, s.kv8_tail_[l], true, &tail_unused, sq.copy_stream);
+                } else {
+                    host_copy(cur, sq.k_cache[l].get() + (size_t)from * row, kv, true, sq.copy_stream, "K cache");
+                    host_copy(cur, sq.v_cache[l].get() + (size_t)from * row, kv, true, sq.copy_stream, "V cache");
+                }
+                block_keys_copy(cur, sq.block_keys[l].get(), b0, b1, cap_blocks_, D.idx_d, e, true, sq.copy_stream);
+                STRIX_CHECK(s.tail_[l].size() >= tail_valid, "Qwen4ExpSession::export_state: indexer tail of ",
+                            s.tail_[l].size(), " bytes, ", tail_valid, " valid");
+                tail_unused.emplace_back(cur + tail_valid, s.tail_[l].size() - tail_valid);
+                host_copy(cur, s.tail_[l].get(), s.tail_[l].size(), true, sq.copy_stream, "indexer tail");
             } else {
-                host_copy(cur, sq.k_cache[l].get() + (size_t)from * row, kv, true, stream_, "K cache");
-                host_copy(cur, sq.v_cache[l].get() + (size_t)from * row, kv, true, stream_, "V cache");
+                host_copy(cur, s.conv_[l].get(), s.conv_[l].size(), true, sq.copy_stream, "conv state");
+                host_copy(cur, s.rec_[l].get(), s.rec_[l].size() * sizeof(float), true, sq.copy_stream,
+                          "recurrent state");
             }
-            block_keys_copy(cur, sq.block_keys[l].get(), b0, b1, cap_blocks_, D.idx_d, e, true, stream_);
-            STRIX_CHECK(s.tail_[l].size() >= tail_valid, "Qwen4ExpSession::export_state: indexer tail of ",
-                        s.tail_[l].size(), " bytes, ", tail_valid, " valid");
-            tail_unused.emplace_back(cur + tail_valid, s.tail_[l].size() - tail_valid);
-            host_copy(cur, s.tail_[l].get(), s.tail_[l].size(), true, stream_, "indexer tail");
-        } else {
-            host_copy(cur, s.conv_[l].get(), s.conv_[l].size(), true, stream_, "conv state");
-            host_copy(cur, s.rec_[l].get(), s.rec_[l].size() * sizeof(float), true, stream_, "recurrent state");
         }
+        host_copy(cur, s.ple_state_.get(), s.ple_state_.size(), true, sq.copy_stream, "PLE conv state");
+        if (mtp_) {
+            const size_t row = (size_t)(D.hkv * D.hd) * e, kv = (size_t)(n - from) * row;
+            host_copy(cur, sq.k_cache_mtp.get() + (size_t)from * row, kv, true, sq.copy_stream, "MTP K cache");
+            host_copy(cur, sq.v_cache_mtp.get() + (size_t)from * row, kv, true, sq.copy_stream, "MTP V cache");
+            block_keys_copy(cur, sq.block_keys_mtp.get(), b0, b1, cap_blocks_, D.idx_d, e, true, sq.copy_stream);
+            STRIX_CHECK(s.mtp_tail_.size() >= tail_valid, "Qwen4ExpSession::export_state: MTP indexer tail of ",
+                        s.mtp_tail_.size(), " bytes, ", tail_valid, " valid");
+            tail_unused.emplace_back(cur + tail_valid, s.mtp_tail_.size() - tail_valid);
+            host_copy(cur, s.mtp_tail_.get(), s.mtp_tail_.size(), true, sq.copy_stream, "MTP indexer tail");
+            host_copy(cur, s.mtp_prev_.get(), s.mtp_prev_.size(), true, sq.copy_stream, "MTP previous streams");
+        }
+        STRIX_HIP_CHECK(hipStreamSynchronize(sq.copy_stream), "Qwen4ExpSession::export_state");
+    } catch (...) {
+        (void)hipStreamSynchronize(sq.copy_stream);  // ensure no queued DMA still targets `out` on unwind
+        throw;
     }
-    host_copy(cur, s.ple_state_.get(), s.ple_state_.size(), true, stream_, "PLE conv state");
-    if (mtp_) {
-        const size_t row = (size_t)(D.hkv * D.hd) * e, kv = (size_t)(n - from) * row;
-        host_copy(cur, sq.k_cache_mtp.get() + (size_t)from * row, kv, true, stream_, "MTP K cache");
-        host_copy(cur, sq.v_cache_mtp.get() + (size_t)from * row, kv, true, stream_, "MTP V cache");
-        block_keys_copy(cur, sq.block_keys_mtp.get(), b0, b1, cap_blocks_, D.idx_d, e, true, stream_);
-        STRIX_CHECK(s.mtp_tail_.size() >= tail_valid, "Qwen4ExpSession::export_state: MTP indexer tail of ",
-                    s.mtp_tail_.size(), " bytes, ", tail_valid, " valid");
-        tail_unused.emplace_back(cur + tail_valid, s.mtp_tail_.size() - tail_valid);
-        host_copy(cur, s.mtp_tail_.get(), s.mtp_tail_.size(), true, stream_, "MTP indexer tail");
-        host_copy(cur, s.mtp_prev_.get(), s.mtp_prev_.size(), true, stream_, "MTP previous streams");
-    }
-    STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::export_state");
     for (const auto &[at, len] : tail_unused) std::memset(at, 0, len);
     STRIX_CHECK((size_t)(cur - out) == bytes, "Qwen4ExpSession::export_state: wrote ", cur - out, " of ", bytes, " bytes");
 }
@@ -2135,35 +2161,42 @@ void Qwen4ExpSession::export_small_state(int seq, const Qwen4ExpSnapshot &s, uin
                     (size_t)(cur - out) + b, " bytes, the buffer holds ", bytes,
                     " - the paged ranges and this walk drifted apart");
     };
-    for (size_t l = 0; l < sq.conv_state.size(); ++l) {
-        if (D.is_attention[l]) {
-            if (kv_format_ == KvFormat::Q8) {  // the four store regions elided, the K/V tail kept
-                room(kernels::kv8_tail_bytes(D.hkv * D.hd, m_.act()));
-                kv8_copy(sq, cur, l, n, /*from=*/0, s.kv8_tail_[l], true, &tail_unused, /*paged=*/false);
+    try {
+        for (size_t l = 0; l < sq.conv_state.size(); ++l) {
+            if (D.is_attention[l]) {
+                if (kv_format_ == KvFormat::Q8) {  // the four store regions elided, the K/V tail kept
+                    room(kernels::kv8_tail_bytes(D.hkv * D.hd, m_.act()));
+                    kv8_copy(sq, cur, l, n, /*from=*/0, s.kv8_tail_[l], true, &tail_unused, sq.copy_stream,
+                             /*paged=*/false);
+                }
+                // (the K / V rows and the block keys are paged: nothing to write, nothing to advance)
+                STRIX_CHECK(s.tail_[l].size() >= tail_valid, "Qwen4ExpSession::export_small_state: indexer tail of ",
+                            s.tail_[l].size(), " bytes, ", tail_valid, " valid");
+                tail_unused.emplace_back(cur + tail_valid, s.tail_[l].size() - tail_valid);
+                room(s.tail_[l].size());
+                host_copy(cur, s.tail_[l].get(), s.tail_[l].size(), true, sq.copy_stream, "indexer tail");
+            } else {
+                room(s.conv_[l].size() + s.rec_[l].size() * sizeof(float));
+                host_copy(cur, s.conv_[l].get(), s.conv_[l].size(), true, sq.copy_stream, "conv state");
+                host_copy(cur, s.rec_[l].get(), s.rec_[l].size() * sizeof(float), true, sq.copy_stream,
+                          "recurrent state");
             }
-            // (the K / V rows and the block keys are paged: nothing to write, nothing to advance)
-            STRIX_CHECK(s.tail_[l].size() >= tail_valid, "Qwen4ExpSession::export_small_state: indexer tail of ",
-                        s.tail_[l].size(), " bytes, ", tail_valid, " valid");
-            tail_unused.emplace_back(cur + tail_valid, s.tail_[l].size() - tail_valid);
-            room(s.tail_[l].size());
-            host_copy(cur, s.tail_[l].get(), s.tail_[l].size(), true, stream_, "indexer tail");
-        } else {
-            room(s.conv_[l].size() + s.rec_[l].size() * sizeof(float));
-            host_copy(cur, s.conv_[l].get(), s.conv_[l].size(), true, stream_, "conv state");
-            host_copy(cur, s.rec_[l].get(), s.rec_[l].size() * sizeof(float), true, stream_, "recurrent state");
         }
+        room(s.ple_state_.size());
+        host_copy(cur, s.ple_state_.get(), s.ple_state_.size(), true, sq.copy_stream, "PLE conv state");
+        if (mtp_) {
+            room(s.mtp_tail_.size() + s.mtp_prev_.size());
+            STRIX_CHECK(s.mtp_tail_.size() >= tail_valid, "Qwen4ExpSession::export_small_state: MTP indexer tail of ",
+                        s.mtp_tail_.size(), " bytes, ", tail_valid, " valid");
+            tail_unused.emplace_back(cur + tail_valid, s.mtp_tail_.size() - tail_valid);
+            host_copy(cur, s.mtp_tail_.get(), s.mtp_tail_.size(), true, sq.copy_stream, "MTP indexer tail");
+            host_copy(cur, s.mtp_prev_.get(), s.mtp_prev_.size(), true, sq.copy_stream, "MTP previous streams");
+        }
+        STRIX_HIP_CHECK(hipStreamSynchronize(sq.copy_stream), "Qwen4ExpSession::export_small_state");
+    } catch (...) {
+        (void)hipStreamSynchronize(sq.copy_stream);  // ensure no queued DMA still targets `out` on unwind
+        throw;
     }
-    room(s.ple_state_.size());
-    host_copy(cur, s.ple_state_.get(), s.ple_state_.size(), true, stream_, "PLE conv state");
-    if (mtp_) {
-        room(s.mtp_tail_.size() + s.mtp_prev_.size());
-        STRIX_CHECK(s.mtp_tail_.size() >= tail_valid, "Qwen4ExpSession::export_small_state: MTP indexer tail of ",
-                    s.mtp_tail_.size(), " bytes, ", tail_valid, " valid");
-        tail_unused.emplace_back(cur + tail_valid, s.mtp_tail_.size() - tail_valid);
-        host_copy(cur, s.mtp_tail_.get(), s.mtp_tail_.size(), true, stream_, "MTP indexer tail");
-        host_copy(cur, s.mtp_prev_.get(), s.mtp_prev_.size(), true, stream_, "MTP previous streams");
-    }
-    STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::export_small_state");
     for (const auto &[at, len] : tail_unused) std::memset(at, 0, len);  // as in export_state: the state's bytes
                                                                         // depend only on its sequence
     STRIX_CHECK((size_t)(cur - out) == bytes, "Qwen4ExpSession::export_small_state: wrote ", cur - out, " of ",
@@ -2231,7 +2264,8 @@ void Qwen4ExpSession::import_small_state(int seq, const uint8_t *in, size_t byte
         if (D.is_attention[l]) {
             if (kv_format_ == KvFormat::Q8) {
                 room(kernels::kv8_tail_bytes(D.hkv * D.hd, m_.act()));
-                kv8_copy(sq, cur, l, n, /*from=*/0, sq.kv8_tail[sq.tail_cur][l], false, nullptr, /*paged=*/false);
+                kv8_copy(sq, cur, l, n, /*from=*/0, sq.kv8_tail[sq.tail_cur][l], false, nullptr, stream_,
+                         /*paged=*/false);
             }
             room(sq.tail[sq.tail_cur][l].size());
             host_copy(cur, sq.tail[sq.tail_cur][l].get(), sq.tail[sq.tail_cur][l].size(), false, stream_,
@@ -2332,7 +2366,7 @@ void Qwen4ExpSession::import_state(int seq, const uint8_t *in, size_t bytes, int
         if (D.is_attention[l]) {
             const size_t row = (size_t)(D.hkv * D.hd) * e, kv = (size_t)(n - from) * row;
             if (kv_format_ == KvFormat::Q8) {
-                kv8_copy(sq, cur, l, n, from, sq.kv8_tail[sq.tail_cur][l], false, nullptr);
+                kv8_copy(sq, cur, l, n, from, sq.kv8_tail[sq.tail_cur][l], false, nullptr, stream_);
             } else {
                 host_copy(cur, sq.k_cache[l].get() + (size_t)from * row, kv, false, stream_, "K cache");
                 host_copy(cur, sq.v_cache[l].get() + (size_t)from * row, kv, false, stream_, "V cache");

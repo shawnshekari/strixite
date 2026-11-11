@@ -433,6 +433,9 @@ struct Qwen4ExpSeqState {
     // between them): every array kv_slot_specs names exists in `layout`.
     Qwen4ExpSeqState(const Qwen4ExpModel &model, int64_t capacity, int64_t chain_rows, bool mtp, KvFormat kv,
                      VmmReservation &kv_res, const KvReservationLayout &layout, int64_t slot);
+    ~Qwen4ExpSeqState();
+    Qwen4ExpSeqState(const Qwen4ExpSeqState &) = delete;
+    Qwen4ExpSeqState &operator=(const Qwen4ExpSeqState &) = delete;
     // The paged arrays' mapping unit. gfx1151: a 2 MiB page is created in ~45 us and mapped pages read at hipMalloc's
     // speed; slack per array is under one page.
     static constexpr size_t kPageBytes = (size_t)2 << 20;
@@ -514,6 +517,9 @@ struct Qwen4ExpSeqState {
     // at the PLE layer of the forward that queued it.
     PinnedHostBuffer ple_stage;
     std::future<void> ple_fut;
+    // Dedicated non-blocking stream for async device -> host snapshot exports (so exports never contend with
+    // other slots on the shared compute stream_).
+    hipStream_t copy_stream = nullptr;
 
     int64_t pos3Hend() const { return pos3_start + (int64_t)pos3_host.size() / 3; }  // == pos when non-empty
 
@@ -605,7 +611,7 @@ public:
     // The host-only view of a parked conversation - what a paged cache entry holds (PagedState): the writer's
     // byte map with host addresses resolved, the page bytes to count, the id to give back.
     PagedState paged_state(int64_t parked_id, int64_t n) const;
-    int64_t parked_generations_used() const { return parked_used_; }      // parks taken (never given back)
+    int64_t parked_generations_used() const { return parked_used_.load(); }  // parks taken (never given back)
     // Parked records still live (taken, neither resumed nor released): the soft K/V reset rebuilds the session only
     // at 0 - a live record's pages go with the session, and a cache entry would still point into them.
     int64_t parked_live() const {
@@ -891,7 +897,7 @@ private:
     // is what the states' buffers map.
     std::unique_ptr<VmmReservation> kv_res_;
     KvReservationLayout kv_layout_;
-    int64_t parked_used_ = 0;  // parks taken across every slot (the shared parked budget's cursor; never refunded)
+    std::atomic<int64_t> parked_used_{0};  // parks taken across every slot (atomic: park_budget_left reads beside calls)
     // The records this session parked, indexed by parked generation (= their id); spent ones are
     // emptied in place so an id never names a live conversation twice. Sized once, with the budget.
     std::vector<ParkedKv> parked_by_gen_;
@@ -936,8 +942,8 @@ private:
     size_t kv8_state_bytes(int64_t n, int64_t from) const;
     void kv8_copy(const Qwen4ExpSeqState &sq, uint8_t *&cur, size_t layer, int64_t n, int64_t from,
                   const DeviceBuffer<uint8_t> &tail, bool to_host, std::vector<std::pair<uint8_t *, size_t>> *unused,
-                  bool paged = true);  // paged = false: only the tail (the small half of a parked entry's store -
-                                       // the four paged regions are the pages themselves)
+                  hipStream_t stream, bool paged = true);  // paged = false: only the tail (the small half of a parked
+                                                           // entry's store - the four paged regions are the pages)
     DeviceBuffer<uint8_t> kv_new_;
     // lg_src_: the batched forward's compacted logits rows - each run's last nL rows gathered contiguous so
     // the LM head's weights are read once for the whole batch. kMaxLogits rows, decode-size (a few MB).
