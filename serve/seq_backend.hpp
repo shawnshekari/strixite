@@ -35,7 +35,7 @@ public:
     const LmBackend &backend() const { return be_; }
 
     enum class Kind {
-        Call,     // a plain call (a forward, a snapshot, an export / import, a reset); ends the seq's draft chain
+        Call,     // a plain call (a forward, a snapshot, an import, a reset); ends the seq's draft chain
         Draft,    // a draft step: step 0 starts the seq's chain, the GPU stays the seq's until it verifies / forwards
         Resolve,  // keep / drop of the seq's run of the batched verify awaiting resolution
         Hint,     // prefetch / lookahead / reads: never blocked by a chain or a pending batch
@@ -45,6 +45,11 @@ public:
     // call on suspect state must fail the request cleanly), a Hint - advisory reads and prefetches - skips f and
     // returns false: an advisory call must never be what takes a slot's worker down (serve/engine.cpp).
     bool run(int seq, Kind kind, const std::function<void()> &f);
+    // Runs a per-seq read or export (export_snapshot, export_small_snapshot, snapshot/pos metadata reads) without
+    // acquiring or blocking on busy_, so concurrent forwards/verifies on other slots never stall or wait for it.
+    // Whole-backend reset() waits until every concurrent call finishes; per-seq reset(seq) waits on seq's own.
+    // When advisory is true, a poisoned seq skips f and returns false instead of throwing.
+    bool run_concurrent(int seq, bool advisory, const std::function<void()> &f);
     // seq's verify, joined into a batch with the other decoding seqs' (see above); returns seq's rows.
     LogitRows verify(int seq, const LmBackend::VerifyRun &run, bool cands, int64_t n_valid);
     // seq resets its state: after a failure the first one resets the whole backend; a pending resolution of seq's is
@@ -114,6 +119,8 @@ private:
     // chain away) instead of timing out on it.
     std::multiset<int> drafts_waiting_;
     std::vector<int64_t> last_call_batch_;  // per seq: stats_.verify_batches when its last call ran
+    std::vector<int> concurrent_;           // per-seq active run_concurrent calls (awaited by reset)
+    int concurrent_total_ = 0;              // total active across all seqs (awaited by whole reset)
 };
 
 // One slot's view of the shared backend: LmBackend's single-conversation calls, mapped to seq's.

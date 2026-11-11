@@ -14,7 +14,10 @@ double now_s() {
 }  // namespace
 
 GpuArbiter::GpuArbiter(LmBackend &be)
-    : be_(be), epoch_((size_t)be.n_seqs(), 0), last_call_batch_((size_t)be.n_seqs(), 0) {
+    : be_(be),
+      epoch_((size_t)be.n_seqs(), 0),
+      last_call_batch_((size_t)be.n_seqs(), 0),
+      concurrent_((size_t)be.n_seqs(), 0) {
     STRIX_CHECK(be.n_seqs() >= 1, "GpuArbiter: the backend holds ", be.n_seqs(), " conversations, expected >= 1");
 }
 
@@ -96,6 +99,36 @@ bool GpuArbiter::run(int seq, Kind kind, const std::function<void()> &f) {
     lock.unlock();
     cv_.notify_all();
     return true;  // f ran
+}
+
+bool GpuArbiter::run_concurrent(int seq, bool advisory, const std::function<void()> &f) {
+    std::unique_lock<std::mutex> lock(mu_);
+    STRIX_CHECK(seq >= 0 && seq < (int)epoch_.size(), "GpuArbiter::run_concurrent: seq ", seq, ", expected 0..",
+                epoch_.size() - 1);
+    if (advisory && poisoned_locked(seq)) return false;
+    check_ok_locked(seq);
+    ++concurrent_[(size_t)seq];
+    ++concurrent_total_;
+    lock.unlock();
+    auto finish = [&](bool thrown) {
+        lock.lock();
+        const bool zero_seq = --concurrent_[(size_t)seq] == 0;
+        const bool zero_all = --concurrent_total_ == 0;
+        // Skip be_.failed() while busy_ holds an exclusive GPU call: Qwen4ExpSession::broken_ is transiently true
+        // during an active forward/draft on another slot.
+        const bool failed = thrown && !failed_ && !busy_ && be_.failed();
+        if (failed) fail_locked();
+        lock.unlock();
+        if (zero_seq || zero_all || failed) cv_.notify_all();
+    };
+    try {
+        f();
+    } catch (...) {
+        finish(true);
+        throw;
+    }
+    finish(false);
+    return true;
 }
 
 bool GpuArbiter::lead_ready_locked(double now) const {
@@ -209,7 +242,7 @@ void GpuArbiter::reset(int seq) {
     std::unique_lock<std::mutex> lock(mu_);
     STRIX_CHECK(seq >= 0 && seq < (int)epoch_.size(), "GpuArbiter::reset: seq ", seq, ", expected 0..",
                 epoch_.size() - 1);
-    cv_.wait(lock, [&] { return !busy_; });
+    cv_.wait(lock, [&] { return !busy_ && (failed_ ? concurrent_total_ == 0 : concurrent_[(size_t)seq] == 0); });
     busy_ = true;
     const bool whole = failed_;
     const bool drop = !whole && resolving_.count(seq) > 0;  // a request failed between its verify and its resolution
@@ -282,7 +315,7 @@ SeqBackend::SeqBackend(GpuArbiter &arb, int seq) : arb_(arb), seq_(seq) {
 
 int64_t SeqBackend::pos() const {
     int64_t p = 0;  // poisoned: 0 (its next Call fails the request anyway; nothing trusts positions mid-failure)
-    arb_.run(seq_, GpuArbiter::Kind::Hint, [&] { p = arb_.backend().pos(seq_); });
+    arb_.run_concurrent(seq_, true, [&] { p = arb_.backend().pos(seq_); });
     return p;
 }
 
@@ -372,13 +405,13 @@ void SeqBackend::save_snapshot(int slot) {
 
 int64_t SeqBackend::snapshot_pos(int slot) const {
     int64_t p = -1;  // poisoned: -1 - no snapshot (a turn_pos of -1 = none; the engine never saves against it)
-    arb_.run(seq_, GpuArbiter::Kind::Hint, [&] { p = arb_.backend().snapshot_pos(seq_, slot); });
+    arb_.run_concurrent(seq_, true, [&] { p = arb_.backend().snapshot_pos(seq_, slot); });
     return p;
 }
 
 bool SeqBackend::can_restore_snapshot(int slot) const {
     bool ok = false;  // poisoned: false - refuse the restore (the caller's next Call fails cleanly)
-    arb_.run(seq_, GpuArbiter::Kind::Hint, [&] { ok = arb_.backend().can_restore_snapshot(seq_, slot); });
+    arb_.run_concurrent(seq_, true, [&] { ok = arb_.backend().can_restore_snapshot(seq_, slot); });
     return ok;
 }
 
@@ -387,12 +420,12 @@ void SeqBackend::restore_snapshot(int slot) {
 }
 
 void SeqBackend::export_snapshot(int slot, HostBuffer &out, int64_t from) {
-    arb_.run(seq_, GpuArbiter::Kind::Call, [&] { arb_.backend().export_snapshot(seq_, slot, out, from); });
+    arb_.run_concurrent(seq_, false, [&] { arb_.backend().export_snapshot(seq_, slot, out, from); });
 }
 
 uint64_t SeqBackend::snapshot_bytes(int slot, int64_t from) const {
     uint64_t b = 0;  // poisoned: 0 (never reached: the save path's snapshot_pos / can_restore hints skip first)
-    arb_.run(seq_, GpuArbiter::Kind::Hint, [&] { b = arb_.backend().snapshot_bytes(seq_, slot, from); });
+    arb_.run_concurrent(seq_, true, [&] { b = arb_.backend().snapshot_bytes(seq_, slot, from); });
     return b;
 }
 
@@ -414,12 +447,12 @@ void SeqBackend::resume_paged(const HostBuffer &small, const PagedState &paged, 
 
 uint64_t SeqBackend::small_snapshot_bytes(int slot) const {
     uint64_t b = 0;
-    arb_.run(seq_, GpuArbiter::Kind::Hint, [&] { b = arb_.backend().small_snapshot_bytes(seq_, slot); });
+    arb_.run_concurrent(seq_, true, [&] { b = arb_.backend().small_snapshot_bytes(seq_, slot); });
     return b;
 }
 
 void SeqBackend::export_small_snapshot(int slot, HostBuffer &out) {
-    arb_.run(seq_, GpuArbiter::Kind::Call, [&] { arb_.backend().export_small_snapshot(seq_, slot, out); });
+    arb_.run_concurrent(seq_, false, [&] { arb_.backend().export_small_snapshot(seq_, slot, out); });
 }
 
 void SeqBackend::resume_small(const HostBuffer &small, int64_t n) {
@@ -432,7 +465,7 @@ void SeqBackend::release_parked(int64_t parked_id) {
 
 bool SeqBackend::park_budget_left() const {
     bool left = false;  // poisoned: false - the save path takes the host copy (a park needs the GPU anyway)
-    arb_.run(seq_, GpuArbiter::Kind::Hint, [&] { left = arb_.backend().park_budget_left(seq_); });
+    arb_.run_concurrent(seq_, true, [&] { left = arb_.backend().park_budget_left(seq_); });
     return left;
 }
 
