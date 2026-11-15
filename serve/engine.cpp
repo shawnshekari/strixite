@@ -70,6 +70,7 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
     STRIX_CHECK(options_.mtp_margin >= 0.0f, "Engine: mtp_margin ", options_.mtp_margin, ", expected >= 0");
     STRIX_CHECK(options_.mtp_draft >= 1 && options_.mtp_draft <= 15, "Engine: mtp_draft ", options_.mtp_draft,
                 ", expected 1..15");
+    STRIX_CHECK(options_.mtp_margin_slope >= 0.0f, "Engine: mtp_margin_slope must be >= 0");
     STRIX_CHECK(options_.capture_dir.empty() || std::filesystem::is_directory(options_.capture_dir),
                 "Engine: capture_dir '", options_.capture_dir, "' is not a directory");
     (void)ThinkWatch{options_.think_nudge_policy};  // a bad nudge policy fails here, at startup, not on a request
@@ -1527,7 +1528,11 @@ void Engine::run(Job &job, Slot &sl) {
                     const Top2 t = sl.be->forward_mtp_top2(ids.back(), step);
                     STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
                     const int32_t d = t.best;
-                    if (t.best_v - t.second_v < options_.mtp_margin || d == im_end_ || d == eot_) break;
+                    float required_margin = options_.mtp_margin;
+                    if (options_.mtp_escalating_margin) {
+                        required_margin += (float)step * options_.mtp_margin_slope;
+                    }
+                    if (t.best_v - t.second_v < required_margin || d == im_end_ || d == eot_) break;
                     // A <tool_call> drafted inside the think block might need the think close fed ahead of it: no draft.
                     if (d == call_begin_ && options_.think_close_on_call && parser.in_reasoning()) break;
                     // A draft the response format refuses would be rejected anyway: don't verify it.

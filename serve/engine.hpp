@@ -555,6 +555,8 @@ public:
         PromptCache *cache = nullptr;
         float mtp_margin = 1.5f;  // logit margin (top1 - top2) required to draft MTP token
         int64_t mtp_draft = 1;    // most drafts per verify (the head chained), 1..15
+        bool mtp_escalating_margin = true; // escalate MTP margin with draft depth (slope 0.08 per step)
+        float mtp_margin_slope = 0.08f;    // margin increase per draft step in escalating mode
         // Non-empty: every finished request's token ids and MTP steps are written there (serve/capture.hpp). The
         // directory must exist.
         std::string capture_dir;
@@ -621,6 +623,13 @@ public:
     const LmBackend &backend() const { return be_; }
     const PromptCache *prompt_cache() const { return cache_; }
     float mtp_margin() const { return options_.mtp_margin; }
+    int64_t mtp_draft() const { return options_.mtp_draft; }
+    bool mtp_escalating_margin() const { return options_.mtp_escalating_margin; }
+    float mtp_margin_slope() const { return options_.mtp_margin_slope; }
+    void set_mtp_margin(float m) { options_.mtp_margin = m; }
+    void set_mtp_draft(int64_t d) { options_.mtp_draft = d; }
+    void set_mtp_escalating_margin(bool m) { options_.mtp_escalating_margin = m; }
+    void set_mtp_margin_slope(float s) { options_.mtp_margin_slope = s; }
     // The GpuFatalError that stopped the engine (empty: none); submit refuses every request after it.
     std::string fatal_error() const;
     const std::string &degraded() const { return options_.degraded; }
@@ -714,7 +723,7 @@ private:
 
     LmBackend &be_;
     const Tokenizer &tok_;
-    const Options options_;
+    Options options_;
     PromptCache *cache_;
     const int64_t capacity_;
     const int32_t im_start_, im_end_, eot_;

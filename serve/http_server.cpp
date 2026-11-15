@@ -757,6 +757,25 @@ void HttpServer::routes() {
         res.set_content(b.dump(), "application/json");
     });
 
+    auto handle_set_mtp = [this](const httplib::Request &req, httplib::Response &res) {
+        if (req.has_param("margin")) engine_.set_mtp_margin(std::stof(req.get_param_value("margin")));
+        if (req.has_param("draft")) engine_.set_mtp_draft(std::stoll(req.get_param_value("draft")));
+        if (req.has_param("escalating_margin")) {
+            const std::string v = req.get_param_value("escalating_margin");
+            engine_.set_mtp_escalating_margin(v == "1" || v == "on" || v == "true");
+        }
+        if (req.has_param("margin_slope")) engine_.set_mtp_margin_slope(std::stof(req.get_param_value("margin_slope")));
+        json::Value b = json::Value::object();
+        b.set("status", json::Value::string("ok"));
+        b.set("mtp_margin", json::Value::number(engine_.mtp_margin()));
+        b.set("mtp_draft", json::Value::integer(engine_.mtp_draft()));
+        b.set("mtp_escalating_margin", json::Value::boolean(engine_.mtp_escalating_margin()));
+        b.set("mtp_margin_slope", json::Value::number(engine_.mtp_margin_slope()));
+        res.set_content(b.dump(), "application/json");
+    };
+    svr_->Get("/set_mtp", handle_set_mtp);
+    svr_->Post("/set_mtp", handle_set_mtp);
+
     svr_->Get("/metrics", [this](const httplib::Request &, httplib::Response &res) {
         const EngineStats s = engine_.stats();
         std::string m;
