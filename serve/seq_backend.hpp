@@ -60,11 +60,9 @@ public:
     // How many seqs are running a request's decode (the engine sizes its draft chains so their verifies fit one batch).
     int decoding_count() const;
 
-    // How long a waiting verify holds its batch for a decoding seq that hasn't sent its own yet: a tenth of the last
-    // batch's time (that seq's host work between steps - sampling, parsing, streaming - is short next to a forward),
-    // within [kBatchWaitMinSeconds, kBatchWaitMaxSeconds]. A fixed 2 ms let two slots fall out of step (each then
-    // verified alone: 14 of 47 batches held both on a two-client run).
-    static constexpr double kBatchWaitMinSeconds = 0.002, kBatchWaitMaxSeconds = 0.020;
+    // How long a waiting verify holds its batch for a decoding seq that hasn't sent its own yet,
+    // within [kBatchWaitMinSeconds, kBatchWaitMaxSeconds].
+    static constexpr double kBatchWaitMinSeconds = 0.010, kBatchWaitMaxSeconds = 0.020;
     double batch_wait_locked() const;
 
     struct Stats {
@@ -95,8 +93,7 @@ private:
     LmBackend &be_;
     mutable std::mutex mu_;
     std::condition_variable cv_;
-    bool busy_ = false;    // a call or a batch is on the GPU
-    int owner_ = -1;       // the seq whose draft chain is running
+    bool busy_ = false;               // a call or a batch is on the GPU
     std::map<int, Pending> pending_;  // verifies waiting for their batch (and their results until taken)
     std::set<int> resolving_;         // seqs of the last batch that have not kept / dropped yet
     std::set<int> decoding_;
@@ -110,9 +107,6 @@ private:
     // ended. A seq's call waiting (calls_waiting_) blocks other seqs' new chains once a batch ran since that seq's
     // last call (last_call_batch_): chunk, decode step, chunk, ...
     std::multiset<int> calls_waiting_;
-    // Seqs waiting for the GPU to start a draft chain: a batch waits for a decoding seq among them (its verify is a
-    // chain away) instead of timing out on it.
-    std::multiset<int> drafts_waiting_;
     std::vector<int64_t> last_call_batch_;  // per seq: stats_.verify_batches when its last call ran
 };
 

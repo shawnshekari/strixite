@@ -423,6 +423,38 @@ int64_t qwen4exp_routed_experts(const StrixwTensor *gate_up, const Qwen4ExpDims 
 // place), so it is now a member: a snapshot belongs to one state and is valid only against it. Everything else
 // in Qwen4ExpSession is per-forward workspace, sized by the largest forward - shared by the slots.
 // ---------------------------------------------------------------------------
+// Per-slot MTP draft workspace: isolated device & host buffers and an independent HIP stream
+// so draft steps on one slot run overlapped with verify/forward on other slots without serializing.
+// ---------------------------------------------------------------------------
+struct MtpDraftWorkspace {
+    DeviceBuffer<int32_t> ids, route_ids;
+    DeviceBuffer<kernels::EmbeddingError> emb_err;
+    DeviceBuffer<uint32_t> router_err, expert_err, attn_err;
+    DeviceBuffer<uint8_t> mtp_emb, mtp_norm_emb, mtp_norm_hid, mtp_proj_emb, mtp_x;
+    DeviceBuffer<float> mtp_ones;
+    DeviceBuffer<uint8_t> u, proj, core, y, sh_y, gu, hh;
+    DeviceBuffer<float> h, w_in, inv, router_logits, route_coef;
+    DeviceBuffer<float> logits;
+    DeviceBuffer<uint8_t> mtp_pick;
+    PinnedHostBuffer host_pick;
+    DeviceBuffer<float> qsa_scores;
+    DeviceBuffer<int32_t> qsa_sel, qsa_nsel;
+    DeviceBuffer<uint8_t> qsa_topk_ws;
+    size_t qsa_topk_ws_bytes = 0;
+    DeviceBuffer<float> attn_ws;
+    size_t attn_ws_bytes = 0;
+    hipStream_t stream = nullptr;
+    hipEvent_t verify_done_event = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// Qwen4ExpSeqState (feat/multi-sequence): the per-slot mutable state. Everything in Qwen4ExpSession that is
+// carried across forwards for one sequence - the buffers one serving slot owns. A session holds one SeqState per
+// slot and its forward / verify API addresses them by run; with one slot this is exactly the old session state.
+// Qwen4ExpSnapshot already saved and restored exactly this set (plus the K/V below the position, which stays in
+// place), so it is now a member: a snapshot belongs to one state and is valid only against it. Everything else
+// in Qwen4ExpSession is per-forward workspace, sized by the largest forward - shared by the slots.
+// ---------------------------------------------------------------------------
 struct Qwen4ExpSeqState {
     // Allocates the buffers for one position space of `capacity` positions (the MTP head's own K/V cache and
     // indexer keys exist with `mtp`; the K/V layout is `kv`); everything starts at position 0. `chain_rows`:
@@ -432,7 +464,9 @@ struct Qwen4ExpSeqState {
     // layout.slot_offset(slot) - all slots' K/V and the parked region in one reservation, so pages can move
     // between them): every array kv_slot_specs names exists in `layout`.
     Qwen4ExpSeqState(const Qwen4ExpModel &model, int64_t capacity, int64_t chain_rows, bool mtp, KvFormat kv,
-                     VmmReservation &kv_res, const KvReservationLayout &layout, int64_t slot);
+                     VmmReservation &kv_res, const KvReservationLayout &layout, int64_t slot,
+                     PrefillMath prefill_math = PrefillMath::WmmaBf16);
+    ~Qwen4ExpSeqState();
     // The paged arrays' mapping unit. gfx1151: a 2 MiB page is created in ~45 us and mapped pages read at hipMalloc's
     // speed; slack per array is under one page.
     static constexpr size_t kPageBytes = (size_t)2 << 20;
@@ -470,6 +504,7 @@ struct Qwen4ExpSeqState {
     // mtp_input): a chain step's prev is the step before's mtp_x_, so if the stamp moved, another draft or
     // a forward interleaved and the chain must not continue (run_mtp refuses).
     uint64_t mtp_chain_xver = 0;
+    MtpDraftWorkspace mtp_ws;
     // forward_verify's machinery, per state (one verify in flight per state): the spare GDN states it writes
     // (gdn_to_spare during it), what drop_verify puts back, whether a keep / drop is owed, and the verify's
     // saved rows / bookkeeping for keep_verify_prefix.
@@ -968,6 +1003,7 @@ private:
     // The MTP layer's input for the batch rows [row_base, row_base + T): token ids_[row_base + t] with the
     // streams after the position before (prev0 for t = 0, x_ row row_base + t - 1 after it).
     void mtp_input(int64_t row_base, int64_t T, const void *prev0);
+    void mtp_input_seq(Qwen4ExpSeqState &sq, int32_t token_id, const void *prev0);
     // forward_mtp / forward_mtp_top2's shared body: the head's layer and the LM head's logits into logits_ (queued on
     // stream_; broken_ set until the caller's read-back succeeds, which then calls mtp_done(seq, step)).
     void run_mtp(int seq, int32_t token_id, int64_t step);

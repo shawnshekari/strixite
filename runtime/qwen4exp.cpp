@@ -483,7 +483,7 @@ Qwen4ExpDims qwen4exp_dims_from_file(const StrixwFile &f) {
 // slot without a copy - the hand-off is only correct inside one reservation on gfx1151.
 Qwen4ExpSeqState::Qwen4ExpSeqState(const Qwen4ExpModel &model, int64_t capacity, int64_t chain_rows, bool mtp,
                                    KvFormat kv, VmmReservation &kv_res, const KvReservationLayout &layout,
-                                   int64_t slot) : mtp(mtp) {
+                                   int64_t slot, PrefillMath prefill_math) : mtp(mtp) {
     const Qwen4ExpDims &D = model.dims();
     const size_t e = es(model.act());
     const int64_t W = D.hkv * D.hd;
@@ -534,12 +534,94 @@ Qwen4ExpSeqState::Qwen4ExpSeqState(const Qwen4ExpModel &model, int64_t capacity,
         block_keys_mtp = attach("MTP block keys");
         for (int k = 0; k < 2; ++k)
             tail_mtp[k] = DeviceBuffer<uint8_t>((size_t)(3 * D.idx_d) * e, "MTP indexer tail " + std::to_string(k));
-        // mtp_x_'s twin (the session's workspace): a chain step swaps the two, so the step before's output is
-        // kept without a copy - same size, same activation bytes (chain_rows is the workspace's max forward rows).
-        mtp_chain_prev = DeviceBuffer<uint8_t>((size_t)(chain_rows * n4) * e, "MTP chain previous streams");
+        // mtp_x's twin (the per-slot workspace): a chain step swaps the two, so the step before's output is
+        // kept without a copy - same size, same activation bytes.
+        mtp_chain_prev = DeviceBuffer<uint8_t>((size_t)n4 * e, "MTP chain previous streams");
         for (int k = 0; k < 2; ++k)
             mtp_chain_tail[k] = DeviceBuffer<uint8_t>((size_t)(3 * D.idx_d) * e,
                                                        "MTP chain indexer tail " + std::to_string(k));
+
+        // Isolated MTP draft workspace for overlapped / asynchronous drafting:
+        auto &ws = this->mtp_ws;
+        ws.ids = DeviceBuffer<int32_t>(1, "MTP draft id");
+        ws.emb_err = DeviceBuffer<kernels::EmbeddingError>(1, "MTP draft embedding error");
+        ws.router_err = DeviceBuffer<uint32_t>(3, "MTP draft router error");
+        ws.expert_err = DeviceBuffer<uint32_t>(3, "MTP draft expert error");
+        ws.attn_err = DeviceBuffer<uint32_t>(3, "MTP draft attention error");
+        STRIX_HIP_CHECK(hipMemset(ws.emb_err.get(), 0, sizeof(kernels::EmbeddingError)), "zero MTP emb error");
+        STRIX_HIP_CHECK(hipMemset(ws.router_err.get(), 0, 3 * sizeof(uint32_t)), "zero MTP router error");
+        STRIX_HIP_CHECK(hipMemset(ws.expert_err.get(), 0, 3 * sizeof(uint32_t)), "zero MTP expert error");
+        STRIX_HIP_CHECK(hipMemset(ws.attn_err.get(), 0, 3 * sizeof(uint32_t)), "zero MTP attn error");
+
+        ws.mtp_emb = DeviceBuffer<uint8_t>((size_t)D.d * e, "MTP draft emb");
+        ws.mtp_norm_emb = DeviceBuffer<uint8_t>((size_t)D.d * e, "MTP draft norm emb");
+        ws.mtp_norm_hid = DeviceBuffer<uint8_t>((size_t)n4 * e, "MTP draft norm hid");
+        ws.mtp_proj_emb = DeviceBuffer<uint8_t>((size_t)D.d * e, "MTP draft proj emb");
+        ws.mtp_x = DeviceBuffer<uint8_t>((size_t)n4 * e, "MTP draft x");
+
+        std::vector<float> ones((size_t)D.H, 1.0f);
+        ws.mtp_ones = DeviceBuffer<float>((size_t)D.H, "MTP draft ones");
+        STRIX_HIP_CHECK(hipMemcpy(ws.mtp_ones.get(), ones.data(), ones.size() * sizeof(float), hipMemcpyHostToDevice),
+                        "MTP draft ones");
+
+        ws.u = DeviceBuffer<uint8_t>((size_t)D.d * e, "MTP draft u");
+        ws.proj = DeviceBuffer<uint8_t>((size_t)D.astride * e, "MTP draft proj");
+        ws.core = DeviceBuffer<uint8_t>((size_t)std::max(D.gz, D.hq * D.hd) * e, "MTP draft core");
+        ws.y = DeviceBuffer<uint8_t>((size_t)n4 * e, "MTP draft y");
+        if (model.shared_separate())
+            ws.sh_y = DeviceBuffer<uint8_t>((size_t)D.d * e, "MTP draft shared expert output");
+        const int64_t A = D.top_k + (model.shared_separate() ? 0 : 1);
+        ws.gu = DeviceBuffer<uint8_t>((size_t)(A * 2 * D.inter) * e, "MTP draft gate up");
+        ws.hh = DeviceBuffer<uint8_t>((size_t)(A * D.inter) * e, "MTP draft hh");
+
+        ws.h = DeviceBuffer<float>((size_t)D.r, "MTP draft hc low-rank");
+        ws.w_in = DeviceBuffer<float>((size_t)D.H, "MTP draft w_in");
+        ws.inv = DeviceBuffer<float>((size_t)D.H, "MTP draft inv");
+
+        ws.router_logits = DeviceBuffer<float>((size_t)(D.experts + 1), "MTP draft router logits");
+        ws.route_ids = DeviceBuffer<int32_t>((size_t)A, "MTP draft route ids");
+        ws.route_coef = DeviceBuffer<float>((size_t)A, "MTP draft route coef");
+
+        ws.logits = DeviceBuffer<float>((size_t)D.vocab, "MTP draft logits");
+        ws.mtp_pick = DeviceBuffer<uint8_t>(sizeof(kernels::MtpPick), "MTP draft pick dev");
+        ws.host_pick = PinnedHostBuffer(sizeof(kernels::MtpPick), "MTP draft pick host");
+
+        const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
+        const int64_t cap_blocks = (capacity + kernels::kQsaBlock - 1) / kernels::kQsaBlock;
+        const bool qsa = capacity > D.dense_key_limit();
+
+        const kernels::AttentionShape s{1, capacity - 1, D.hq, D.hkv, D.hd, D.astride, 2 * D.hd};
+        ws.attn_ws_bytes = kernels::attention_workspace_bytes(s);
+        if (qsa) ws.attn_ws_bytes = std::max(ws.attn_ws_bytes, kernels::attention_gathered_workspace_bytes(s, qsa_k));
+        ws.attn_ws_bytes = std::max(ws.attn_ws_bytes,
+            kernels::attention_wmma_workspace_bytes({1, 0, D.hq, D.hkv, D.hd, D.astride, 2 * D.hd}));
+        if (qsa) ws.attn_ws_bytes = std::max(ws.attn_ws_bytes,
+            kernels::attention_gathered_wmma_workspace_bytes(s, qsa_k));
+        ws.attn_ws = DeviceBuffer<float>(ws.attn_ws_bytes / 4 + 1, "MTP draft attn ws");
+
+        if (qsa) {
+            ws.qsa_scores = DeviceBuffer<float>((size_t)cap_blocks, "MTP draft QSA scores");
+            ws.qsa_sel = DeviceBuffer<int32_t>((size_t)qsa_k, "MTP draft QSA sel");
+            ws.qsa_nsel = DeviceBuffer<int32_t>(1, "MTP draft QSA nsel");
+            ws.qsa_topk_ws_bytes = kernels::qsa_topk_workspace_bytes(1);
+            ws.qsa_topk_ws = DeviceBuffer<uint8_t>(ws.qsa_topk_ws_bytes, "MTP draft QSA topk ws");
+            STRIX_HIP_CHECK(hipMemset(ws.qsa_topk_ws.get(), 0, ws.qsa_topk_ws_bytes), "zero QSA topk ws");
+        }
+
+        STRIX_HIP_CHECK(hipStreamCreateWithFlags(&ws.stream, hipStreamNonBlocking), "MTP draft stream");
+        STRIX_HIP_CHECK(hipEventCreateWithFlags(&ws.verify_done_event, hipEventDisableTiming), "MTP draft verify_done_event");
+    }
+}
+
+Qwen4ExpSeqState::~Qwen4ExpSeqState() {
+    if (mtp_ws.stream) {
+        (void)hipStreamSynchronize(mtp_ws.stream);
+        (void)hipStreamDestroy(mtp_ws.stream);
+        mtp_ws.stream = nullptr;
+    }
+    if (mtp_ws.verify_done_event) {
+        (void)hipEventDestroy(mtp_ws.verify_done_event);
+        mtp_ws.verify_done_event = nullptr;
     }
 }
 
@@ -997,7 +1079,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     kv_res_ = std::make_unique<VmmReservation>(kv_layout_.total_bytes, Qwen4ExpSeqState::kPageBytes, "K/V reservation");
     const uint64_t avail0 = mem_available_bytes();
     seqs_.push_back(std::make_unique<Qwen4ExpSeqState>(m_, capacity, max_tokens, mtp, kv, *kv_res_, kv_layout_,
-                                                        /*slot=*/0));
+                                                        /*slot=*/0, prefill_math_));
     const uint64_t avail1 = mem_available_bytes();
     const uint64_t slot_cost = avail0 > avail1 ? avail0 - avail1 : 0;  // what one slot's state took from RAM
     auto act_buf = [&](int64_t per_token, const std::string &name) {
@@ -1120,7 +1202,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
                     " MiB would leave less than the ", kSlotFloorBytes >> 30, " GiB floor after it - ", k,
                     " slot(s) fit: lower total-slots (or the capacity)");
         seqs_.push_back(std::make_unique<Qwen4ExpSeqState>(m_, capacity, max_tokens, mtp, kv, *kv_res_, kv_layout_,
-                                                            /*slot=*/k));
+                                                            /*slot=*/k, prefill_math_));
     }
     reset();
 }
@@ -1634,8 +1716,11 @@ void Qwen4ExpSession::reset_seq_state(Qwen4ExpSeqState &s) {
         s.pos3_start = 0;
         s.pos3_host.clear(), s.pending3.clear(), s.verify_hist_before.clear();
         s.imported_at = -1;
-        if (mtp_)  // position 0's MTP row pairs its token with no trunk state: zeros
+        if (mtp_) {  // position 0's MTP row pairs its token with no trunk state: zeros
             STRIX_HIP_CHECK(hipMemset(s.mtp_prev.get(), 0, s.mtp_prev.size()), "Qwen4ExpSession: zero MTP previous streams");
+            if (s.mtp_ws.verify_done_event)
+                STRIX_HIP_CHECK(hipEventRecord(s.mtp_ws.verify_done_event, stream_), "record verify_done_event on reset");
+        }
         if (m_.dims().ple_layer >= 0) {
             STRIX_HIP_CHECK(hipMemset(s.ple_state.get(), 0, s.ple_state.size()), "Qwen4ExpSession: zero PLE state");
             s.ple_hist = PleHistory::fresh(m_.ngram_rows().hash_params());
@@ -2737,7 +2822,7 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
     // set_positions can keep checking continuations. Text-only forwards: both no-ops, no upload, no allocation.
     // After broken_ = true: a mismatching span (rows != T) takes the session down cleanly instead of leaving
     // a half-consumed history.
-    broken_ = true;
+    try {
     for (Run &r : runs) {
         Qwen4ExpSeqState &sq = *r.sq;
         if (!sq.pending3.empty()) {
@@ -3301,13 +3386,18 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
             STRIX_HIP_CHECK(hipMemcpyAsync(sq.mtp_prev.get(), at(x_, (r.base + r.Tr - 1) * n4), (size_t)n4 * e,
                                            hipMemcpyDeviceToDevice, stream_),
                             "MTP previous streams");
+            if (sq.mtp_ws.verify_done_event)
+                STRIX_HIP_CHECK(hipEventRecord(sq.mtp_ws.verify_done_event, stream_), "record verify_done_event on forward");
         }
     }
     std::vector<float> logits = cands ? read_back(0, "", n_logits) : read_back((size_t)(n_logits * D.vocab), "");
     for (Run &r : runs) r.sq->pos += r.Tr, r.sq->verify_carry = 0;  // the run's rows consumed its carried token
-    broken_ = false;
     for (Run &r : runs) r.sq->mtp_chain_step = -1;
     return logits;
+    } catch (...) {
+        broken_ = true;
+        throw;
+    }
 }std::vector<float> Qwen4ExpSession::forward_verify(const std::vector<int32_t> &ids, int64_t n_logits,
                                                    const std::vector<int64_t> &pos3) {
     const int64_t pending = pending_verify_seq();
@@ -3476,6 +3566,8 @@ void Qwen4ExpSession::drop_verify(int seq) {
 void Qwen4ExpSession::drop_verify_seq(Qwen4ExpSeqState &sq) {
     copy_state(sq.ple_state_kept, sq.ple_state, stream_, "PLE conv state");
     copy_state(sq.mtp_prev_kept, sq.mtp_prev, stream_, "MTP previous streams");
+    if (sq.mtp_ws.verify_done_event)
+        STRIX_HIP_CHECK(hipEventRecord(sq.mtp_ws.verify_done_event, stream_), "record verify_done_event on drop_verify");
     STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::drop_verify");
     sq.pos = sq.verify_pos, sq.tail_cur = sq.verify_tail_cur, sq.mtp_tail_cur = sq.verify_mtp_tail_cur,
         sq.ple_hist = sq.verify_hist;
@@ -3540,7 +3632,7 @@ void Qwen4ExpSession::keep_verify_prefix_seq(Qwen4ExpSeqState &sq, int64_t rows)
     // block completed within the kept rows replay with its first row's triple / the scalar base + delta -
     // exactly like the verify's own forward did.
     prepare_positions(sq, p0, rows);
-    broken_ = true;  // until the state is whole again
+    try {  // until the state is whole again
     for (int64_t i = 0; i < D.layers; ++i) {
         const Qwen4ExpModel::Layer &l = m_.layer(i);
         const size_t li = (size_t)i;
@@ -3597,6 +3689,8 @@ void Qwen4ExpSession::keep_verify_prefix_seq(Qwen4ExpSeqState &sq, int64_t rows)
         STRIX_HIP_CHECK(hipMemcpyAsync(sq.mtp_prev.get(), x_.get() + (size_t)((rbase + rows - 1) * n4) * e,
                                        (size_t)n4 * e, hipMemcpyDeviceToDevice, stream_),
                         "Qwen4ExpSession::keep_verify_prefix: MTP previous streams");
+        if (sq.mtp_ws.verify_done_event)
+            STRIX_HIP_CHECK(hipEventRecord(sq.mtp_ws.verify_done_event, stream_), "record verify_done_event on keep_verify_prefix");
     }
     STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::keep_verify_prefix");
     // The n-gram history: the one before the verify, advanced over the kept ids.
@@ -3621,7 +3715,10 @@ void Qwen4ExpSession::keep_verify_prefix_seq(Qwen4ExpSeqState &sq, int64_t rows)
     sq.mtp_chain_step = -1;
     sq.rewind_to.push_back(sq.pos);  // the verify's rows past sq.pos get overwritten: snapshots beyond it no longer match
     sq.verify_pending = false, sq.verify_rows = 0, sq.verify_carry = 0;
-    broken_ = false;
+    } catch (...) {
+        broken_ = true;
+        throw;
+    }
 }
 
 void Qwen4ExpSession::set_mtp_vocab(int64_t n) {
@@ -3674,13 +3771,46 @@ void Qwen4ExpSession::mtp_input(int64_t row_base, int64_t T, const void *prev0) 
     ++mtp_x_version_;  // the head's rows were rewritten (the draft chain's interruption stamp, see the field)
 }
 
+void Qwen4ExpSession::mtp_input_seq(Qwen4ExpSeqState &sq, int32_t token_id, const void *prev0) {
+    STRIX_CHECK(mtp_, "Qwen4ExpSession::mtp_input_seq: MTP is off");
+    auto &ws = sq.mtp_ws;
+    const Qwen4ExpDims &D = m_.dims();
+    const Act act = m_.act();
+    const Qwen4ExpModel::MtpHead &mtp = m_.mtp();
+    hipStream_t stream = ws.stream;
+
+    STRIX_HIP_CHECK(hipMemcpyAsync(ws.ids.get(), &token_id, sizeof(int32_t), hipMemcpyHostToDevice, stream),
+                    "uploading MTP token id");
+    kernels::reset_embedding_error(ws.emb_err.get(), stream);
+
+    if (m_.is_embed_q8())
+        kernels::embedding_lookup(ws.ids.get(), 1, m_.embed_q8(), ws.mtp_emb.get(), act,
+                                  ws.emb_err.get(), stream);
+    else
+        kernels::embedding_lookup(ws.ids.get(), 1, m_.embed(), D.vocab, D.d, ws.mtp_emb.get(), act,
+                                  ws.emb_err.get(), stream);
+
+    kernels::rmsnorm_zc(ws.mtp_emb.get(), mtp.pre_fc_norm_embedding, ws.mtp_norm_emb.get(), 1, D.d, D.eps, act, stream);
+    STRIX_CHECK(prev0 != nullptr, "Qwen4ExpSession::mtp_input_seq: null previous streams");
+    kernels::group_rmsnorm_zc(prev0, mtp.pre_fc_norm_hidden, ws.mtp_norm_hid.get(), 1, D.H, D.d, D.eps, act, stream);
+
+    kernels::linear_qw(ws.mtp_norm_emb.get(), mtp.fc_embedding, ws.mtp_proj_emb.get(), 1, act, act, stream);
+    kernels::linear_qw(ws.mtp_norm_hid.get(), mtp.fc_hidden, ws.mtp_x.get(), D.H, act, act, stream);
+    kernels::hc_inject(ws.mtp_x.get(), ws.mtp_ones.get(), ws.mtp_proj_emb.get(), 1, D.H, D.d, act, stream);
+}
+
 std::vector<float> Qwen4ExpSession::forward_mtp(int32_t token_id, int64_t step) {
     return forward_mtp_seq(0, token_id, step);
 }
 
 std::vector<float> Qwen4ExpSession::forward_mtp_seq(int seq, int32_t token_id, int64_t step) {
     run_mtp(seq, token_id, step);
-    std::vector<float> logits = read_back((size_t)mtp_vocab_, " MTP");
+    auto &ws = seqs_[(size_t)seq]->mtp_ws;
+    std::vector<float> logits((size_t)mtp_vocab_);
+    STRIX_HIP_CHECK(hipMemcpyAsync(logits.data(), ws.logits.get(), (size_t)mtp_vocab_ * sizeof(float),
+                                   hipMemcpyDeviceToHost, ws.stream),
+                    "reading back MTP logits");
+    STRIX_HIP_CHECK(hipStreamSynchronize(ws.stream), "syncing MTP stream");
     mtp_done(seq, step);
     return logits;
 }
@@ -3691,17 +3821,15 @@ Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2(int32_t token_id, int
 
 Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2_seq(int seq, int32_t token_id, int64_t step) {
     run_mtp(seq, token_id, step);
-    if (mtp_pick_.size() == 0) mtp_pick_ = DeviceBuffer<uint8_t>(sizeof(kernels::MtpPick), "MTP pick");
-    auto *dev = reinterpret_cast<kernels::MtpPick *>(mtp_pick_.get());
-    kernels::mtp_pick(logits_.get(), mtp_vocab_, router_err_.get(), expert_err_.get(), attn_err_.get(),
-                      emb_err_.get(), dev, stream_);
-    // One copy into the pinned area (the logits' part - unused here) behind the forward, one synchronize.
-    STRIX_CHECK(readback_.size() >= kReadbackLogitsAt + sizeof(kernels::MtpPick),
-                "Qwen4ExpSession::forward_mtp_top2: pinned area of ", readback_.size(), " bytes");
-    auto *host = reinterpret_cast<kernels::MtpPick *>(static_cast<uint8_t *>(readback_.get()) + kReadbackLogitsAt);
-    STRIX_HIP_CHECK(hipMemcpyAsync(host, dev, sizeof(kernels::MtpPick), hipMemcpyDeviceToHost, stream_),
+    auto &ws = seqs_[(size_t)seq]->mtp_ws;
+    hipStream_t stream = ws.stream;
+    auto *dev = reinterpret_cast<kernels::MtpPick *>(ws.mtp_pick.get());
+    kernels::mtp_pick(ws.logits.get(), mtp_vocab_, ws.router_err.get(), ws.expert_err.get(), ws.attn_err.get(),
+                      reinterpret_cast<kernels::EmbeddingError *>(ws.emb_err.get()), dev, stream);
+    auto *host = reinterpret_cast<kernels::MtpPick *>(ws.host_pick.get());
+    STRIX_HIP_CHECK(hipMemcpyAsync(host, dev, sizeof(kernels::MtpPick), hipMemcpyDeviceToHost, stream),
                     "Qwen4ExpSession::forward_mtp_top2: the pick");
-    STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::forward_mtp_top2: end of the draft");
+    STRIX_HIP_CHECK(hipStreamSynchronize(stream), "Qwen4ExpSession::forward_mtp_top2: end of the draft");
     const kernels::MtpPick p = *host;
     kernels::report_router_error(p.err, "Qwen4ExpSession MTP router");
     kernels::report_expert_error(p.err + 3, "Qwen4ExpSession MTP experts");
@@ -3714,10 +3842,8 @@ Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2_seq(int seq, int32_t 
 }
 
 void Qwen4ExpSession::mtp_done(int seq, int64_t step) {
-    broken_ = false;
     Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
     sq.mtp_chain_step = step, sq.mtp_chain_pos = sq.pos;
-    sq.mtp_chain_xver = mtp_x_version_;  // this step's streams are in mtp_x_ up to this version (run_mtp checks)
 }
 
 void Qwen4ExpSession::run_mtp(int seq, int32_t token_id, int64_t step) {
@@ -3726,28 +3852,23 @@ void Qwen4ExpSession::run_mtp(int seq, int32_t token_id, int64_t step) {
     STRIX_CHECK(mtp_, fn, ": the session was made without MTP");
     STRIX_CHECK(seq >= 0 && seq < n_slots(), fn, ": seq ", seq, ", expected 0..", n_slots() - 1);
     Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
-    STRIX_CHECK(!broken_, fn, ": an earlier call failed midway; reset() the session first");
+    STRIX_CHECK(!broken_, fn, ": an earlier session call failed midway; reset() the session first");
+    auto &ws = sq.mtp_ws;
+    hipStream_t stream = ws.stream;
     const Qwen4ExpDims &D = m_.dims();
     STRIX_CHECK(token_id >= 0 && token_id < D.vocab, fn, ": token ", token_id, " outside [0, ", D.vocab, ")");
     STRIX_CHECK(step >= 0, fn, ": step ", step, ", expected >= 0");
-    const int64_t pending = pending_verify_seq();
-    STRIX_CHECK(pending < 0, fn, ": a forward_verify on seq ", pending,
-                " awaits keep_verify / drop_verify - resolve the pending batch before drafting");
-    // The batched MTP cycle's ordering (design "MTP cycle in the batched world"): a slot drafts its whole
-    // chain before the next slot's starts (the batched verify then resolves them together). The draft's
-    // streams live in the shared mtp_x_ (swapped against the state's chain buffer), so the ONE thing that
-    // must not happen is a chain left half-written while another draft (or forward) overwrites mtp_x_: the
-    // version stamp below catches exactly that. A finished, not-yet-verified chain does not block another
-    // slot's fresh chain (its last step's streams are not read again - the trunk verify re-derives them),
-    // and no verify may be pending (checked above - the shared workspaces are the verify's).
+    STRIX_CHECK(!sq.verify_pending, fn, ": seq ", seq,
+                " awaits keep_verify / drop_verify - resolve before drafting");
+
+    if (step == 0 && ws.verify_done_event) {
+        STRIX_HIP_CHECK(hipStreamWaitEvent(stream, ws.verify_done_event, 0), "waiting for stream_ verify_done_event");
+    }
+
     STRIX_CHECK(step == 0 || (sq.mtp_chain_pos == sq.pos && sq.mtp_chain_step == step - 1), fn, ": step ",
                 step, " doesn't continue a chain (last step ", sq.mtp_chain_step, " at position ", sq.mtp_chain_pos,
                 ", now at ", sq.pos, ")");
-    if (step > 0)
-        STRIX_CHECK(sq.mtp_chain_xver == mtp_x_version_, fn, ": seq ", seq, "'s draft chain (step ", step,
-                    ") was interrupted - mtp_x_ was written ", mtp_x_version_ - (uint64_t)sq.mtp_chain_xver,
-                    " time(s) since its step ", step - 1, " (another draft or a forward ran mid-chain) - finish"
-                    " a chain before drafting another slot's");
+
     const int64_t p = sq.pos + step;  // this row's sequence position (cache row, dense checks; rope angle below)
     STRIX_CHECK(p < capacity_, fn, ": position ", p, " is at the capacity ", capacity_);
     STRIX_CHECK(sq.pending3.empty(), fn, ": set_positions holds ", sq.pending3.size() / 3,
@@ -3757,26 +3878,25 @@ void Qwen4ExpSession::run_mtp(int seq, int32_t token_id, int64_t step) {
     const size_t e = es(act);
     const bool sep = m_.shared_separate();
     const int64_t T = 1, A = D.top_k + (sep ? 0 : 1), hd = D.hd;
-    // mRoPE: the draft row continues the (scalar) text span, so its angle sits at rope_pos(p) = p +
-    // rope_delta; the indexer block window may reach an image tail, so its block keys use the history's
-    // triples. History rows past p can't exist (no forward ran since the last keep / drop).
-    prepare_positions(sq, p, T);
-    const int64_t rope_p = mk_jobs_.pos3 == nullptr ? p + sq.rope_delta : p;
+
+    ensure_rows(sq, p + T);
+    const int64_t rope_p = p + sq.rope_delta;
+    const kernels::MropePos no_mrope{};
     const Qwen4ExpModel::MtpHead &mtp = m_.mtp();
     const Qwen4ExpModel::Layer &l = mtp.layer;
     auto at = [&](const DeviceBuffer<uint8_t> &b, int64_t elem) { return b.get() + (size_t)elem * e; };
     auto hc_mix = [&](const Qwen4ExpModel::Hc &hc, bool inject) {
-        float *w_in = inject ? w_in_.get() : nullptr;
+        float *w_in = inject ? ws.w_in.get() : nullptr;
         if (hc.down.bits == 8)
-            kernels::hc_mix_down(mtp_x_.get(), hc.down.q8, T, D.H, D.d, D.r, inject, D.eps, h_.get(), w_in, inv_.get(), act, stream_);
+            kernels::hc_mix_down(ws.mtp_x.get(), hc.down.q8, T, D.H, D.d, D.r, inject, D.eps, ws.h.get(), w_in, ws.inv.get(), act, stream);
         else
-            kernels::hc_mix_down(mtp_x_.get(), hc.down.q4, T, D.H, D.d, D.r, inject, D.eps, h_.get(), w_in, inv_.get(), act, stream_);
+            kernels::hc_mix_down(ws.mtp_x.get(), hc.down.q4, T, D.H, D.d, D.r, inject, D.eps, ws.h.get(), w_in, ws.inv.get(), act, stream);
         if (hc.up.bits == 8)
-            kernels::hc_mix_up(h_.get(), hc.up.q8, mtp_x_.get(), hc.norm, inv_.get(), T, D.H, D.d, u_.get(), act, stream_);
+            kernels::hc_mix_up(ws.h.get(), hc.up.q8, ws.mtp_x.get(), hc.norm, ws.inv.get(), T, D.H, D.d, ws.u.get(), act, stream);
         else
-            kernels::hc_mix_up(h_.get(), hc.up.q4, mtp_x_.get(), hc.norm, inv_.get(), T, D.H, D.d, u_.get(), act, stream_);
+            kernels::hc_mix_up(ws.h.get(), hc.up.q4, ws.mtp_x.get(), hc.norm, ws.inv.get(), T, D.H, D.d, ws.u.get(), act, stream);
     };
-    broken_ = true;
+
     sq.mtp_chain_step = -1;
     // Indexer tails: step 0 continues the committed tail into the spare buffer (not flipped); chain steps continue
     // from the step before into their own pair.
@@ -3785,33 +3905,31 @@ void Qwen4ExpSession::run_mtp(int seq, int32_t token_id, int64_t step) {
                                       : sq.mtp_chain_tail[step % 2].get();
     void *tail_out = step == 0 ? sq.tail_mtp[1 - sq.mtp_tail_cur].get() : sq.mtp_chain_tail[(step + 1) % 2].get();
     if (step > 0) {  // the step before's output streams, kept by swapping buffers (mtp_input overwrites mtp_x_)
-        STRIX_CHECK(sq.mtp_chain_prev.size() == mtp_x_.size(), "Qwen4ExpSession: MTP chain buffers ", sq.mtp_chain_prev.size(),
-                    " / ", mtp_x_.size(), " bytes, expected equal (they're swapped)");
-        std::swap(mtp_x_, sq.mtp_chain_prev);
+        STRIX_CHECK(sq.mtp_chain_prev.size() == ws.mtp_x.size(), "Qwen4ExpSession: MTP chain buffers ", sq.mtp_chain_prev.size(),
+                    " / ", ws.mtp_x.size(), " bytes, expected equal (they're swapped)");
+        std::swap(ws.mtp_x, sq.mtp_chain_prev);
     }
-    STRIX_HIP_CHECK(hipMemcpyAsync(ids_.get(), &token_id, 4, hipMemcpyHostToDevice, stream_), "uploading the MTP token id");
-    kernels::reset_embedding_error(emb_err_.get(), stream_);
-    mtp_input(0, T, step == 0 ? sq.mtp_prev.get() : sq.mtp_chain_prev.get());
+    mtp_input_seq(sq, token_id, step == 0 ? sq.mtp_prev.get() : sq.mtp_chain_prev.get());
 
     // The layer, as a trunk full-attention layer at position p. Step 0's KV row and block keys are the ones the next
     // forward's catch-up writes again from the same inputs; a chain step's, until the position runs, its guess.
     hc_mix(l.hc_attn, true);
     uint8_t *kc = sq.k_cache_mtp.get(), *vc = sq.v_cache_mtp.get();
-    kernels::linear_qw(u_.get(), l.qkv, proj_.get(), T, act, act, stream_);
+    kernels::linear_qw(ws.u.get(), l.qkv, ws.proj.get(), T, act, act, stream);
     // q, k, v and (past the dense limit) the indexer queries in one launch, as in the trunk's layers.
     const bool qsa_layer = p + T > D.dense_key_limit();
     const kernels::NormRopeJob nr[4] = {
-        {proj_.get(), D.astride, 2 * hd, proj_.get(), D.astride, 2 * hd, D.hq, hd, l.q_norm},
-        {at(proj_, D.hq * 2 * hd), D.astride, hd, kc + (size_t)(p * D.hkv * hd) * e, D.hkv * hd, hd, D.hkv, hd, l.k_norm},
-        {at(proj_, D.hq * 2 * hd + D.hkv * hd), D.astride, hd, vc + (size_t)(p * D.hkv * hd) * e, D.hkv * hd, hd, D.hkv,
+        {ws.proj.get(), D.astride, 2 * hd, ws.proj.get(), D.astride, 2 * hd, D.hq, hd, l.q_norm},
+        {at(ws.proj, D.hq * 2 * hd), D.astride, hd, kc + (size_t)(p * D.hkv * hd) * e, D.hkv * hd, hd, D.hkv, hd, l.k_norm},
+        {at(ws.proj, D.hq * 2 * hd + D.hkv * hd), D.astride, hd, vc + (size_t)(p * D.hkv * hd) * e, D.hkv * hd, hd, D.hkv,
          hd, nullptr},
-        {at(proj_, D.idx_col), D.astride, D.idx_d, at(proj_, D.idx_col), D.astride, D.idx_d, D.idx_h, D.idx_d,
+        {at(ws.proj, D.idx_col), D.astride, D.idx_d, at(ws.proj, D.idx_col), D.astride, D.idx_d, D.idx_h, D.idx_d,
          l.idx_q_norm}};
-    kernels::qk_norm_rope_jobs(nr, qsa_layer ? 4 : 3, T, D.eps, D.rot, rope_p, m_.inv_freq(), act, stream_,
-                               m_.rope_scale(), mk_jobs_);
-    kernels::qsa_block_keys(at(proj_, D.idx_col + D.idx_h * D.idx_d), D.astride, T, p,
+    kernels::qk_norm_rope_jobs(nr, qsa_layer ? 4 : 3, T, D.eps, D.rot, rope_p, m_.inv_freq(), act, stream,
+                               m_.rope_scale(), no_mrope);
+    kernels::qsa_block_keys(at(ws.proj, D.idx_col + D.idx_h * D.idx_d), D.astride, T, p,
                             p % kernels::kQsaBlock ? tail_in : nullptr, tail_out, D.idx_d, l.idx_k_norm, D.eps, m_.inv_freq(),
-                            D.rot, sq.block_keys_mtp.get(), cap_blocks_, act, stream_, m_.rope_scale(), mk_block_);
+                            D.rot, sq.block_keys_mtp.get(), cap_blocks_, act, stream, m_.rope_scale(), no_mrope);
     const kernels::AttentionShape as{T, p, D.hq, D.hkv, hd, D.astride, 2 * hd};
     const float scale = 1.0f / std::sqrt((float)hd);
     // The head's own layer, as a trunk full-attention layer: the same dispatch, including the matrix-unit
@@ -3821,49 +3939,49 @@ void Qwen4ExpSession::run_mtp(int seq, int32_t token_id, int64_t step) {
     const bool wmma_attn = prefill_math_ == PrefillMath::WmmaBf16 && act == Act::BF16 && T >= kWmmaAttnMinTokens;
     if (!qsa_layer) {
         if (wmma_attn)
-            kernels::attention_wmma(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, scale, core_.get(),
-                                    attn_ws_.get(), attn_ws_bytes_, act, stream_, precision_.attention);
+            kernels::attention_wmma(ws.proj.get(), at(ws.proj, hd), kc, vc, capacity_, as, scale, ws.core.get(),
+                                    ws.attn_ws.get(), ws.attn_ws_bytes, act, stream, precision_.attention);
         else
-            kernels::attention(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, scale, core_.get(), attn_ws_.get(),
-                               attn_ws_bytes_, act, stream_);
+            kernels::attention(ws.proj.get(), at(ws.proj, hd), kc, vc, capacity_, as, scale, ws.core.get(), ws.attn_ws.get(),
+                               ws.attn_ws_bytes, act, stream);
     } else {
         const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
-        void *iq = at(proj_, D.idx_col);  // normed + roped by the qk_norm_rope_jobs above
+        void *iq = at(ws.proj, D.idx_col);  // normed + roped by the qk_norm_rope_jobs above
         kernels::qsa_scores(iq, D.astride, D.idx_d, T, p, D.idx_h, D.idx_d, sq.block_keys_mtp.get(), cap_blocks_,
-                            qsa_scores_.get(), cap_blocks_, act, stream_);
-        kernels::qsa_topk(qsa_scores_.get(), cap_blocks_, T, p, qsa_k, qsa_sel_.get(), qsa_nsel_.get(),
-                          qsa_topk_ws_.get(), qsa_topk_ws_bytes_, stream_);
+                            ws.qsa_scores.get(), cap_blocks_, act, stream);
+        kernels::qsa_topk(ws.qsa_scores.get(), cap_blocks_, T, p, qsa_k, ws.qsa_sel.get(), ws.qsa_nsel.get(),
+                          ws.qsa_topk_ws.get(), ws.qsa_topk_ws_bytes, stream);
         if (wmma_attn)
-            kernels::attention_gathered_wmma(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, qsa_sel_.get(),
-                                              qsa_nsel_.get(), qsa_k, scale, core_.get(), attn_ws_.get(),
-                                              attn_ws_bytes_, attn_err_.get(), act, stream_, precision_.attention);
+            kernels::attention_gathered_wmma(ws.proj.get(), at(ws.proj, hd), kc, vc, capacity_, as, ws.qsa_sel.get(),
+                                              ws.qsa_nsel.get(), qsa_k, scale, ws.core.get(), ws.attn_ws.get(),
+                                              ws.attn_ws_bytes, ws.attn_err.get(), act, stream, precision_.attention);
         else
-            kernels::attention_gathered(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, qsa_sel_.get(),
-                                        qsa_nsel_.get(), qsa_k, scale, core_.get(), attn_ws_.get(), attn_ws_bytes_,
-                                        attn_err_.get(), act, stream_);
+            kernels::attention_gathered(ws.proj.get(), at(ws.proj, hd), kc, vc, capacity_, as, ws.qsa_sel.get(),
+                                        ws.qsa_nsel.get(), qsa_k, scale, ws.core.get(), ws.attn_ws.get(), ws.attn_ws_bytes,
+                                        ws.attn_err.get(), act, stream);
     }
-    kernels::linear_qw(core_.get(), l.o_proj, y_.get(), T, act, act, stream_);
-    kernels::hc_inject(mtp_x_.get(), w_in_.get(), y_.get(), T, D.H, D.d, act, stream_);
+    kernels::linear_qw(ws.core.get(), l.o_proj, ws.y.get(), T, act, act, stream);
+    kernels::hc_inject(ws.mtp_x.get(), ws.w_in.get(), ws.y.get(), T, D.H, D.d, act, stream);
 
     hc_mix(l.hc_mlp, true);
-    kernels::linear_bf16w(u_.get(), l.router, router_logits_.get(), T, D.experts + 1, D.d, act, Act::F32, stream_);
-    kernels::moe_router(router_logits_.get(), D.experts + 1, T, D.experts, D.top_k,
-                        sep ? nullptr : router_logits_.get() + D.experts, D.experts + 1, (int32_t)D.experts,
-                        route_ids_.get(), route_coef_.get(), Act::F32, router_err_.get(), stream_);
+    kernels::linear_bf16w(ws.u.get(), l.router, ws.router_logits.get(), T, D.experts + 1, D.d, act, Act::F32, stream);
+    kernels::moe_router(ws.router_logits.get(), D.experts + 1, T, D.experts, D.top_k,
+                        sep ? nullptr : ws.router_logits.get() + D.experts, D.experts + 1, (int32_t)D.experts,
+                        ws.route_ids.get(), ws.route_coef.get(), Act::F32, ws.router_err.get(), stream);
     const int64_t Estack = D.experts + (sep ? 0 : 1);
-    kernels::linear_qw_experts_gather_swiglu(u_.get(), l.gate_up, Estack, route_ids_.get(), T, A, hh_.get(), act,
-                                             expert_err_.get(), stream_);
-    kernels::linear_qw_experts_combine(hh_.get(), l.down, Estack, route_ids_.get(), route_coef_.get(), T, A, y_.get(),
-                                       act, expert_err_.get(), stream_);
+    kernels::linear_qw_experts_gather_swiglu(ws.u.get(), l.gate_up, Estack, ws.route_ids.get(), T, A, ws.hh.get(), act,
+                                             ws.expert_err.get(), stream);
+    kernels::linear_qw_experts_combine(ws.hh.get(), l.down, Estack, ws.route_ids.get(), ws.route_coef.get(), T, A, ws.y.get(),
+                                       act, ws.expert_err.get(), stream);
     if (sep) {
-        kernels::linear_qw(u_.get(), l.shared_gate_up, gu_.get(), T, act, act, stream_);
-        kernels::swiglu(gu_.get(), hh_.get(), T, D.inter, act, stream_);
-        kernels::linear_qw(hh_.get(), l.shared_down, sh_y_.get(), T, act, act, stream_);
-        kernels::moe_shared_add_inject(y_.get(), sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1, T, D.d,
-                                       (uint32_t)D.experts, mtp_x_.get(), w_in_.get(), D.H, act, router_err_.get(),
-                                       stream_);
+        kernels::linear_qw(ws.u.get(), l.shared_gate_up, ws.gu.get(), T, act, act, stream);
+        kernels::swiglu(ws.gu.get(), ws.hh.get(), T, D.inter, act, stream);
+        kernels::linear_qw(ws.hh.get(), l.shared_down, ws.sh_y.get(), T, act, act, stream);
+        kernels::moe_shared_add_inject(ws.y.get(), ws.sh_y.get(), ws.router_logits.get() + D.experts, D.experts + 1, T, D.d,
+                                       (uint32_t)D.experts, ws.mtp_x.get(), ws.w_in.get(), D.H, act, ws.router_err.get(),
+                                       stream);
     } else {
-        kernels::hc_inject(mtp_x_.get(), w_in_.get(), y_.get(), T, D.H, D.d, act, stream_);
+        kernels::hc_inject(ws.mtp_x.get(), ws.w_in.get(), ws.y.get(), T, D.H, D.d, act, stream);
     }
 
     // The head's own collapse, then the LM head's first mtp_vocab_ rows (row-major: a prefix view) - from the model's
@@ -3881,7 +3999,7 @@ void Qwen4ExpSession::run_mtp(int seq, int32_t token_id, int64_t step) {
         case 4: head.q4.N = mtp_vocab_; break;
         default: STRIX_FAIL("Qwen4ExpSession::forward_mtp: LM head has ", head.bits, " bits, expected 4, 5, 6 or 8");
     }
-    kernels::linear_qw(u_.get(), head, logits_.get(), 1, act, Act::F32, stream_);
+    kernels::linear_qw(ws.u.get(), head, ws.logits.get(), 1, act, Act::F32, stream);
 }
 
 }  // namespace strix
