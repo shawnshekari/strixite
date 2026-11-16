@@ -38,8 +38,10 @@ measured it on terminal-bench: the model took 4-7 times as many steps and was no
 
 Server setting: `thinking-cap = N` caps the thinking of every request that sets no budget of its own: past N tokens
 (and the end of the sentence it's in) the server closes the think block and the model answers. The shipped default
-is `0`, no cap. v0.3 shipped 2,048, and people told me the model seemed less smart with it, so from v0.4.0 the cap is
-yours to set. A request's own budget always wins.
+is 32,768. It's a backstop for runaway thinking, not a limit on normal answers: from v0.4.0 to v0.7.0 the default was
+`0`, no cap, and one request thought for over 61,000 tokens and held its slot for minutes (#47). v0.3 shipped 2,048,
+and people told me the model seemed less smart with it, so the cap stays well above what real thinking uses. Set
+`thinking-cap = 0` to turn it off. A request's own budget always wins.
 
 ## The thinking nudge
 
@@ -62,6 +64,11 @@ approach. It never closes the think block itself; the model decides whether to w
 
 A streamed response (`"stream": true`) sends server-sent events: one `data:` chunk per piece of reasoning, content
 or tool call, then a chunk with the `finish_reason`, a last chunk with `usage` and `strix`, and `data: [DONE]`.
+
+**When a request fails after its stream started** (for example, no room for its K/V), the stream ends with an
+`event: error` frame carrying the usual error object, then a chunk with `finish_reason` `"error"`, and no
+`data: [DONE]`. Before v0.7.1 such a failure could look like an empty, successful reply (#43). Clients that read the
+error event raise it; clients that only read chunks see a finish that isn't `stop`. `/v1/completions` ends the same way.
 
 **Prefill progress.** A long prompt can take minutes to read before the first token. By default the stream says how
 far it got only in SSE comment lines (`: prefill 24576/65536`), which keep the connection alive but which clients
