@@ -316,13 +316,16 @@ int run(int argc, char **argv) {
         // The growth runs inside a session call (this thread holds the GPU), so parked records the room rule
         // retires go back right here, straight on the backend - else their pages would stay held until the
         // engine's next drain while this growth waits on that very RAM.
-        backend.set_kv_budget([c = cache.get(), &backend](uint64_t bytes) {
+        // The grant returned is held by the session until the pages are mapped (the room stays booked till then).
+        backend.set_kv_budget([c = cache.get(), &backend](uint64_t bytes) -> std::shared_ptr<void> {
             const auto release = [&backend](const std::vector<int64_t> &ids) {
                 for (const int64_t id : ids) backend.release_parked(id);
             };
-            STRIX_CHECK(c->make_room_for(bytes, release), "K/V growth of ", bytes >> 20, " MiB refused: the prompt cache can't ",
+            auto grant = std::make_shared<PromptCache::RoomGrant>(c->make_room_for(bytes, release));
+            STRIX_CHECK(*grant, "K/V growth of ", bytes >> 20, " MiB refused: the prompt cache can't ",
                         "keep its RAM margin after it (MemAvailable ", c->mem_available_now() >> 20, " MiB) - every ",
                         "slot together holds more K/V than this machine has room for");
+            return grant;
         });
     Engine::Options eng_opts;
     eng_opts.cache = cache.get();

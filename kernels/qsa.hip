@@ -857,6 +857,18 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 // Workgroups the cooperative kernel may have resident at once on this device (queried once).
+int64_t coop_max_resident();
+
+}  // namespace
+
+TopkPath qsa_topk_auto_path(int64_t T, int64_t nb) {
+    STRIX_CHECK(T >= 1 && nb >= 0, "qsa_topk_auto_path: T = ", T, ", nb = ", nb, " (expected T >= 1, nb >= 0)");
+    if (nb <= kQsaTopkRowMaxBlocks) return TopkPath::Row;
+    return T <= kQsaTopkRowMaxT ? TopkPath::Split : TopkPath::Filter;  // never Coop (strixite #31, at the dispatch)
+}
+
+namespace {
+
 int64_t coop_max_resident() {
     static const int64_t r = [] {
         int dev = 0, per = 0;
@@ -1033,10 +1045,10 @@ void qsa_topk(const float *scores, int64_t ld, int64_t T, int64_t pos0, int64_t 
                     path == TopkPath::Filter || path == TopkPath::FilterTight,
                 fn, ": path ", (int)path);
     const bool small_t = T <= kQsaTopkRowMaxT;
+    if (path == TopkPath::Auto) path = qsa_topk_auto_path(T, nb);
     // Filter for many queries past the row path's limit (prefill chunks at depth); FilterTight: a candidate list of
     // exactly k, so most rows take the fallback (tests).
-    const bool filter_auto = !small_t && nb > kQsaTopkRowMaxBlocks;
-    if (path == TopkPath::Filter || path == TopkPath::FilterTight || (path == TopkPath::Auto && filter_auto)) {
+    if (path == TopkPath::Filter || path == TopkPath::FilterTight) {
         const int64_t cap = path == TopkPath::FilterTight ? k : kFilterCap;
         // The filter words at the end of the workspace (qsa_topk_workspace_bytes): past every T's split rows.
         uint32_t *end = static_cast<uint32_t *>(workspace) + workspace_bytes / 4;
@@ -1051,11 +1063,15 @@ void qsa_topk(const float *scores, int64_t ld, int64_t T, int64_t pos0, int64_t 
         STRIX_HIP_CHECK_LAUNCH(fn, " filter exact T=", T, " pos0=", pos0, " k=", k);
         return;
     }
-    // Auto (gfx1151): row up to 16384 blocks; past that coop for verifies (T = 5: 27.8 /
+    // Measured, and given up below: past 16384 blocks coop was faster for verifies (T = 5: 27.8 /
     // 41.1 / 46.8 us at 16k / 32k / 64k blocks vs split 50.4 / 56.3 / 52.0) and for T = 1 up to 40960 blocks (23.7 /
     // 28.5 vs 31.2 / 31.8); T = 1 deeper keeps split (64k: coop 45.4 vs split 32.3).
-    const bool coop_auto = small_t && nb > kQsaTopkRowMaxBlocks && (T > 1 || nb <= kQsaTopkCoopMaxBlocksT1);
-    if (path == TopkPath::Coop || (path == TopkPath::Auto && coop_auto)) {
+    // Auto never picks Coop (strixite #31): a T = 5 coop launch at 40,788 blocks never returned at the end of a 163k
+    // prefill inside the server - twice, on an outside box - while the same launch passes alone. Its grid syncs wait
+    // forever when not every workgroup is resident, and the occupancy query can't promise that with other streams
+    // on the GPU. Split took that request through; it costs ~5-23 us per full-attention layer per verify past 16384
+    // blocks (the numbers above). Coop stays as an explicit path.
+    if (path == TopkPath::Coop) {
         STRIX_CHECK(small_t, fn, ": the coop path takes T <= ", kQsaTopkRowMaxT, ", got T = ", T);
         const int64_t W = std::clamp<int64_t>(std::min<int64_t>((nb + kTopkChunk - 1) / kTopkChunk,
                                                                   coop_max_resident() / T),
@@ -1073,7 +1089,7 @@ void qsa_topk(const float *scores, int64_t ld, int64_t T, int64_t pos0, int64_t 
     // Row also for prefill chunks (any T) up to kQsaTopkRowMaxBlocks: T = 2048 - row 0.33 / 0.47 /
     // 0.71 / 1.24 / 1.80 ms vs split 1.23 / 3.91 / 4.53 / 5.11 / 5.82 at 1k / 4k / 8k / 12k / 16k blocks; at 32k
     // blocks row 14.7 vs split 9.2, so split past the limit.
-    if (path == TopkPath::Row || (path == TopkPath::Auto && nb <= kQsaTopkRowMaxBlocks)) {
+    if (path == TopkPath::Row) {
         STRIX_CHECK(nb < (int64_t)kRowEqMask && kMaxK < (1 << (32 - kRowEqBits)), fn, ": the row path takes rows of fewer than ",
                     kRowEqMask, " blocks (its packed counts), got ", nb);
         topk_row_kernel<<<(unsigned)T, kRowThreads, 0, stream>>>(scores, ld, pos0, (int)k, sel, nsel);

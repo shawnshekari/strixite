@@ -109,6 +109,16 @@ inline void linear_qw_experts_gather_grouped(const void *x, const QWeightView &w
         default: STRIX_FAIL("linear_qw_experts_gather_grouped: experts have ", w.bits, " bits, expected 4 or 5");
     }
 }
+// The grouped gather with the SwiGLU in its epilogue (MoeMath::WmmaF16 kinds; kernels/moe_grouped.hpp).
+inline void linear_qw_experts_gather_grouped_swiglu(const void *x, const QWeightView &w, int64_t E, const void *ws,
+                                                    size_t ws_bytes, int64_t M, int64_t A, void *h, Act act,
+                                                    MoeMath math, hipStream_t stream, bool h_f16 = false) {
+    switch (w.bits) {
+        case 4: linear_q4_experts_gather_grouped_swiglu(x, w.q4, E, ws, ws_bytes, M, A, h, act, math, stream, h_f16); return;
+        case 5: linear_q5_experts_gather_grouped_swiglu(x, w.q5, E, ws, ws_bytes, M, A, h, act, math, stream, h_f16); return;
+        default: STRIX_FAIL("linear_qw_experts_gather_grouped_swiglu: experts have ", w.bits, " bits, expected 4 or 5");
+    }
+}
 inline void linear_qw_experts_combine_grouped(const void *h, const QWeightView &w, int64_t E, const int32_t *ids,
                                               const float *coef, const void *ws, size_t ws_bytes, float *partial,
                                               int64_t M, int64_t A, void *y, Act act, MoeMath math,
@@ -120,9 +130,8 @@ inline void linear_qw_experts_combine_grouped(const void *h, const QWeightView &
                                               shared, h_f16);
             return;
         case 5:
-            STRIX_CHECK(!h_f16, "linear_qw_experts_combine_grouped: F16 h needs Q4 experts, got Q5");
             linear_q5_experts_combine_grouped(h, w.q5, E, ids, coef, ws, ws_bytes, partial, M, A, y, act, math, stream,
-                                              shared);
+                                              shared, h_f16);
             return;
         default: STRIX_FAIL("linear_qw_experts_combine_grouped: experts have ", w.bits, " bits, expected 4 or 5");
     }

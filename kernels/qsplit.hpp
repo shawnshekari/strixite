@@ -31,4 +31,14 @@ struct QHigh32 {
     }
 };
 
+// Of 8 Q5 codes' 5th bits h8 (code i's at bit i; bits 8+ ignored), the even codes' (parity 0) or the odd codes'
+// (parity 1) as bit 4 of bytes 0..3 - code 2j + parity's in byte j, where the F16 decode holds code 2j + parity's low
+// nibble (kernels/wmma_gemm.hpp wmma_q5_word_to_f16). (h8 >> parity) & 0x55 holds them at bits 2j; times 0x410410
+// (bits 4, 10, 16, 22) moves bit 2j to 8j + 4. The other products land on 2i + 6j + 4 with i != j, never on a kept
+// bit (i + 3j = 4j has no other solution in 0..3); the three positions two products share (10, 16, 22) carry into
+// 11, 17, 23 only. The product stays below 2^29.
+__host__ __device__ constexpr uint32_t q5_bit4_spread(uint32_t h8, int parity) {
+    return (((h8 >> parity) & 0x55u) * 0x410410u) & 0x10101010u;
+}
+
 }  // namespace strix::kernels

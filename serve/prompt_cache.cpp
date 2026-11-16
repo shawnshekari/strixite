@@ -494,7 +494,10 @@ bool PromptCache::with_state(const std::vector<int32_t> &prompt, int64_t n,
         any_disk = true;
         p.loaded = take_buffer();
         // Room first, the margin counted at the allocation (make_room_for): refused, the prompt prefills instead.
-        if (p.file_bytes > p.loaded.capacity() && !make_room_for(p.file_bytes - p.loaded.capacity())) {
+        // The grant stays booked until load_file below has allocated (end of this iteration).
+        RoomGrant room;
+        if (p.file_bytes > p.loaded.capacity()) room = make_room_for(p.file_bytes - p.loaded.capacity());
+        if (p.file_bytes > p.loaded.capacity() && !room) {
             slog(LogLevel::Warning, "prompt cache: not loading the %s-token entry from disk: no room in RAM (needs %s GB "
                  "more; MemAvailable %s GiB, margin %s GiB)", fmt_n((long long)p.e->tokens.size()).c_str(),
                  fmt_rate((p.file_bytes - p.loaded.capacity()) / 1e9, 1).c_str(),
@@ -927,9 +930,9 @@ void PromptCache::poke_retired() {
     }
 }
 
-bool PromptCache::make_room_for(uint64_t bytes, const RetiredRelease &release_retired) {
+PromptCache::RoomGrant PromptCache::make_room_for(uint64_t bytes, const RetiredRelease &release_retired) {
     STRIX_CHECK(bytes < (1ull << 40), "PromptCache::make_room_for: ", bytes, " bytes, expected < 1 TiB");
-    if (bytes == 0) return true;
+    if (bytes == 0) return RoomGrant(nullptr, 0);
     // Parked records already retired go back first (their pages are RAM the reading below should see), then
     // after every eviction pass. Off-lock: the releaser does HIP work.
     const auto release_now = [&] {
@@ -947,8 +950,8 @@ bool PromptCache::make_room_for(uint64_t bytes, const RetiredRelease &release_re
     const double deadline = now_s() + opt_.room_wait_seconds;
     for (;;) {
         release_now();
+        if (gov_.try_reserve(bytes)) return RoomGrant(&gov_, bytes);  // room now: booked
         const uint64_t avail = gov_.available();  // the one reading the rule and the shortfall both see
-        if (gov_.room(avail, bytes)) return true;
         {
             Handback hb;
             std::lock_guard<std::mutex> lock(mu_);
@@ -956,13 +959,19 @@ bool PromptCache::make_room_for(uint64_t bytes, const RetiredRelease &release_re
             hb.take(this);
         }  // the evicted buffers are unmapped here, before MemAvailable is read again
         release_now();  // and the evicted parked records' pages given back
-        if (gov_.room_now(bytes)) return true;  // the evicted buffers were unmapped before this reading
+        if (gov_.try_reserve(bytes)) return RoomGrant(&gov_, bytes);  // the evicted buffers were unmapped before this
         std::unique_lock<std::mutex> lock(mu_);
         const double left = deadline - now_s();
-        if (leaving_bytes_locked() == 0 || left <= 0) {
+        // Refused only when nothing is on its way out and nothing more can leave. With several slots, the pass above
+        // can count another caller's eviction as this one's room and evict nothing; that write then finishes and the
+        // other caller takes the RAM - nothing leaving, room still short, entries free to leave: run the rule again
+        // on a fresh reading rather than refuse (strixite #42).
+        const bool leaving = leaving_bytes_locked() > 0;
+        if (left <= 0 || (!leaving && !evictable_locked())) {
             ++stats_.room_refused;
-            return false;
+            return RoomGrant();
         }
+        if (!leaving) continue;
         ++stats_.room_waits;
         idle_cv_.wait_for(lock, std::chrono::duration<double>(std::min(left, 0.05)));  // a write done, or poll
     }
@@ -985,6 +994,13 @@ std::string PromptCache::ram_summary() const {
            " GB), " + fmt_n(queued) + " queued for a write (" + gb(queued_b) + " GB), " + fmt_n(free_n) +
            " free to leave (" + gb(free_b) + " GB); spares " + fmt_n((long long)spares_.size()) + " (" + gb(spare_bytes_) +
            " GB); leaving " + gb(leaving_bytes_locked()) + " GB";
+}
+
+bool PromptCache::evictable_locked() const {
+    if (!spares_.empty() || !points_.empty()) return true;
+    for (const EntryPtr &e : entries_)
+        if (can_leave_ram(*e)) return true;
+    return false;
 }
 
 uint64_t PromptCache::leaving_bytes_locked() const {
@@ -1028,7 +1044,7 @@ void PromptCache::make_room_locked(uint64_t extra, uint64_t avail_in) {
         // tokens).
         Entry *lru = nullptr;
         for (const EntryPtr &e : entries_)
-            if (e->in_ram() && !e->drop_ram && (e->readers == 0 || e->queued) && (!lru || e->last_used < lru->last_used))
+            if (can_leave_ram(*e) && (!lru || e->last_used < lru->last_used))
                 lru = e.get();
         if (!lru) break;  // the rest is in use or on its way out; the next put tries again
         if (opt_.ram_tier) need -= std::min(need, lru->ram_cost());

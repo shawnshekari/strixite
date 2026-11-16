@@ -28,6 +28,11 @@ public:
     int64_t logits_row() const override { return model_.dims().vocab; }
     int64_t pos() const override { return session_->pos(); }
     uint64_t state_bytes_at(int64_t n) const { return session_->state_bytes(n); }  // a whole saved state at n tokens
+    // Qwen4ExpSession::set_default_probe, kept across renew().
+    void set_default_probe(Qwen4ExpProbe probe) {
+        default_probe_ = std::move(probe);
+        session_->set_default_probe(default_probe_);
+    }
     // Paged slot K/V (Qwen4ExpSession::set_kv_budget / kv_full_bytes): the startup plan's deep-slot term and the
     // budget its growth asks first.
     uint64_t kv_full_bytes() const { return session_->kv_full_bytes(); }
@@ -35,7 +40,7 @@ public:
     // Which K/V generation the conversation's slot stands at (the parked budget's other side; the tests and
     // /health read it - reaching the last one is the switch-count exhaustion refusal).
     int64_t kv_generation() const { return session_->kv_generation(0); }
-    void set_kv_budget(std::function<void(uint64_t)> f);  // kept for a renewed session too
+    void set_kv_budget(Qwen4ExpSession::KvBudget f);  // kept for a renewed session too
     void reset() override { session_->reset(); }
     // The soft K/V reset (LmBackend::renew): a new session on the same loaded model, built with the same
     // settings - every slot's K/V, snapshot and generation counter start over, the weights and n-gram rows stay.
@@ -171,7 +176,8 @@ private:
     const PrecisionOptions precision_;
     const KvFormat kv_;
     const int64_t n_seqs_, kv_generations_;
-    std::function<void(uint64_t)> kv_budget_;
+    Qwen4ExpSession::KvBudget kv_budget_;
+    Qwen4ExpProbe default_probe_;  // set_default_probe
     std::unique_ptr<Qwen4ExpSession> session_;  // null only when a renewal failed midway (failed() is then true)
     mutable std::mutex stats_mu_;  // backend_stats (any thread) vs renew's swap
     int64_t renewals_ = 0;

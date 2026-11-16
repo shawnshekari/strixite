@@ -29,8 +29,8 @@ namespace strix::kernels {
 // How the grouped GEMMs compute: FP32 on the vector units (the engine's default semantics), or on the matrix units
 // with x rounded to BF16, the weights exact (scaled codes) and FP32 accumulation (kernels/wmma_gemm.hpp - a
 // lower-precision path, behind a switch).
-// WmmaF16 (Q4 experts): x as F16 (exact from BF16 in range), the weights dequantized
-// to F16 in registers (code * scale + min, one F16 rounding), FP32 accumulation over the whole K.
+// WmmaF16 (Q4 / Q5 experts): x as F16 (exact from BF16 in range), the weights dequantized
+// to F16 in registers (code * scale + min, one F16 rounding; codes 0..31 exact), FP32 accumulation over the whole K.
 // WmmaF16 picks one of three kernels with the same math (bit-identical outputs) by the call's token count M:
 // WmmaF16Narrow - 64-slot tiles, each wave decoding its own 16 weight rows in registers -, WmmaF16Wide - the dense
 // GEMMs' tile structure, 128-slot x 128-row blocks with each weight tile dequantized once into LDS and read by the
@@ -59,7 +59,7 @@ void linear_q4_experts_gather_grouped(const void *x, const Q4DeviceView &w, int6
                                       size_t ws_bytes, int64_t M, int64_t A, void *y, Act act, MoeMath math,
                                       hipStream_t stream);
 
-// The gather with SwiGLU fused (MoeMath::WmmaF16, Q4 only): h [M*A, N/2] = silu(gate) * up of the stacked gate_up
+// The gather with SwiGLU fused (MoeMath::WmmaF16 kinds): h [M*A, N/2] = silu(gate) * up of the stacked gate_up
 // rows (each expert's N rows: N/2 gate rows, then N/2 up rows), from the FP32 accumulators, rounded once to the
 // activation dtype - in place of the gather into gu [M*A, N] and kernels/swiglu. h must not overlap x. h_f16 (BF16
 // activations): h stored as F16 bits of its BF16 rounding (what the F16 down kernels stage from BF16 h, round toward
@@ -90,13 +90,16 @@ void linear_q4_experts_combine_grouped(const void *h, const Q4DeviceView &w, int
                                        int64_t A, void *y, Act act, MoeMath math, hipStream_t stream,
                                        const MoeSharedAdd *shared = nullptr, bool h_f16 = false);
 
-// The same with Q5 experts (formats/q5.hpp rows, K % 128 == 0) - one kernel template with the Q4 ones.
+// The same with Q5 experts (formats/q5.hpp rows, K % 128 == 0) - one kernel template with the Q4 ones (every MoeMath).
 void linear_q5_experts_gather_grouped(const void *x, const Q5DeviceView &w, int64_t E, const void *ws,
                                       size_t ws_bytes, int64_t M, int64_t A, void *y, Act act, MoeMath math,
                                       hipStream_t stream);
+void linear_q5_experts_gather_grouped_swiglu(const void *x, const Q5DeviceView &w, int64_t E, const void *ws,
+                                             size_t ws_bytes, int64_t M, int64_t A, void *h, Act act, MoeMath math,
+                                             hipStream_t stream, bool h_f16 = false);
 void linear_q5_experts_combine_grouped(const void *h, const Q5DeviceView &w, int64_t E, const int32_t *ids,
                                        const float *coef, const void *ws, size_t ws_bytes, float *partial, int64_t M,
                                        int64_t A, void *y, Act act, MoeMath math, hipStream_t stream,
-                                       const MoeSharedAdd *shared = nullptr);
+                                       const MoeSharedAdd *shared = nullptr, bool h_f16 = false);
 
 }  // namespace strix::kernels

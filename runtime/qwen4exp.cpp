@@ -600,8 +600,9 @@ void Qwen4ExpSession::ensure_rows(Qwen4ExpSeqState &sq, int64_t end) {
     uint64_t missing = 0;
     for_paged(sq, end, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &r) { missing += b.missing_bytes(r); });
     if (missing == 0) return;
+    std::shared_ptr<void> booked;  // the budget's booking of this RAM, dropped once the pages below are mapped
     if (kv_budget_) {
-        kv_budget_(missing);  // throws to refuse (nothing mapped yet)
+        booked = kv_budget_(missing);  // throws to refuse (nothing mapped yet)
     } else {
         const uint64_t avail = mem_available_bytes();
         STRIX_CHECK(avail >= kSlotFloorBytes + missing, "Qwen4ExpSession: the K/V for positions [0, ", end, ") needs ",
@@ -2597,7 +2598,8 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
 // same launch order - verified by token identity. Multi-run batches are decode-sized and scalar: no image
 // rows, no mRoPE state (checked below); the verify mechanism is per state (forward_batch_verify).
 std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, const ImageInput *image,
-                                                  const Qwen4ExpProbe &probe) {
+                                                  const Qwen4ExpProbe &call_probe) {
+    const Qwen4ExpProbe &probe = call_probe ? call_probe : default_probe_;
     STRIX_CHECK(!broken_, "Qwen4ExpSession::forward: an earlier call failed midway; reset() the session first");
     STRIX_CHECK(!batch.empty() && batch.size() <= (size_t)n_slots(), "Qwen4ExpSession::forward: ", batch.size(),
                 " runs, expected 1..", n_slots());
@@ -2626,8 +2628,6 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
     const size_t e = es(act);
     const bool sep = m_.shared_separate();
     const bool wmma = prefill_math_ == PrefillMath::WmmaBf16;
-    STRIX_TRACE_STAGE(stage);
-    STRIX_TRACE_SET(stage, "embed");
     // Dense Q4 / Q8 projection: on the matrix units for large enough forwards when switched on.
     auto lin = [&](const void *x, const QWeightView &w, void *y, int64_t M, Act out_act) {
         if (wmma && M >= kWmmaMinTokens) kernels::linear_qw_wmma(x, w, y, M, act, out_act, stream_);
@@ -2686,6 +2686,10 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
     STRIX_TRACE_RANGE(std::string(batch.size() == 1 && runs[0].sq->gdn_to_spare ? "verify"
                                 : T == 1 ? "decode" : "prefill") + " T=" + std::to_string(T) +
                       " runs=" + std::to_string(batch.size()));
+    // The stage ranges open inside the forward's range: ROCTX ranges are a stack, so a stage opened first was popped
+    // by the first stage switch in its place, and the forward's range ended after its setup.
+    STRIX_TRACE_STAGE(stage);
+    STRIX_TRACE_SET(stage, "embed");
     if (runs.size() > 1) {  // the batch's decode-size scalar contract (see the header's forward_batch)
         STRIX_CHECK(image == nullptr, "Qwen4ExpSession::forward: ", runs.size(),
                     " runs and an image forward - image rows run alone (vision's one-forward-one-image contract)");
@@ -3170,19 +3174,15 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                                                (uint32_t)D.experts, router_err_.get()};
         bool h_f16 = false;
         if (T >= kGroupedMinTokens) {
-            // Q4 experts on the matrix units take F16; Q5 stays on BF16 scaled codes
-            // until its kernel moves over.
-            const kernels::MoeMath em = moe_math == kernels::MoeMath::WmmaBf16 && l.gate_up.bits == 4 &&
-                                                l.down.bits == 4
-                                            ? kernels::MoeMath::WmmaF16
-                                            : moe_math;
+            // Q4 and Q5 experts on the matrix units take F16 (kernels/moe_grouped.hpp MoeMath::WmmaF16).
+            const kernels::MoeMath em = moe_math == kernels::MoeMath::WmmaBf16 ? kernels::MoeMath::WmmaF16 : moe_math;
             kernels::moe_group_routes(route_ids_.get(), T, A, Estack, group_ws_.get(), group_ws_bytes_,
                                       expert_err_.get(), stream_);
-            const bool fused = em == kernels::MoeMath::WmmaF16 && l.gate_up.bits == 4;
-            // h as F16 bits between the fused gather and a Q4 down: the down's x conversion done once (bit-identical)
-            h_f16 = fused && l.down.bits == 4 && act == Act::BF16;
+            const bool fused = em == kernels::MoeMath::WmmaF16;
+            // h as F16 bits between the fused gather and the F16 down: the down's x conversion done once (bit-identical)
+            h_f16 = fused && act == Act::BF16;
             if (fused) {  // SwiGLU in the gather's epilogue
-                kernels::linear_q4_experts_gather_grouped_swiglu(u_.get(), l.gate_up.q4, Estack, group_ws_.get(),
+                kernels::linear_qw_experts_gather_grouped_swiglu(u_.get(), l.gate_up, Estack, group_ws_.get(),
                                                                  group_ws_bytes_, T, A, hh_.get(), act, em, stream_,
                                                                  h_f16);
             } else {
@@ -3536,6 +3536,7 @@ void Qwen4ExpSession::keep_verify_prefix_seq(Qwen4ExpSeqState &sq, int64_t rows)
     const Act act = m_.act();
     const size_t e = es(act);
     const int64_t n4 = D.H * D.d, p0 = sq.verify_pos;
+    const bool wmma = prefill_math_ == PrefillMath::WmmaBf16;  // as forward() decides its GDN path
     // mRoPE: the verify's rows (kept and rejected alike) are already in the history; the block keys of a
     // block completed within the kept rows replay with its first row's triple / the scalar base + delta -
     // exactly like the verify's own forward did.
@@ -3546,14 +3547,19 @@ void Qwen4ExpSession::keep_verify_prefix_seq(Qwen4ExpSeqState &sq, int64_t rows)
         const size_t li = (size_t)i;
         if (!D.is_attention[li]) {
             // GDN: the verify wrote its states to the spare set, so sq.conv_state / sq.rec_state are still the ones
-            // before it - replay rows [0, rows) on them in place, with the verify's own path (Auto: per token), so
-            // the state is exactly the verify's after that row (split invariance).
+            // before it - replay rows [0, rows) on them in place, with the path and precision a forward of `rows`
+            // tokens takes (ChunkedWmma at gdn-precision from kWmmaMinTokens rows, else per token), so the state is
+            // exactly a forward's after those rows (split invariance). Before strixite PR #37 the replay ran per token
+            // at Exact: kept rows >= 12 (mtp-draft >= 11) left a state no forward produces.
             kernels::gdn_front(sq.verify_in[li].get(),
                                {rows, D.gk, kHD, D.gv, kHD, D.gstride, D.conv_c + D.gz, D.conv_c + D.gz + D.gv},
                                l.conv_w, sq.conv_state[li].get(), sq.conv_state[li].get(), false, l.A_log, l.dt_bias,
                                qkv_.get(), beta_.get(), g_.get(), act, stream_);
             kernels::delta_rule(qkv_.get(), beta_.get(), g_.get(), {rows, D.gk, D.gv, D.conv_c}, sq.rec_state[li].get(),
-                                sq.rec_state[li].get(), false, core_.get(), act, stream_, kernels::DeltaRulePath::Auto);
+                                sq.rec_state[li].get(), false, core_.get(), act, stream_,
+                                wmma && rows >= kWmmaMinTokens ? kernels::DeltaRulePath::ChunkedWmma
+                                                               : kernels::DeltaRulePath::Auto,
+                                precision_.gdn);
         } else {
             // Attention: the tail (and any block completed within the kept rows - same keys the verify wrote) from
             // the tail before the verify, which it only read. Same block-window triples as the verify's forward.

@@ -66,7 +66,8 @@ void qsa_scores(const void *q, int64_t q_ts, int64_t q_hs, int64_t T, int64_t po
 // more than k blocks - three histogram passes, the select, a per-row sort - else 1), for many queries (prefill);
 // Row - one workgroup per query, one launch (the passes over the row in LDS, the select in index order so no
 // sort), for decode and verifies (T <= kQsaTopkRowMaxT), where Split's cost was its launches. Auto picks Row for
-// rows of at most kQsaTopkRowMaxBlocks blocks (any T: prefill chunks too, 3-8x faster than Split there), Coop for small T past that (the split's
+// rows of at most kQsaTopkRowMaxBlocks blocks (any T: prefill chunks too, 3-8x faster than Split there), Split for small T past that
+// (strixite #31: a coop launch hung inside the server). Coop, explicit only: the split's
 // workgroups in one cooperative launch: grid syncs between the passes, a select in index order - no sort); either can be forced
 // explicitly. Measured (gfx1151, T = 1): Row 7.3 / 12.5 / 33.8 / 64.0 / 124.0 us at 1k / 4k /
 // 16k / 32k / 64k blocks, Split 30.5-32.5 us throughout - one workgroup streaming a long row loses to the split's
@@ -81,7 +82,10 @@ void qsa_scores(const void *q, int64_t q_ts, int64_t q_hs, int64_t T, int64_t po
 // times (details at the kernels). A row whose candidates miss (fewer than k, or past the list's 4096) runs the exact
 // select on its whole row: same result. FilterTight: a list of exactly k (it mostly takes the fallback).
 enum class TopkPath { Auto, Split, Row, Coop, Filter, FilterTight };
-constexpr int64_t kQsaTopkRowMaxT = 8, kQsaTopkRowMaxBlocks = 16384, kQsaTopkCoopMaxBlocksT1 = 40960;
+constexpr int64_t kQsaTopkRowMaxT = 8, kQsaTopkRowMaxBlocks = 16384;
+// The path Auto takes for T queries over rows of nb complete blocks: Row up to kQsaTopkRowMaxBlocks, past that Split
+// for T <= kQsaTopkRowMaxT and Filter for more. Never Coop (strixite #31).
+TopkPath qsa_topk_auto_path(int64_t T, int64_t nb);
 size_t qsa_topk_workspace_bytes(int64_t T);
 // Rows of the filter path that fell back to the whole-row select since the last call (synchronizes stream; resets the
 // count). For tests and benches.

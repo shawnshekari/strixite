@@ -557,7 +557,10 @@ public:
     // Paged slot K/V: before a slot's arrays map more pages, f(bytes) is asked for
     // the RAM (the server's prompt cache makes room - K/V first) and throws to refuse; unset, growth is refused only
     // when it would leave MemAvailable below the slot floor. A refusal fails the call before any page is mapped.
-    void set_kv_budget(std::function<void(uint64_t bytes)> f) { kv_budget_ = std::move(f); }
+    // The K/V budget: asked before a slot maps `bytes` more K/V pages; throws to refuse. What it returns is held
+    // until those pages are mapped, then dropped - the owner's booking of that RAM (null: nothing to hold).
+    using KvBudget = std::function<std::shared_ptr<void>(uint64_t bytes)>;
+    void set_kv_budget(KvBudget f) { kv_budget_ = std::move(f); }
     // The bytes one slot's paged arrays map at the full capacity (the startup memory plan's deep-slot term).
     uint64_t kv_full_bytes() const;
     // The bytes slot seq's paged arrays map now: the deepest position any of its conversations reached (pages are
@@ -763,6 +766,10 @@ public:
     // bias (a request's logit_bias): null, or bias_n entries (kernels/logits_bias) the forward adds to its logits rows
     // ahead of logits_topk - in runs' order: row0 ascending, a run's ids ascending, runs' row ranges disjoint, every
     // row range inside that forward's n_logits (checked there); copied here into a pinned buffer like the masks.
+    // A probe every forward / forward_verify / forward_batch uses when its call passes none (null: none) - for code
+    // that observes forwards it doesn't call itself. The probe syncs the stream at every name (Qwen4ExpProbe), so a
+    // run with one is for counting, not timing.
+    void set_default_probe(Qwen4ExpProbe probe) { default_probe_ = std::move(probe); }
     void want_candidates(int64_t n_valid, const uint32_t *masks = nullptr, int64_t mask_rows = 0, int64_t mask_words = 0,
                          const kernels::LogitBiasEntry *bias = nullptr, int64_t bias_n = 0);
     struct Candidates {
@@ -915,7 +922,7 @@ private:
     // run_mtp), each run of a multi-run batched forward, import_state - after kv_budget_ (or the floor check) allowed
     // the bytes.
     void ensure_rows(Qwen4ExpSeqState &sq, int64_t end);
-    std::function<void(uint64_t)> kv_budget_;
+    KvBudget kv_budget_;
     static uint64_t mem_available_bytes();
     // The slot allocation guard's floor: a unified-memory machine with MemAvailable near 0.5 GB hard-hangs.
     static constexpr uint64_t kSlotFloorBytes = 4ull << 30;
@@ -1059,6 +1066,7 @@ private:
     Candidates cand_host_;
     size_t attn_ws_bytes_ = 0;
     bool broken_ = false;
+    Qwen4ExpProbe default_probe_;  // set_default_probe
     // PLE rows on the host (runtime/ngram_table gather -> the activation dtype), in pinned buffers [max_tokens, ple_e]
     // for an async upload. Two, so the next forward's gather (set_lookahead) fills one while this forward's upload
     // reads the other; a buffer is written again only after the forward that uploaded from it ended with its stream

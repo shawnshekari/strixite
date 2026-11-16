@@ -762,11 +762,14 @@ bool Engine::save_state(Slot &sl, const int32_t *tokens, int slot, int64_t n, Pr
     if (state.capacity() == 0) state = cache_->take_buffer();
     // Room before the buffer grows (PromptCache::make_room_for): else no save - never past the margin. Parked
     // records the room rule retires go back right here (this thread may hand the GPU work to the arbiter).
+    // The grant stays booked until the export below has grown the buffer (end of this function).
     const uint64_t want = sl.be->snapshot_bytes(slot, base_n);
-    if (want > state.capacity() &&
-        !cache_->make_room_for(want - state.capacity(), [&](const std::vector<int64_t> &ids) {
+    PromptCache::RoomGrant room;
+    if (want > state.capacity())
+        room = cache_->make_room_for(want - state.capacity(), [&](const std::vector<int64_t> &ids) {
             for (const int64_t id : ids) sl.be->release_parked(id);
-        })) {
+        });
+    if (want > state.capacity() && !room) {
         slog_row(LogLevel::Warning, rows++ ? "" : "cache",
                  "%s, %s tokens: not saved - no room in RAM (needs %s GB more; MemAvailable %s GiB, margin %s GiB)",
                  what, fmt_n(n).c_str(), fmt_rate((want - state.capacity()) / 1e9, 1).c_str(),
@@ -777,6 +780,7 @@ bool Engine::save_state(Slot &sl, const int32_t *tokens, int slot, int64_t n, Pr
         return false;
     }
     sl.be->export_snapshot(slot, state, base_n);
+    room.release();  // the buffer holds its pages now: MemAvailable shows them
     const double ms = (now_s() - t_e) * 1e3;  // > 0.5 s: the request path waited - worth seeing
     const LogLevel level = ms > 500 ? LogLevel::Warning : LogLevel::Debug;
     // To the RAM tier only: the disk gets an entry later (idle, RAM pressure, shutdown), if at all.
@@ -809,15 +813,17 @@ bool Engine::save_point(Slot &sl, const int32_t *tokens, int slot, int64_t n, co
     }
     const double t0 = now_s();
     const uint64_t want = sl.be->small_snapshot_bytes(slot);
-    if (!cache_->make_room_for(want, [&](const std::vector<int64_t> &ids) {
-            for (const int64_t id : ids) sl.be->release_parked(id);
-        })) {
+    PromptCache::RoomGrant room = cache_->make_room_for(want, [&](const std::vector<int64_t> &ids) {
+        for (const int64_t id : ids) sl.be->release_parked(id);
+    });
+    if (!room) {
         slog_row(LogLevel::Debug, rows++ ? "" : "cache", "%s, %s tokens: not saved - no room in RAM for %s MB", what,
                  fmt_n(n).c_str(), fmt_rate(want / 1e6, 0).c_str());
         return false;
     }
     HostBuffer small;
     sl.be->export_small_snapshot(slot, small);
+    room.release();  // the small state's pages are in place
     const size_t bytes = small.size();
     const bool put = cache_->put_point(key, std::move(small), req_id);
     slog_row(LogLevel::Debug, rows++ ? "" : "cache", "%s, %s tokens -> RAM (%s MB small state, %s ms)", what,

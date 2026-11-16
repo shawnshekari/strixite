@@ -12,6 +12,7 @@
 // accumulation either way (a lower-precision path). Included by .hip files
 // only.
 
+#include "kernels/qsplit.hpp"  // q5_bit4_spread
 #include "kernels/wmma.hpp"
 
 #include "common/hip_runtime.hpp"
@@ -127,12 +128,23 @@ __device__ inline uint32_t wmma_codes_to_f16x2(uint32_t hi_src, uint32_t lo_src,
     return __builtin_bit_cast(uint32_t, __builtin_elementwise_fma(c, s, m));
 }
 
-// The 8 Q4 codes of one word (code i at bits 4i) as 4 F16 pairs (codes 2j, 2j+1) into out[0..3].
-__device__ inline void wmma_q4_word_to_f16(uint32_t w, wmma_f16x2 s, wmma_f16x2 m, uint32_t *out) {
-    const uint32_t lo = w & 0x0F0F0F0Fu, hi = (w >> 4) & 0x0F0F0F0Fu;  // even / odd codes, one per byte
+// Codes 2j (byte j of lo) and 2j + 1 (byte j of hi), j = 0..3, as 4 F16 pairs into out[0..3].
+__device__ inline void wmma_code_bytes_to_f16(uint32_t lo, uint32_t hi, wmma_f16x2 s, wmma_f16x2 m, uint32_t *out) {
 #pragma unroll
     for (int j = 0; j < 4; ++j)  // perm(hi, lo): bytes 0-3 lo's, 4-7 hi's -> [lo_j, 0, hi_j, 0]
         out[j] = wmma_codes_to_f16x2(hi, lo, (uint32_t)j | 0x0c00u | ((uint32_t)(4 + j) << 16) | 0x0c000000u, s, m);
+}
+
+// The 8 Q4 codes of one word (code i at bits 4i) as 4 F16 pairs (codes 2j, 2j+1) into out[0..3].
+__device__ inline void wmma_q4_word_to_f16(uint32_t w, wmma_f16x2 s, wmma_f16x2 m, uint32_t *out) {
+    wmma_code_bytes_to_f16(w & 0x0F0F0F0Fu, (w >> 4) & 0x0F0F0F0Fu, s, m, out);  // even / odd codes, one per byte
+}
+
+// The 8 Q5 codes of one word: low nibbles w as Q4's (code i at bits 4i), 5th bits h8 (code i's at bit i; bits 8+
+// ignored), as 4 F16 pairs (codes 2j, 2j+1) into out[0..3]. Codes 0..31 are exact in F16; one rounding, as Q4.
+__device__ inline void wmma_q5_word_to_f16(uint32_t w, uint32_t h8, wmma_f16x2 s, wmma_f16x2 m, uint32_t *out) {
+    wmma_code_bytes_to_f16((w & 0x0F0F0F0Fu) | q5_bit4_spread(h8, 0),
+                           ((w >> 4) & 0x0F0F0F0Fu) | q5_bit4_spread(h8, 1), s, m, out);
 }
 
 // The 4 Q8 codes of one word (code i in byte i) as 2 F16 pairs (codes 0,1 then 2,3) into out[0..1].
@@ -142,16 +154,19 @@ __device__ inline void wmma_q8_word_to_f16(uint32_t w, wmma_f16x2 s, wmma_f16x2 
 }
 
 // One 16-byte load of codes (BITS 4: 32 codes, 8: 16 - all in one group, scale sc / min mn as F16 pairs) dequantized
-// to F16 and written to LDS at dst (16-byte aligned) in K order.
+// to F16 and written to LDS at dst (16-byte aligned) in K order. BITS 5: q the 32 codes' low nibbles (Q4's order),
+// hi their 5th bits (code i's at bit i, formats/q5.hpp's high plane).
 template <int BITS>
-__device__ inline void wmma_stage_codes_f16(const uint4 &q, wmma_f16x2 sc, wmma_f16x2 mn, uint16_t *dst) {
-    static_assert(BITS == 4 || BITS == 8, "F16 staging: Q4 / Q8 codes");
-    constexpr int kCodes = BITS == 4 ? 32 : 16;
+__device__ inline void wmma_stage_codes_f16(const uint4 &q, wmma_f16x2 sc, wmma_f16x2 mn, uint16_t *dst,
+                                            uint32_t hi = 0) {
+    static_assert(BITS == 4 || BITS == 5 || BITS == 8, "F16 staging: Q4 / Q5 / Q8 codes");
+    constexpr int kCodes = BITS == 8 ? 16 : 32;
     const uint32_t words[4] = {q.x, q.y, q.z, q.w};
     uint32_t d[kCodes / 2];
 #pragma unroll
     for (int w = 0; w < 4; ++w) {
         if constexpr (BITS == 4) wmma_q4_word_to_f16(words[w], sc, mn, d + 4 * w);
+        else if constexpr (BITS == 5) wmma_q5_word_to_f16(words[w], hi >> (8 * w), sc, mn, d + 4 * w);
         else wmma_q8_word_to_f16(words[w], sc, mn, d + 2 * w);
     }
     uint4 *out = reinterpret_cast<uint4 *>(dst);
@@ -323,12 +338,56 @@ struct WmmaWCodesSplit {
 #pragma unroll
             for (int j = 0; j < 4; ++j) out[j] = make_uint4(d[4 * j], d[4 * j + 1], d[4 * j + 2], d[4 * j + 3]);
         }
+        stage_window(sw, mw);
+    }
+    // WmmaWCodes::fetch_mapped's interface: staged row r from global row row_of(r) (< 0: a zero row).
+    template <typename RowFn>
+    __device__ void fetch_mapped(const uint8_t *codes, const uint16_t *scale, const uint16_t *minv, RowFn row_of,
+                                 int64_t K, int64_t k0) {
+#pragma unroll
+        for (int i = 0; i < kLoads; ++i) {
+            const int l = (int)threadIdx.x + i * kWmmaThreads, r = l / kLoadsPerRow;
+            const int64_t k = k0 + (l % kLoadsPerRow) * kCodesPerLoad, row = row_of(r);
+            const uint8_t *rp = codes + (row >= 0 ? row : 0) * (K / 2 + K * HB / 8);
+            lo[i] = row >= 0 ? *reinterpret_cast<const uint4 *>(rp + k / 2) : make_uint4(0, 0, 0, 0);
+            if constexpr (HB == 2) {
+                const uint2 v = row >= 0 ? *reinterpret_cast<const uint2 *>(rp + K / 2 + k / 4) : make_uint2(0, 0);
+                hi[i][0] = v.x, hi[i][1] = v.y;
+            } else {
+                hi[i][0] = row >= 0 ? *reinterpret_cast<const uint32_t *>(rp + K / 2 + k / 8) : 0u;
+            }
+        }
+        win = opens_window(k0);
+        if (win) {
+            const int64_t groups = K / G, g0 = k0 / G;
+#pragma unroll
+            for (int i = 0; i < kWinLoads; ++i) {
+                const int e = (int)threadIdx.x + i * kWmmaThreads, r = e / kWin;
+                const int64_t g = g0 + e % kWin, row = row_of(r);
+                const bool ok = row >= 0 && g < groups;
+                s[i] = ok ? scale[row * groups + g] : (uint16_t)0, m[i] = ok ? minv[row * groups + g] : (uint16_t)0;
+            }
+        }
+    }
+    __device__ void stage_window(uint16_t *sw, uint16_t *mw) const {
         if (win)
 #pragma unroll
             for (int i = 0; i < kWinLoads; ++i) {
                 const int e = (int)threadIdx.x + i * kWmmaThreads;
                 sw[e] = s[i], mw[e] = m[i];  // [r][e % kWin] with r = e / kWin
             }
+    }
+    // WmmaWCodes::stage_f16 for Q5 (HB 1): the codes dequantized with their group's scale / min from the staged window.
+    __device__ void stage_f16(uint16_t *lds, const uint16_t *sw, const uint16_t *mw, int64_t k0) const {
+        static_assert(HB == 1, "F16 staging: Q5 split codes");
+#pragma unroll
+        for (int i = 0; i < kLoads; ++i) {
+            const int l = (int)threadIdx.x + i * kWmmaThreads, r = l / kLoadsPerRow;
+            const int kin = (l % kLoadsPerRow) * kCodesPerLoad;
+            const int slot = (int)(((k0 + kin) / G) % kWin);  // a load's 32 codes lie in one group (G >= 32)
+            wmma_stage_codes_f16<5>(lo[i], wmma_bf16_bits_to_f16x2(sw[r * kWin + slot]),
+                                    wmma_bf16_bits_to_f16x2(mw[r * kWin + slot]), lds + r * kWmmaLd + kin, hi[i][0]);
+        }
     }
 };
 

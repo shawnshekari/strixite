@@ -333,9 +333,9 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
         {"placement", K::Text, 0, 0, "device",
          "where the weights live: device, or host-experts (the expert stacks in pinned host RAM - for GPUs too small "
          "for the model; slow, test machines only)"},
-        {"thinking-cap", K::Int, 0, 1 << 20, "0",
+        {"thinking-cap", K::Int, 0, 1 << 20, "32768",
          "a cap on thinking tokens for requests that set no budget of their own (0 = off); the thinking budget's stop "
-         "closes the block and the model answers"},
+         "closes the block and the model answers. The default is a backstop for runaway thinking, far past normal turns"},
         {"thinking-cap-grace", K::Int, 0, 1 << 16, "256",
          "past the thinking cap, wait at most this many more thinking tokens for a sentence end before the stop (0 = stop "
          "at the cap)"},

@@ -282,8 +282,44 @@ public:
     // passes it, and the ids this call's evictions retire go back through it BEFORE MemAvailable is read again.
     // Without it a parked entry's eviction frees nothing until the engine's next drain - the rule would count
     // its pages as gone, read MemAvailable unchanged, and refuse (or evict the whole tier for nothing).
+    // Granted, the bytes stay booked with the governor (every other room check sees them as spent) until the
+    // returned RoomGrant is released or destroyed - hold it until the allocation has landed (strixite #42: two slots
+    // passed on one reading and together took MemAvailable under the floor).
     using RetiredRelease = std::function<void(const std::vector<int64_t> &)>;
-    bool make_room_for(uint64_t bytes, const RetiredRelease &release_retired = {});
+    class RoomGrant {
+    public:
+        RoomGrant() = default;  // refused: nothing booked
+        RoomGrant(MemoryGovernor *gov, uint64_t bytes) : gov_(gov), bytes_(bytes), granted_(true) {}
+        RoomGrant(RoomGrant &&o) noexcept { *this = std::move(o); }
+        RoomGrant &operator=(RoomGrant &&o) noexcept {
+            if (this != &o) {
+                release();
+                gov_ = o.gov_, bytes_ = o.bytes_, granted_ = o.granted_;
+                o.gov_ = nullptr, o.bytes_ = 0, o.granted_ = false;
+            }
+            return *this;
+        }
+        RoomGrant(const RoomGrant &) = delete;
+        RoomGrant &operator=(const RoomGrant &) = delete;
+        ~RoomGrant() { release(); }
+        explicit operator bool() const { return granted_; }
+        // The allocation has landed (or won't happen): the booking goes. Idempotent; never throws.
+        void release() noexcept {
+            if (gov_ && bytes_) {
+                try {
+                    gov_->release(bytes_);
+                } catch (...) {  // a booking the governor doesn't hold: a bug, but not one a destructor may throw
+                }
+            }
+            gov_ = nullptr, bytes_ = 0;
+        }
+
+    private:
+        MemoryGovernor *gov_ = nullptr;
+        uint64_t bytes_ = 0;
+        bool granted_ = false;
+    };
+    RoomGrant make_room_for(uint64_t bytes, const RetiredRelease &release_retired = {});
     // Called on the writer thread, off the cache's lock, when parked ids wait in the retired list after the
     // writer's own work (a margin-watch eviction, a finished eviction write): the owner's cue to drain them while
     // it is idle. The hook must not call back into this cache. Set {} to clear it - that waits for a call in
@@ -390,6 +426,11 @@ private:
     // The RAM rule: MemAvailable >= ram_margin + extra. avail: the caller's reading of MemAvailable (UINT64_MAX: read it
     // here) - make_room_for passes the one its check used, so both decide on the same number.
     void make_room_locked(uint64_t extra = 0, uint64_t avail = UINT64_MAX);
+    // An entry the RAM rule may send out of RAM: in RAM, not leaving already, and not being read (one queued for a
+    // write counts - it leaves once written). make_room_locked's candidates; evictable_locked asks the same.
+    static bool can_leave_ram(const Entry &e) { return e.in_ram() && !e.drop_ram && (e.readers == 0 || e.queued); }
+    // Something make_room_locked could still send out of RAM: a spare, a resume point, or an entry that can leave.
+    bool evictable_locked() const;
     uint64_t leaving_bytes_locked() const;             // RAM of evicted entries not yet written (on its way out)
     // The writer's margin watch (Options::ram_watch_seconds): the RAM rule, its buffers unmapped outside the lock.
     void watch_margin(std::unique_lock<std::mutex> &lock);

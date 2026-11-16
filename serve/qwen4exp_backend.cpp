@@ -39,9 +39,10 @@ void Qwen4ExpBackend::build_session() {
     session_->set_precision(precision_);
     if (mtp_vocab_ > 0) session_->set_mtp_vocab(mtp_vocab_);
     if (kv_budget_) session_->set_kv_budget(kv_budget_);
+    if (default_probe_) session_->set_default_probe(default_probe_);
 }
 
-void Qwen4ExpBackend::set_kv_budget(std::function<void(uint64_t)> f) {
+void Qwen4ExpBackend::set_kv_budget(Qwen4ExpSession::KvBudget f) {
     kv_budget_ = std::move(f);  // kept: a renewed session gets it too
     session_->set_kv_budget(kv_budget_);
 }

@@ -44,8 +44,8 @@ __device__ inline void store_h(float *p, int64_t i, float v) {
     static_assert(!XH, "F16 h: BF16 activations only");
     p[i] = v;
 }
-// The combine's partials (one per slot, summed by combine_reduce_kernel): FP32, or - the F16 kernel, MoeMath::WmmaF16,
-// the served path for Q4 experts - rounded to BF16 (to nearest even) into the same buffer read as uint16_t, half its
+// The combine's partials (one per slot, summed by combine_reduce_kernel): FP32, or - the F16 kernels, MoeMath::WmmaF16,
+// the served path - rounded to BF16 (to nearest even) into the same buffer read as uint16_t, half its
 // bytes. BF16 partials: the down kernel 88 -> 76 us a token at 8192, the same 400-needle long-context score as FP32
 // partials (365 vs 366; F16 partials, as fast, scored 301), NLL inside the noise floor.
 __device__ inline void put_partial(float *p, int64_t i, float v, bool bf16) {
@@ -345,7 +345,7 @@ __global__ void __launch_bounds__(kWmmaThreads)
         }
 }
 
-// F16 on the matrix units (MoeMath::WmmaF16; Q4 experts): the same tiles and grid
+// F16 on the matrix units (MoeMath::WmmaF16; Q4 or Q5 experts, HB as kernels/qsplit.hpp): the same tiles and grid
 // as grouped_wmma_kernel, but no per-group work in the K loop. x goes to LDS as F16 (exact from BF16 at these ranges);
 // the weight codes go to LDS still packed (coalesced loads by the block), each wave decodes its own 16 rows to F16
 // in registers (code * scale + min, one F16 rounding), and the matrix units accumulate the whole K extent in FP32.
@@ -359,7 +359,7 @@ __device__ inline f16x2 bf16_bits_to_f16x2(uint16_t b) { return wmma_bf16_bits_t
 // SWI (gather only): the block's waves 0..3 compute gate columns [j0, j0 + 64) and waves 4..7 the matching up columns
 // [I + j0, ...) of the stacked gate_up rows (N = 2I); the epilogue meets them in LDS and stores h = silu(g) u [slot, I]
 // directly - SwiGLU from the FP32 accumulators, rounded once, instead of storing gu and running kernels/swiglu.
-template <typename T, int G, bool COMBINE, int TR, bool SWI = false, bool XH = false>
+template <typename T, int G, bool COMBINE, int TR, int HB, bool SWI = false, bool XH = false>
 __global__ void __launch_bounds__(kWmmaThreads)
     grouped_wmma_f16_kernel(const T *x, const uint8_t *q, const uint16_t *scale, const uint16_t *minv,
                             const int32_t *ws, int64_t A, int64_t N, int64_t K, T *y, float *partial, bool pbf16) {
@@ -370,8 +370,9 @@ __global__ void __launch_bounds__(kWmmaThreads)
     static_assert(G == 32 || G == 64 || G == 128, "group sizes: a 32-code half-step lies in one group");
     constexpr int TM = TR / 16;
     // LDS: x as F16 [TR][kWmmaLd]; the step's codes packed [kWmmaBN rows][2 x 16 bytes + 16 pad] (coalesced global
-    // loads, then each wave reads its own rows); scale / min windows of kWin groups per row, refreshed every kWin groups.
-    constexpr int kWin = 8, kCodeLd = 3;  // uint4 per code row (2 used)
+    // loads, then each wave reads its own rows) - Q5: the 64 codes' 5th bits in the pad's first 8 bytes; scale / min
+    // windows of kWin groups per row, refreshed every kWin groups.
+    constexpr int kWin = 8, kCodeLd = 3;  // uint4 per code row (2 used, Q5 3)
     __shared__ __attribute__((aligned(16))) uint16_t xs[TR * kWmmaLd];
     __shared__ uint4 cs[kWmmaBN * kCodeLd];
     __shared__ uint16_t sw[kWmmaBN * kWin], mw[kWmmaBN * kWin];
@@ -419,12 +420,16 @@ __global__ void __launch_bounds__(kWmmaThreads)
     // consecutive groups of a row (a 16-byte run), not one scattered 2-byte value per lane.
     static_assert(kWmmaBN * 2 == kWmmaThreads, "one 16-byte code load per thread and step");
     constexpr int kWinLoads = kWmmaBN * kWin / kWmmaThreads;
+    // Q5: the thread's 32 codes' 5th bits too, a 4-byte load from the row's high plane.
     const int crow = (int)threadIdx.x / 2, chalf = (int)threadIdx.x % 2;
-    const uint8_t *cptr = q + (row0 + wrow(crow)) * (K / 2) + chalf * 16;
+    const uint8_t *rptr = q + (row0 + wrow(crow)) * qsplit_row_bytes<HB>(K);
+    const uint8_t *cptr = rptr + chalf * 16, *hptr = rptr + K / 2 + chalf * 4;
     uint4 cq;
+    uint32_t hq = 0;
     uint16_t fs[kWinLoads], fm[kWinLoads];
     auto wfetch = [&](int64_t k0) {
         cq = *reinterpret_cast<const uint4 *>(cptr + k0 / 2);
+        if constexpr (HB == 1) hq = *reinterpret_cast<const uint32_t *>(hptr + k0 / 8);
         const int64_t g0 = k0 / G;
         if (k0 % G == 0 && g0 % kWin == 0)
 #pragma unroll
@@ -459,6 +464,7 @@ __global__ void __launch_bounds__(kWmmaThreads)
                     make_uint4(h[0], h[1], h[2], h[3]);
             }
             cs[crow * kCodeLd + chalf] = cq;
+            if constexpr (HB == 1) reinterpret_cast<uint32_t *>(cs + crow * kCodeLd + 2)[chalf] = hq;
             if (k0 % G == 0 && (k0 / G) % kWin == 0)
 #pragma unroll
                 for (int i = 0; i < kWinLoads; ++i) {
@@ -472,6 +478,11 @@ __global__ void __launch_bounds__(kWmmaThreads)
             }
             const uint4 c0 = cs[wr * kCodeLd], c1 = cs[wr * kCodeLd + 1];
             const uint32_t wv[8] = {c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w};
+            uint32_t hv[2] = {0, 0};  // Q5: codes 0..31's and 32..63's 5th bits
+            if constexpr (HB == 1) {
+                const uint2 h2 = *reinterpret_cast<const uint2 *>(cs + wr * kCodeLd + 2);
+                hv[0] = h2.x, hv[1] = h2.y;
+            }
             const int ga = (int)((k0 / G) % kWin), gb = (int)(((k0 + 32) / G) % kWin);
             const f16x2 s0 = bf16_bits_to_f16x2(sw[wr * kWin + ga]), m0 = bf16_bits_to_f16x2(mw[wr * kWin + ga]),
                         s1 = bf16_bits_to_f16x2(sw[wr * kWin + gb]), m1 = bf16_bits_to_f16x2(mw[wr * kWin + gb]);
@@ -479,8 +490,13 @@ __global__ void __launch_bounds__(kWmmaThreads)
             for (int kk = 0; kk < kWmmaKC / 16; ++kk) {
                 uint32_t b[8];
                 const f16x2 s = kk < 2 ? s0 : s1, m = kk < 2 ? m0 : m1;
-                q4_word_to_f16(wv[2 * kk], s, m, b);
-                q4_word_to_f16(wv[2 * kk + 1], s, m, b + 4);
+                if constexpr (HB == 1) {  // word w's 5th bits: byte w % 4 of hv[w / 4]
+                    wmma_q5_word_to_f16(wv[2 * kk], hv[kk / 2] >> (16 * (kk % 2)), s, m, b);
+                    wmma_q5_word_to_f16(wv[2 * kk + 1], hv[kk / 2] >> (16 * (kk % 2) + 8), s, m, b + 4);
+                } else {
+                    q4_word_to_f16(wv[2 * kk], s, m, b);
+                    q4_word_to_f16(wv[2 * kk + 1], s, m, b + 4);
+                }
                 const wmma_u32x8 bv = {b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]};
                 const wmma_f16x16 bf = __builtin_bit_cast(wmma_f16x16, bv);
 #pragma unroll
@@ -537,14 +553,15 @@ __global__ void __launch_bounds__(kWmmaThreads)
 // wmma_q4_word_to_f16 decode), the F16 x and each output tile's WMMA sequence over K are the F16 kernel's, so the
 // outputs are bit-identical to it. SWI: staged rows [0, 64) are gate rows, [64, 128) the matching up rows; waves of
 // column group wn < 2 hold gate columns, wn >= 2 the up columns, met in LDS (the tiles' bytes, free after the loop).
-template <typename T, int G, bool COMBINE, bool SWI, bool XH = false>
+// HB 1: Q5 codes (WmmaWCodes<5>, the same F16 decode with the 5th bit).
+template <typename T, int G, bool COMBINE, bool SWI, int HB, bool XH = false>
 __global__ void __launch_bounds__(kWmmaThreads)
     grouped_wmma_f16_wide_kernel(const T *x, const uint8_t *q, const uint16_t *scale, const uint16_t *minv,
                                  const int32_t *ws, int64_t A, int64_t N, int64_t K, T *y, float *partial, bool pbf16) {
     static_assert(!(SWI && COMBINE), "SwiGLU fuses into the gather only");
     static_assert(!XH || ((COMBINE || SWI) && sizeof(T) == 2), "XH: the down's x / the SwiGLU gather's h, BF16 path");
     static_assert(G == 32 || G == 64 || G == 128, "group sizes: a 16-byte code load lies in one group");
-    using WT = WmmaWCodes<4, G, kWmmaBN>;
+    using WT = WmmaWCodes<HB == 0 ? 4 : 5, G, kWmmaBN>;
     constexpr int TR = RX, kHalf = kWmmaBN / 2, kTileElems = (TR + kWmmaBN) * kWmmaLd;
     static_assert(!SWI || TR * (kHalf + 1) * 4 <= kTileElems * 2, "SWI: the up accumulators fit in the tiles' LDS");
     constexpr int kOutLd = kWmmaBN + 8;  // COMBINE: the BF16 output tile's LDS row stride (16-byte aligned rows)
@@ -698,8 +715,9 @@ __global__ void __launch_bounds__(kWmmaThreads)
 // are 40 F16 (80 bytes: 8 lanes' 16-byte reads hit distinct banks). SWI: wave column group wn stages gate rows
 // [32 wn, 32 wn + 32) of the block's h columns as its tiles 0-1 and the matching up rows as tiles 2-3, so
 // h = silu(g) u forms in registers. The staged F16 values (wmma_stage_codes_f16, the x conversion) and each output
-// tile's WMMA sequence over K are the wide kernel's, so the outputs are bit-identical to it.
-template <typename T, int G, bool COMBINE, bool SWI, bool XH = false>
+// tile's WMMA sequence over K are the wide kernel's, so the outputs are bit-identical to it. HB 1 (Q5): each thread also
+// loads its row's 32 5th bits a step (4 bytes of the high plane).
+template <typename T, int G, bool COMBINE, bool SWI, int HB, bool XH = false>
 __global__ void __launch_bounds__(kWmmaThreads)
     grouped_wmma_f16_wide256_kernel(const T *x, const uint8_t *q, const uint16_t *scale, const uint16_t *minv,
                                     const int32_t *ws, int64_t A, int64_t N, int64_t K, T *y, float *partial, bool pbf16) {
@@ -754,9 +772,12 @@ __global__ void __launch_bounds__(kWmmaThreads)
     uint4 qc = make_uint4(0, 0, 0, 0);  // this step's codes of row wrow
     uint16_t sb = 0, mb = 0;            // their group's scale / min (BF16 bits)
     uint32_t xb[kXPasses][4];           // 8 BF16 x values a pass
+    uint32_t hc = 0;                    // Q5: the step's codes' 5th bits
     const auto fetch = [&](int64_t k0) {
         if (wrow >= 0) {
-            qc = *reinterpret_cast<const uint4 *>(q + wrow * (K / 2) + k0 / 2);
+            const uint8_t *row = q + wrow * qsplit_row_bytes<HB>(K);
+            qc = *reinterpret_cast<const uint4 *>(row + k0 / 2);
+            if constexpr (HB == 1) hc = *reinterpret_cast<const uint32_t *>(row + K / 2 + k0 / 8);
             if (k0 % G == 0) sb = scale[wrow * groups + k0 / G], mb = minv[wrow * groups + k0 / G];
         }
 #pragma unroll
@@ -787,7 +808,10 @@ __global__ void __launch_bounds__(kWmmaThreads)
                 h[i] = XH && COMBINE ? xb[p][i] : bf16x2_to_f16x2(xb[p][i]);  // XH: x is F16 already
             *reinterpret_cast<uint4 *>(xs + (seg / kSegs) * LD + (seg % kSegs) * 8) = make_uint4(h[0], h[1], h[2], h[3]);
         }
-        wmma_stage_codes_f16<4>(qc, wmma_bf16_bits_to_f16x2(sb), wmma_bf16_bits_to_f16x2(mb), wsm + threadIdx.x * LD);
+        if constexpr (HB == 1)
+            wmma_stage_codes_f16<5>(qc, wmma_bf16_bits_to_f16x2(sb), wmma_bf16_bits_to_f16x2(mb), wsm + threadIdx.x * LD, hc);
+        else
+            wmma_stage_codes_f16<4>(qc, wmma_bf16_bits_to_f16x2(sb), wmma_bf16_bits_to_f16x2(mb), wsm + threadIdx.x * LD);
     };
     auto k_loop = [&](auto tma_c) {
         constexpr int TMA = decltype(tma_c)::value;  // this wave's row tiles: wm, wm + 2, .., 2 (TMA - 1) + wm
@@ -1031,7 +1055,6 @@ void launch_grouped(const T *x, const Q4DeviceView &w, int64_t E, const void *ws
     STRIX_CHECK(!XH || is_f16(math), "moe grouped (F16 h): needs a MoeMath::WmmaF16 kind, got math ", (int)math);
     const auto *wsi = static_cast<const int32_t *>(ws);
     if (math == MoeMath::WmmaF16Wide) {
-        STRIX_CHECK(HB == 0, "moe grouped (WMMA F16 wide): Q4 experts only (Q5 runs on MoeMath::WmmaBf16)");
         STRIX_CHECK(w.K % kWmmaKC == 0, "moe grouped (WMMA F16 wide): K = ", w.K, ", expected a multiple of ", kWmmaKC);
         STRIX_CHECK(device_warp_size(kWmmaThreads) == 32, "moe grouped (WMMA F16 wide): needs wave32 (gfx11 WMMA)");
         const int64_t tiles = route_layout(M, A, E).XTmax;
@@ -1039,14 +1062,13 @@ void launch_grouped(const T *x, const Q4DeviceView &w, int64_t E, const void *ws
         const int64_t cols = SWI ? N / 2 : N, per_block = SWI ? kWmmaBN / 2 : kWmmaBN;  // SWI: h columns
         dim3 grid((unsigned)((cols + per_block - 1) / per_block), (unsigned)tiles), block(kWmmaThreads);
         switch (w.G) {
-            case 32: grouped_wmma_f16_wide_kernel<T, 32, COMBINE, SWI, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
-            case 64: grouped_wmma_f16_wide_kernel<T, 64, COMBINE, SWI, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
-            default: grouped_wmma_f16_wide_kernel<T, 128, COMBINE, SWI, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
+            case 32: grouped_wmma_f16_wide_kernel<T, 32, COMBINE, SWI, HB, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
+            case 64: grouped_wmma_f16_wide_kernel<T, 64, COMBINE, SWI, HB, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
+            default: grouped_wmma_f16_wide_kernel<T, 128, COMBINE, SWI, HB, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
         }
         return;
     }
     if (math == MoeMath::WmmaF16Wide256) {
-        STRIX_CHECK(HB == 0, "moe grouped (WMMA F16 wide256): Q4 experts only (Q5 runs on MoeMath::WmmaBf16)");
         STRIX_CHECK(w.K % 32 == 0, "moe grouped (WMMA F16 wide256): K = ", w.K, ", expected a multiple of 32 (its K step)");
         STRIX_CHECK(device_warp_size(kWmmaThreads) == 32, "moe grouped (WMMA F16 wide256): needs wave32 (gfx11 WMMA)");
         const int64_t tiles = route_layout(M, A, E).XTmax;
@@ -1055,14 +1077,13 @@ void launch_grouped(const T *x, const Q4DeviceView &w, int64_t E, const void *ws
         const int64_t cols = SWI ? N / 2 : N, per_block = SWI ? kWmmaThreads / 2 : kWmmaThreads;
         dim3 grid((unsigned)((cols + per_block - 1) / per_block), (unsigned)tiles), block(kWmmaThreads);
         switch (w.G) {
-            case 32: grouped_wmma_f16_wide256_kernel<T, 32, COMBINE, SWI, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
-            case 64: grouped_wmma_f16_wide256_kernel<T, 64, COMBINE, SWI, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
-            default: grouped_wmma_f16_wide256_kernel<T, 128, COMBINE, SWI, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
+            case 32: grouped_wmma_f16_wide256_kernel<T, 32, COMBINE, SWI, HB, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
+            case 64: grouped_wmma_f16_wide256_kernel<T, 64, COMBINE, SWI, HB, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
+            default: grouped_wmma_f16_wide256_kernel<T, 128, COMBINE, SWI, HB, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
         }
         return;
     }
     if (math == MoeMath::WmmaF16Narrow) {
-        STRIX_CHECK(HB == 0, "moe grouped (WMMA F16): Q4 experts only (Q5 runs on MoeMath::WmmaBf16)");
         STRIX_CHECK(w.K % kWmmaKC == 0, "moe grouped (WMMA F16): K = ", w.K, ", expected a multiple of ", kWmmaKC);
         STRIX_CHECK(device_warp_size(kWmmaThreads) == 32, "moe grouped (WMMA F16): needs wave32 (gfx11 WMMA)");
         const int64_t tiles = route_layout(M, A, E).WTmax;
@@ -1070,9 +1091,9 @@ void launch_grouped(const T *x, const Q4DeviceView &w, int64_t E, const void *ws
         const int64_t cols = SWI ? N / 2 : N, per_block = SWI ? kWmmaBN / 2 : kWmmaBN;  // SWI: h columns
         dim3 grid((unsigned)((cols + per_block - 1) / per_block), (unsigned)tiles), block(kWmmaThreads);
         switch (w.G) {
-            case 32: grouped_wmma_f16_kernel<T, 32, COMBINE, RW, SWI, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
-            case 64: grouped_wmma_f16_kernel<T, 64, COMBINE, RW, SWI, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
-            default: grouped_wmma_f16_kernel<T, 128, COMBINE, RW, SWI, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
+            case 32: grouped_wmma_f16_kernel<T, 32, COMBINE, RW, HB, SWI, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
+            case 64: grouped_wmma_f16_kernel<T, 64, COMBINE, RW, HB, SWI, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
+            default: grouped_wmma_f16_kernel<T, 128, COMBINE, RW, HB, SWI, XH><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
         }
         return;
     }
@@ -1153,9 +1174,11 @@ void experts_gather_grouped(const char *fn, const void *x, const Q4DeviceView &w
                            E, " N=", N, " K=", w.K, " G=", w.G);
 }
 
+template <int HB>
 void experts_gather_grouped_swiglu(const char *fn, const void *x, const Q4DeviceView &w, int64_t E, const void *ws,
                                    size_t ws_bytes, int64_t M, int64_t A, void *h, Act act, MoeMath math,
                                    hipStream_t stream, bool h_f16) {
+    STRIX_CHECK(HB == 0 || w.K % 128 == 0, fn, ": Q5 K = ", w.K, " is not a multiple of 128 (the layout's)");
     check_common(fn, x, w, E, M, A, ws, ws_bytes, h, act);
     STRIX_CHECK(is_f16(math), fn, ": the fused SwiGLU runs on MoeMath::WmmaF16 (or its Narrow / Wide) only, got ",
                 (int)math);
@@ -1164,14 +1187,14 @@ void experts_gather_grouped_swiglu(const char *fn, const void *x, const Q4Device
     check_no_overlap(fn, "h", h, M * A * (N / 2) * es, "x", x, M * w.K * es);
     STRIX_CHECK(!h_f16 || act == Act::BF16, fn, ": F16 h needs BF16 activations, got ", act_name(act));
     if (act == Act::F32)
-        launch_grouped<float, false, 0, true>(static_cast<const float *>(x), w, E, ws, M, A, static_cast<float *>(h),
-                                              nullptr, math, stream);
+        launch_grouped<float, false, HB, true>(static_cast<const float *>(x), w, E, ws, M, A, static_cast<float *>(h),
+                                               nullptr, math, stream);
     else if (h_f16)
-        launch_grouped<uint16_t, false, 0, true, true>(static_cast<const uint16_t *>(x), w, E, ws, M, A,
-                                                       static_cast<uint16_t *>(h), nullptr, math, stream);
+        launch_grouped<uint16_t, false, HB, true, true>(static_cast<const uint16_t *>(x), w, E, ws, M, A,
+                                                        static_cast<uint16_t *>(h), nullptr, math, stream);
     else
-        launch_grouped<uint16_t, false, 0, true>(static_cast<const uint16_t *>(x), w, E, ws, M, A,
-                                                 static_cast<uint16_t *>(h), nullptr, math, stream);
+        launch_grouped<uint16_t, false, HB, true>(static_cast<const uint16_t *>(x), w, E, ws, M, A,
+                                                  static_cast<uint16_t *>(h), nullptr, math, stream);
     STRIX_HIP_CHECK_LAUNCH(fn, " ", act_name(act), " wmma-f16", h_f16 ? " (F16 h)" : "", " M=", M, " A=", A, " E=", E,
                            " N=", N, " K=", w.K, " G=", w.G);
 }
@@ -1182,9 +1205,8 @@ void experts_combine_grouped(const char *fn, const void *h, const Q4DeviceView &
                              void *y, Act act, MoeMath math, hipStream_t stream, const MoeSharedAdd *shared,
                              bool h_f16) {
     STRIX_CHECK(HB == 0 || w.K % 128 == 0, fn, ": Q5 K = ", w.K, " is not a multiple of 128 (the layout's)");
-    STRIX_CHECK(!h_f16 || (HB == 0 && act == Act::BF16 && is_f16(math)), fn, ": F16 h needs Q4 experts, BF16 ",
-                "activations and a MoeMath::WmmaF16 kind, got ", HB == 0 ? "Q4" : "Q5", " ", act_name(act), " math ",
-                (int)math);
+    STRIX_CHECK(!h_f16 || (act == Act::BF16 && is_f16(math)), fn, ": F16 h needs BF16 activations and a ",
+                "MoeMath::WmmaF16 kind, got ", act_name(act), " math ", (int)math);
     check_common(fn, h, w, E, M, A, ws, ws_bytes, y, act);
     STRIX_CHECK(ids != nullptr && coef != nullptr && partial != nullptr, fn, ": null pointer (ids=",
                 (const void *)ids, ", coef=", (const void *)coef, ", partial=", (const void *)partial, ")");
@@ -1227,11 +1249,10 @@ void experts_combine_grouped(const char *fn, const void *h, const Q4DeviceView &
         launch_grouped<float, true, HB>(static_cast<const float *>(h), w, E, ws, M, A, nullptr, partial, math, stream);
         reduce(static_cast<float *>(y));
     } else {
-        if constexpr (HB == 0)
-            if (h_f16)
-                launch_grouped<uint16_t, true, HB, false, true>(static_cast<const uint16_t *>(h), w, E, ws, M, A, nullptr,
-                                                                partial, math, stream);
-        if (!h_f16)
+        if (h_f16)
+            launch_grouped<uint16_t, true, HB, false, true>(static_cast<const uint16_t *>(h), w, E, ws, M, A, nullptr,
+                                                            partial, math, stream);
+        else
             launch_grouped<uint16_t, true, HB>(static_cast<const uint16_t *>(h), w, E, ws, M, A, nullptr, partial, math,
                                                stream);
         reduce(static_cast<uint16_t *>(y));
@@ -1251,8 +1272,8 @@ void linear_q4_experts_gather_grouped(const void *x, const Q4DeviceView &w, int6
 void linear_q4_experts_gather_grouped_swiglu(const void *x, const Q4DeviceView &w, int64_t E, const void *ws,
                                               size_t ws_bytes, int64_t M, int64_t A, void *h, Act act, MoeMath math,
                                               hipStream_t stream, bool h_f16) {
-    experts_gather_grouped_swiglu("linear_q4_experts_gather_grouped_swiglu", x, w, E, ws, ws_bytes, M, A, h, act, math,
-                                  stream, h_f16);
+    experts_gather_grouped_swiglu<0>("linear_q4_experts_gather_grouped_swiglu", x, w, E, ws, ws_bytes, M, A, h, act,
+                                     math, stream, h_f16);
 }
 
 void linear_q4_experts_combine_grouped(const void *h, const Q4DeviceView &w, int64_t E, const int32_t *ids,
@@ -1270,12 +1291,19 @@ void linear_q5_experts_gather_grouped(const void *x, const Q5DeviceView &w, int6
                               ws_bytes, M, A, y, act, math, stream);
 }
 
+void linear_q5_experts_gather_grouped_swiglu(const void *x, const Q5DeviceView &w, int64_t E, const void *ws,
+                                              size_t ws_bytes, int64_t M, int64_t A, void *h, Act act, MoeMath math,
+                                              hipStream_t stream, bool h_f16) {
+    experts_gather_grouped_swiglu<1>("linear_q5_experts_gather_grouped_swiglu", x, {w.q, w.scale, w.minv, w.N, w.K, w.G},
+                                     E, ws, ws_bytes, M, A, h, act, math, stream, h_f16);
+}
+
 void linear_q5_experts_combine_grouped(const void *h, const Q5DeviceView &w, int64_t E, const int32_t *ids,
                                        const float *coef, const void *ws, size_t ws_bytes, float *partial, int64_t M,
                                        int64_t A, void *y, Act act, MoeMath math, hipStream_t stream,
-                                       const MoeSharedAdd *shared) {
+                                       const MoeSharedAdd *shared, bool h_f16) {
     experts_combine_grouped<1>("linear_q5_experts_combine_grouped", h, {w.q, w.scale, w.minv, w.N, w.K, w.G}, E, ids,
-                               coef, ws, ws_bytes, partial, M, A, y, act, math, stream, shared, false);
+                               coef, ws, ws_bytes, partial, M, A, y, act, math, stream, shared, h_f16);
 }
 
 }  // namespace strix::kernels

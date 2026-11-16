@@ -409,26 +409,26 @@ void HttpServer::routes() {
 
         res.set_header("Cache-Control", "no-cache");
         res.set_chunked_content_provider("text/event-stream", [sink, meta, clamped, keepalive, tools, rp = cr.return_progress](size_t, httplib::DataSink &out) {
-            const auto send = [&](const std::string &data) {
-                const std::string frame = "data: " + data + "\n\n";
-                if (!out.write(frame.data(), frame.size())) {
+            const auto frame = [&](const std::string &f) {
+                if (!out.write(f.data(), f.size())) {
                     sink->cancel();
                     return false;
                 }
                 return true;
             };
-            const auto comment = [&](const std::string &text) {
-                const std::string frame = ": " + text + "\n\n";
-                if (!out.write(frame.data(), frame.size())) {
-                    sink->cancel();
-                    return false;
-                }
-                return true;
+            const auto send = [&](const std::string &data) { return frame("data: " + data + "\n\n"); };
+            const auto comment = [&](const std::string &text) { return frame(": " + text + "\n\n"); };
+            // The role chunk waits for the first output or the finish: a request that fails before its first token
+            // (refused for K/V room in prefill) must not look like the start of a reply (strixite #43).
+            bool role_sent = false;
+            const auto send_role = [&]() {
+                if (role_sent) return true;
+                role_sent = true;
+                json::Value first = json::Value::object();
+                first.set("role", json::Value::string("assistant"));
+                first.set("content", json::Value::string(""));
+                return send(chunk_body(meta, first, nullptr));
             };
-            json::Value first = json::Value::object();
-            first.set("role", json::Value::string("assistant"));
-            first.set("content", json::Value::string(""));
-            if (!send(chunk_body(meta, first, nullptr))) return false;
             int tool_index = 0;
             QueueSink::Item it;
             std::string progress;
@@ -448,6 +448,7 @@ void HttpServer::routes() {
                     }
                     break;
                 case QueueSink::Item::Kind::Events:
+                    if (!send_role()) return false;
                     for (size_t k = 0; k < it.events.size(); ++k) {
                         const OutputEvent &e = it.events[k];
                         json::Value d = json::Value::object();
@@ -472,14 +473,18 @@ void HttpServer::routes() {
                     break;
                 case QueueSink::Item::Kind::Done: {
                     const GenerationResult &r = it.result;
+                    // A failed request ends in an `error` event, then a finish chunk with finish_reason "error", and no
+                    // [DONE]: SDKs that read the event or the error object raise, parsers that only read chunks see a
+                    // finish that isn't "stop", and none takes the stream for a complete reply (strixite #43).
                     if (r.finish_reason == "error") {
-                        send(error_body(r.error, engine_error_type(r), ""));
+                        if (frame("event: error\ndata: " + error_body(r.error, engine_error_type(r), "") + "\n\n"))
+                            send(chunk_body(meta, json::Value::object(), "error"));
                     } else if (r.finish_reason != "cancelled") {
-                        send(chunk_body(meta, json::Value::object(), r.finish_reason.c_str()));
-                        send(usage_chunk_body(meta, r, clamped));
+                        if (send_role() && send(chunk_body(meta, json::Value::object(), r.finish_reason.c_str())) &&
+                            send(usage_chunk_body(meta, r, clamped))) {
+                            frame("data: [DONE]\n\n");
+                        }
                     }
-                    const std::string done = "data: [DONE]\n\n";
-                    out.write(done.data(), done.size());
                     out.done();
                     return true;
                 }
@@ -591,13 +596,15 @@ void HttpServer::routes() {
                     break;
                 case QueueSink::Item::Kind::Done: {
                     const GenerationResult &r = it.result;
+                    // Same ending as chat completions: an `error` event, a finish "error" chunk, no [DONE] (strixite #43).
                     if (r.finish_reason == "error") {
-                        frame("data: " + error_body(r.error, engine_error_type(r), "") + "\n\n");
+                        if (frame("event: error\ndata: " + error_body(r.error, engine_error_type(r), "") + "\n\n"))
+                            frame("data: " + text_chunk_body(meta, "", "error") + "\n\n");
                     } else if (r.finish_reason != "cancelled") {
-                        frame("data: " + text_chunk_body(meta, "", r.finish_reason.c_str()) + "\n\n");
-                        frame("data: " + text_usage_chunk_body(meta, r, clamped) + "\n\n");
+                        if (frame("data: " + text_chunk_body(meta, "", r.finish_reason.c_str()) + "\n\n") &&
+                            frame("data: " + text_usage_chunk_body(meta, r, clamped) + "\n\n"))
+                            frame("data: [DONE]\n\n");
                     }
-                    frame("data: [DONE]\n\n");
                     out.done();
                     return true;
                 }
